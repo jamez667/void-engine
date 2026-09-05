@@ -2628,6 +2628,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
+ "naga",
  "pollster",
  "rodio",
  "serde",

@@ -1,0 +1,462 @@
+//! Render the procedural materials on a real GPU and check what comes out.
+//!
+//! A WGSL file that parses and validates can still draw nothing, or draw the
+//! same thing for every material. This stands up a headless device, draws one
+//! quad per material through the actual pipeline the game uses, and reads the
+//! pixels back — so the thing under test is the shader itself rather than a
+//! Rust reimplementation of it that could drift from it.
+//!
+//! Skipped, not failed, when no adapter is available: CI without a GPU should
+//! not report a red build for a machine limitation.
+
+use void_engine::renderer::batch::{Batch, Material, Surface, Vertex};
+
+const W: u32 = 256;
+const H: u32 = 256;
+
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+fn gpu() -> Option<Gpu> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::default(),
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("material test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::default(),
+        },
+        None,
+    ))
+    .ok()?;
+    Some(Gpu { device, queue })
+}
+
+/// Draw a batch through the real shader and read the framebuffer back as RGBA.
+fn render(gpu: &Gpu, batch: &Batch) -> Vec<u8> {
+    use wgpu::util::DeviceExt;
+
+    let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("main shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            include_str!("../src/renderer/shader.wgsl").into(),
+        ),
+    });
+
+    // An orthographic camera mapping our -128..128 quad space onto the target.
+    let half_w = W as f32 * 0.5;
+    let half_h = H as f32 * 0.5;
+    let proj = glam::Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -1.0, 1.0);
+    let camera_buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::bytes_of(&proj),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let camera_bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let camera_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &camera_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera_buffer.as_entire_binding(),
+        }],
+    });
+
+    // The white 1x1 the solid-colour path multiplies against.
+    let white = gpu.device.create_texture_with_data(
+        &gpu.queue,
+        &wgpu::TextureDescriptor {
+            label: Some("white"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &[255, 255, 255, 255],
+    );
+    let white_view = white.create_view(&Default::default());
+    let sampler = gpu.device.create_sampler(&Default::default());
+    let tex_bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+    let tex_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &tex_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&white_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&camera_bgl, &tex_bgl],
+            push_constant_ranges: &[],
+        });
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let pipeline = gpu
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("target"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&Default::default());
+
+    let vbuf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&batch.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+    let ibuf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&batch.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+    // Read-back needs its row stride padded to 256 bytes.
+    let unpadded = W * 4;
+    let padded = unpadded.div_ceil(256) * 256;
+    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (padded * H) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut enc = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rpass.set_pipeline(&pipeline);
+        rpass.set_bind_group(0, &camera_bg, &[]);
+        rpass.set_bind_group(1, &tex_bg, &[]);
+        rpass.set_vertex_buffer(0, vbuf.slice(..));
+        rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        rpass.draw_indexed(0..batch.indices.len() as u32, 0, 0..1);
+    }
+    enc.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &readback,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(H),
+            },
+        },
+        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+    );
+    gpu.queue.submit([enc.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    gpu.device.poll(wgpu::Maintain::Wait);
+    let mapped = slice.get_mapped_range();
+
+    // Strip the row padding back out.
+    let mut out = Vec::with_capacity((unpadded * H) as usize);
+    for row in 0..H {
+        let start = (row * padded) as usize;
+        out.extend_from_slice(&mapped[start..start + unpadded as usize]);
+    }
+    drop(mapped);
+    readback.unmap();
+    out
+}
+
+/// A full-target quad painted with one surface.
+fn quad_with(surface: Option<Surface>) -> Batch {
+    let mut b = Batch::new();
+    if let Some(s) = surface {
+        b.set_surface(s);
+    }
+    // Mid grey, so a pattern has room to darken and lighten it.
+    b.rect(
+        glam::Vec2::ZERO,
+        glam::Vec2::new(W as f32, H as f32),
+        [0.5, 0.5, 0.5, 1.0],
+    );
+    b
+}
+
+/// Spread of luminance across the image: a patterned fill varies, a flat one
+/// does not.
+fn variation(px: &[u8]) -> f32 {
+    let lum: Vec<f32> = px
+        .chunks(4)
+        .map(|p| (p[0] as f32 * 0.299 + p[1] as f32 * 0.587 + p[2] as f32 * 0.114) / 255.0)
+        .collect();
+    let mean = lum.iter().sum::<f32>() / lum.len() as f32;
+    (lum.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / lum.len() as f32).sqrt()
+}
+
+/// Variation left after averaging over 4x4 blocks.
+///
+/// Per-pixel noise averages away; drawn features -- a blade, a pebble, a crack
+/// between blocks -- survive. This is what separates a pattern from a grain.
+fn coarse_variation(px: &[u8]) -> f32 {
+    const B: usize = 4;
+    let mut blocks = Vec::new();
+    for by in (0..H as usize).step_by(B) {
+        for bx in (0..W as usize).step_by(B) {
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for y in by..(by + B).min(H as usize) {
+                for x in bx..(bx + B).min(W as usize) {
+                    let i = (y * W as usize + x) * 4;
+                    sum += (px[i] as f32 * 0.299
+                        + px[i + 1] as f32 * 0.587
+                        + px[i + 2] as f32 * 0.114)
+                        / 255.0;
+                    n += 1.0;
+                }
+            }
+            blocks.push(sum / n);
+        }
+    }
+    let mean = blocks.iter().sum::<f32>() / blocks.len() as f32;
+    (blocks.iter().map(|b| (b - mean).powi(2)).sum::<f32>() / blocks.len() as f32).sqrt()
+}
+
+/// How different two renders are, per pixel.
+fn difference(a: &[u8], b: &[u8]) -> f32 {
+    let n = a.len().min(b.len());
+    let sum: f32 = (0..n).map(|i| (a[i] as f32 - b[i] as f32).abs()).sum();
+    sum / n as f32 / 255.0
+}
+
+#[test]
+fn materials_draw_distinct_patterns() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    // A solid fill is the control: it must come out perfectly flat.
+    let solid = render(&gpu, &quad_with(None));
+    assert!(
+        variation(&solid) < 0.01,
+        "a solid fill must be flat, got variation {:.4}",
+        variation(&solid)
+    );
+
+    // Each material seen at 24 px per metre, which is a working zoom in game.
+    // Pattern features are then several pixels across: big enough to read.
+    const PPM: f32 = 24.0;
+    let surface = |m| {
+        Some(
+            Surface::new(m)
+                .scale_m(0.35 * PPM)
+                .m_per_px(1.0 / PPM),
+        )
+    };
+    let grass = render(&gpu, &quad_with(surface(Material::Grass)));
+    let dirt = render(&gpu, &quad_with(surface(Material::Dirt)));
+    let stone = render(&gpu, &quad_with(surface(Material::Stone)));
+
+    for (name, px) in [("grass", &grass), ("dirt", &dirt), ("stone", &stone)] {
+        assert!(
+            variation(px) > 0.02,
+            "{name} must actually draw a pattern, got variation {:.4}",
+            variation(px)
+        );
+        // A pattern must have structure at a legible size, not merely be noisy.
+        // Per-pixel noise varies as much as a drawn hatch but reads as grain,
+        // so measure how much survives a blur: real features do, noise does not.
+        assert!(
+            coarse_variation(px) > 0.012,
+            "{name} must have features bigger than a pixel, got {:.4}",
+            coarse_variation(px)
+        );
+        assert!(
+            difference(px, &solid) > 0.01,
+            "{name} must differ from a flat fill"
+        );
+    }
+
+    // The spec's real requirement: the materials are told apart by pattern, not
+    // only by colour. All three are drawn in the same grey here, so any
+    // difference between them is pattern alone.
+    for (a_name, a, b_name, b) in [
+        ("grass", &grass, "dirt", &dirt),
+        ("grass", &grass, "stone", &stone),
+        ("dirt", &dirt, "stone", &stone),
+    ] {
+        let d = difference(a, b);
+        assert!(
+            d > 0.01,
+            "{a_name} and {b_name} must be distinguishable with colour removed, \
+             differ by only {d:.4}"
+        );
+    }
+}
+
+#[test]
+fn a_pattern_fades_out_before_it_aliases() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    // Zoomed far out, one pattern cell is smaller than a pixel. Drawing the
+    // hatch there would moire, so it must fade to honest flat colour.
+    let tiny = Surface::new(Material::Stone).scale_m(0.35).m_per_px(1.0);
+    let far = render(&gpu, &quad_with(Some(tiny)));
+    assert!(
+        variation(&far) < 0.01,
+        "a pattern finer than a pixel must fade to flat, got {:.4}",
+        variation(&far)
+    );
+
+    // Close in, the same material must show its pattern.
+    let near = Surface::new(Material::Stone)
+        .scale_m(0.35 * 24.0)
+        .m_per_px(1.0 / 24.0);
+    let close = render(&gpu, &quad_with(Some(near)));
+    assert!(
+        variation(&close) > 0.02,
+        "the same material must pattern when its features are visible"
+    );
+}
+
+#[test]
+fn strength_controls_how_far_the_pattern_departs_from_colour() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    let at = |s: f32| {
+        render(
+            &gpu,
+            &quad_with(Some(
+                Surface::new(Material::Stone)
+                    .scale_m(0.35 * 24.0)
+                    .m_per_px(1.0 / 24.0)
+                    .strength(s),
+            )),
+        )
+    };
+    let faint = variation(&at(0.15));
+    let full = variation(&at(1.0));
+    assert!(
+        full > faint,
+        "a stronger pattern must vary more: {full:.4} vs {faint:.4}"
+    );
+
+    // Zero strength is flat colour, whatever the material says.
+    let none = at(0.0);
+    assert!(
+        variation(&none) < 0.01,
+        "zero strength must leave the colour flat, got {:.4}",
+        variation(&none)
+    );
+}

@@ -8,3 +8,7 @@
 # Misc
 *.original.md
 nul
+
+# Preview renders are artefacts, not sources.
+materials.png
+*.png
