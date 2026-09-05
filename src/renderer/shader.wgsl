@@ -157,13 +157,15 @@ fn pat_stone(p: vec2<f32>) -> f32 {
             }
         }
     }
-    // The gap between nearest and next-nearest site is the crack between
-    // blocks. Kept narrow and hard-edged: a fracture in rock is a line.
-    let crack = 1.0 - smoothstep(0.01, 0.06, d2 - d1);
-    // Faint mottling across each block face, so the rock is not dead flat
-    // between cracks -- but well below the cracks, which are the figure.
-    let mottle = smoothstep(0.45, 0.85, value_noise(p * 2.5)) * 0.22;
-    return clamp(crack + mottle, 0.0, 1.0);
+    // A joint: narrow, hard-edged, and sparse. Rock is unbroken over metres
+    // with the odd fracture running across it, which is exactly what tells it
+    // apart from scree -- scree is all edges, rock is almost none.
+    let joint = 1.0 - smoothstep(0.004, 0.022, d2 - d1);
+    // Only some cell boundaries are jointed at all; the rest is solid face.
+    let solid = step(0.45, hash2(floor(p) + vec2<f32>(3.1, 7.7)));
+    // Broad, soft variation across the face: weathering, not fragments.
+    let weather = smoothstep(0.35, 0.75, value_noise(p * 0.8)) * 0.30;
+    return clamp(joint * solid + weather, 0.0, 1.0);
 }
 
 // --- Shared drawing helpers -------------------------------------------------
@@ -213,13 +215,20 @@ fn stipple(p: vec2<f32>, density: f32, size: f32, vary: f32) -> f32 {
 
 // Talus and mine waste: angular fragments of every size, jumbled.
 fn pat_scree(p: vec2<f32>) -> f32 {
+    // Every boundary, at three sizes: a talus slope is nothing but the edges
+    // of broken rock, with no unbroken ground anywhere in it. Against stone,
+    // which is mostly unbroken face, that reads as a different substance
+    // rather than as the same one at a different size.
     let a = worley(p);
-    let coarse = 1.0 - smoothstep(0.01, 0.07, a.y - a.x);
-    let b = worley(p * 2.7 + vec2<f32>(11.3, 4.1));
-    let fine = 1.0 - smoothstep(0.02, 0.10, b.y - b.x);
-    // Shading on each face, so fragments read as solid rather than as outlines.
-    let facet = smoothstep(0.3, 0.9, value_noise(p * 3.5)) * 0.25;
-    return clamp(max(coarse, fine * 0.7) + facet, 0.0, 1.0);
+    let coarse = 1.0 - smoothstep(0.01, 0.08, a.y - a.x);
+    let b = worley(p * 2.3 + vec2<f32>(11.3, 4.1));
+    let mid = 1.0 - smoothstep(0.015, 0.09, b.y - b.x);
+    let c = worley(p * 5.1 + vec2<f32>(3.7, 19.1));
+    let fine = 1.0 - smoothstep(0.02, 0.11, c.y - c.x);
+    // Each fragment takes its own tone, so the slope reads as a heap of
+    // separate pieces rather than as a net of lines.
+    let facet = hash2(floor(p * 2.3 + vec2<f32>(11.3, 4.1))) * 0.34;
+    return clamp(max(coarse, max(mid * 0.85, fine * 0.6)) + facet, 0.0, 1.0);
 }
 
 // Creek bed: rounded, sorted, water-worn stones packed together.
@@ -243,12 +252,15 @@ fn pat_sand(p: vec2<f32>) -> f32 {
 
 // Dried mud: the polygon crack pattern of a playa.
 fn pat_cracked(p: vec2<f32>) -> f32 {
-    let w = worley(p);
-    // Wide, soft-shouldered cracks: mud shrinks away from itself.
-    let crack = 1.0 - smoothstep(0.015, 0.09, w.y - w.x);
-    // Each plate curls, so its middle is lighter than its edge.
-    let curl = smoothstep(0.2, 0.6, w.x) * 0.2;
-    return clamp(crack - curl, 0.0, 1.0);
+    // One crack per plate boundary, thin and clean, over plates that are
+    // otherwise smooth. Mud dries into large flat plates; the smoothness
+    // between the cracks is what distinguishes it from broken rock.
+    let w = worley(p * 0.55);
+    let crack = 1.0 - smoothstep(0.008, 0.045, w.y - w.x);
+    // Each plate curls up at its edge, so it is lighter in the middle and
+    // darker where it lifts -- the shading a dried playa actually has.
+    let curl = (1.0 - smoothstep(0.05, 0.45, w.x)) * 0.28;
+    return clamp(crack + curl, 0.0, 1.0);
 }
 
 // Timber from the side: bark furrows running along the grain.

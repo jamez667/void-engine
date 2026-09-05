@@ -505,6 +505,57 @@ impl Batch {
         self.tile = None;
     }
 
+    /// A rect whose colour grades across it, in the direction `dir`.
+    ///
+    /// The base colour of a tile is otherwise flat, so where a grid of tiles
+    /// changes colour it steps on the tile edge however smoothly the *pattern*
+    /// over it is blended. That step is visible whenever the pattern is fine
+    /// enough not to hide it, which is to say whenever the pattern is drawn at
+    /// the size of real ground.
+    ///
+    /// `from` is the colour at the far side, `to` at the near side, matching
+    /// `Surface::from_edge` so colour and pattern cross over together.
+    pub fn rect_graded(
+        &mut self,
+        center: Vec2,
+        size: Vec2,
+        dir: Vec2,
+        from: [f32; 4],
+        to: [f32; 4],
+    ) {
+        let h = size * 0.5;
+        self.tile = Some((center, h));
+        let corners = [
+            center + Vec2::new(-h.x, h.y),
+            center + Vec2::new(h.x, h.y),
+            center + Vec2::new(h.x, -h.y),
+            center + Vec2::new(-h.x, -h.y),
+        ];
+        let d = dir.normalize_or_zero();
+        let base = self.vertices.len() as u32;
+        for c in corners {
+            // Where this corner sits along the gradient, 0 at the far side and
+            // 1 at the near one.
+            let along = if d == Vec2::ZERO {
+                0.5
+            } else {
+                let local = (c - center) / h.max(Vec2::splat(0.0001));
+                (local.dot(d) * 0.5 + 0.5).clamp(0.0, 1.0)
+            };
+            let mix = |a: f32, b: f32| a + (b - a) * along;
+            let colour = [
+                mix(from[0], to[0]),
+                mix(from[1], to[1]),
+                mix(from[2], to[2]),
+                mix(from[3], to[3]),
+            ];
+            self.vertices.push(self.vertex(c, [0.5, 0.5], colour));
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        self.tile = None;
+    }
+
     /// Rotated rect (angle in radians)
     pub fn quad(&mut self, center: Vec2, size: Vec2, angle: f32, color: [f32; 4]) {
         let h = size * 0.5;

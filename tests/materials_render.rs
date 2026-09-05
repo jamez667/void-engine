@@ -711,9 +711,14 @@ fn an_overlay_can_cross_over_inside_its_tile() {
     // that replaces them. So test that the middle lies between the ends,
     // whichever way round they are.
     let (lo, hi) = if s[0] <= s[3] { (s[0], s[3]) } else { (s[3], s[0]) };
+    // The slack is for the patterns' own texture: a strip's mean carries
+    // whatever fragments and joints happen to fall in it, which varies by a
+    // few thousandths between strips independently of the blend. Tighter than
+    // this measures the materials rather than the gradient.
+    const TEXTURE: f32 = 0.012;
     for (i, v) in s.iter().enumerate().take(3).skip(1) {
         assert!(
-            *v >= lo - 0.006 && *v <= hi + 0.006,
+            *v >= lo - TEXTURE && *v <= hi + TEXTURE,
             "strip {i} lies outside the ends, so the tile steps rather than grades: {s:?}"
         );
     }
@@ -978,4 +983,77 @@ fn strength_controls_how_far_the_pattern_departs_from_colour() {
         "zero strength must leave the colour flat, got {:.4}",
         variation(&none)
     );
+}
+
+/// A tile's base colour must be able to grade across it.
+///
+/// The pattern over a tile can already cross over inside it, but the colour
+/// under that pattern was one flat value, so a grid of tiles stepped at its
+/// edges however well the pattern blended. That step is invisible only while
+/// the pattern is coarse enough to hide it -- which is to say, only while the
+/// ground is drawn at the wrong size.
+#[test]
+fn a_tile_colour_can_grade_across_it() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    let dark = [0.30, 0.30, 0.28, 1.0];
+    let pale = [0.80, 0.80, 0.76, 1.0];
+
+    let mut b = Batch::new();
+    b.rect_graded(
+        glam::Vec2::ZERO,
+        glam::Vec2::new(W as f32, H as f32),
+        glam::Vec2::X,
+        dark,
+        pale,
+    );
+    let graded = render(&gpu, &b);
+
+    let s = strips(&graded, 4);
+    // Dark at the far side, pale at the near one, and monotonic between.
+    assert!(s[0] < s[3], "the gradient must run dark to pale: {s:?}");
+    for i in 1..s.len() {
+        assert!(
+            s[i] >= s[i - 1] - 0.004,
+            "a colour gradient must not step backwards: {s:?}"
+        );
+    }
+    // And it must genuinely span the two colours rather than sitting between.
+    //
+    // The bar is what a strip *mean* can reach, not the full colour range:
+    // four strips sample the gradient at its eighths, so their means span
+    // three quarters of it, and the sRGB framebuffer compresses the bright end
+    // further. Measured against flat fills of the two end colours, which is
+    // the most any gradient between them could show.
+    let flat_of = |c| {
+        let mut b = Batch::new();
+        b.rect(glam::Vec2::ZERO, glam::Vec2::new(W as f32, H as f32), c);
+        strips(&render(&gpu, &b), 4)[0]
+    };
+    let range = flat_of(pale) - flat_of(dark);
+    assert!(
+        s[3] - s[0] > range * 0.6,
+        "the gradient must cover most of the range: {:.3} of {range:.3}",
+        s[3] - s[0]
+    );
+
+    // With no direction it is a flat fill, which is what a plain rect gives.
+    let mut f = Batch::new();
+    f.rect_graded(
+        glam::Vec2::ZERO,
+        glam::Vec2::new(W as f32, H as f32),
+        glam::Vec2::ZERO,
+        dark,
+        pale,
+    );
+    let flat = strips(&render(&gpu, &f), 4);
+    for i in 1..flat.len() {
+        assert!(
+            (flat[i] - flat[0]).abs() < 0.004,
+            "no direction must give a flat fill: {flat:?}"
+        );
+    }
 }
