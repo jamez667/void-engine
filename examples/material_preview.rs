@@ -9,8 +9,8 @@
 
 use void_engine::renderer::batch::{Batch, Material, Surface, Vertex};
 
-const W: u32 = 900;
-const H: u32 = 640;
+const W: u32 = 1000;
+const H: u32 = 820;
 
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "materials.png".into());
@@ -31,52 +31,73 @@ fn main() {
     ))
     .expect("device");
 
-    // --- The swatches ------------------------------------------------------
-    let mut batch = Batch::new();
-    let materials = [
-        (Material::Grass, [0.36, 0.44, 0.27, 1.0], "grass"),
+    // Every material, in its own colour, at one working zoom. Laid out in a
+    // grid so the whole library can be compared at a glance -- which is the
+    // point: these have to be told apart from one another, not merely look
+    // like something on their own.
+    let swatches: [(Material, [f32; 4], &str); 20] = [
+        (Material::Grass, [0.38, 0.46, 0.28, 1.0], "grass"),
         (Material::Dirt, [0.52, 0.42, 0.30, 1.0], "dirt"),
-        (Material::Stone, [0.55, 0.55, 0.53, 1.0], "stone"),
+        (Material::Stone, [0.56, 0.56, 0.54, 1.0], "stone"),
+        (Material::Scree, [0.60, 0.57, 0.51, 1.0], "scree"),
+        (Material::Gravel, [0.63, 0.60, 0.54, 1.0], "gravel"),
+        (Material::Sand, [0.78, 0.70, 0.52, 1.0], "sand"),
+        (Material::Cracked, [0.66, 0.58, 0.46, 1.0], "cracked mud"),
+        (Material::Timber, [0.42, 0.33, 0.21, 1.0], "timber"),
+        (Material::EndGrain, [0.58, 0.46, 0.30, 1.0], "end grain"),
+        (Material::Alluvium, [0.85, 0.79, 0.64, 1.0], "alluvium"),
+        (Material::Shale, [0.55, 0.58, 0.63, 1.0], "shale"),
+        (Material::Sandstone, [0.82, 0.66, 0.36, 1.0], "sandstone"),
+        (Material::Limestone, [0.62, 0.71, 0.72, 1.0], "limestone"),
+        (Material::Dolomite, [0.66, 0.69, 0.65, 1.0], "dolomite"),
+        (Material::Quartzite, [0.77, 0.66, 0.63, 1.0], "quartzite"),
+        (Material::Granite, [0.69, 0.54, 0.51, 1.0], "granite"),
+        (Material::Gossan, [0.56, 0.35, 0.18, 1.0], "gossan"),
+        (Material::OreSulphide, [0.42, 0.44, 0.47, 1.0], "sulphide ore"),
+        (Material::Quartz, [0.86, 0.84, 0.80, 1.0], "quartz"),
+        (Material::Timbered, [0.47, 0.40, 0.31, 1.0], "timbered"),
     ];
-    // Each column is a zoom, in pixels per metre: how big a metre of ground is
-    // on screen. Left is close in, right is far off.
-    let px_per_m = [64.0_f32, 24.0, 8.0, 2.0];
 
-    let pad = 18.0;
-    let cell_w = (W as f32 - pad * 5.0) / 4.0;
-    let cell_h = (H as f32 - pad * 5.0) / 3.0;
+    const COLS: usize = 5;
+    const PPM: f32 = 26.0;
+    let pad = 14.0;
+    let cell_w = (W as f32 - pad * (COLS as f32 + 1.0)) / COLS as f32;
+    let rows = swatches.len().div_ceil(COLS);
+    let cell_h = (H as f32 - pad * (rows as f32 + 1.0)) / rows as f32;
 
-    for (row, (material, colour, _)) in materials.iter().enumerate() {
-        for (col, ppm) in px_per_m.iter().enumerate() {
-            // Centre-origin, y-up.
-            let x = -(W as f32) * 0.5 + pad + col as f32 * (cell_w + pad) + cell_w * 0.5;
-            let y = (H as f32) * 0.5 - pad - row as f32 * (cell_h + pad) - cell_h * 0.5;
+    let mut batch = Batch::new();
+    for (i, (material, colour, _)) in swatches.iter().enumerate() {
+        let (col, row) = (i % COLS, i / COLS);
+        let x = -(W as f32) * 0.5 + pad + col as f32 * (cell_w + pad) + cell_w * 0.5;
+        let y = (H as f32) * 0.5 - pad - row as f32 * (cell_h + pad) - cell_h * 0.5;
 
-            batch.with_surface(
-                            Surface::new(*material)
-                    .scale_m(0.35 * ppm)
-                    .m_per_px(1.0 / ppm),
-                |b| {
-                    b.rect(
-                        glam::Vec2::new(x, y),
-                        glam::Vec2::new(cell_w, cell_h),
-                        *colour,
-                    );
-                },
-            );
-            // A hairline frame, drawn flat, so each swatch reads as a sample.
-            batch.rect(
-                glam::Vec2::new(x, y + cell_h * 0.5),
-                glam::Vec2::new(cell_w, 1.0),
-                [0.17, 0.15, 0.13, 1.0],
-            );
-        }
+        batch.with_surface(
+            Surface::new(*material)
+                .scale_m(0.35 * PPM)
+                .m_per_px(1.0 / PPM),
+            |b| {
+                b.rect(
+                    glam::Vec2::new(x, y),
+                    glam::Vec2::new(cell_w, cell_h),
+                    *colour,
+                );
+            },
+        );
+        // A ruled top edge, drawn flat, so each swatch reads as a sample.
+        batch.rect(
+            glam::Vec2::new(x, y + cell_h * 0.5),
+            glam::Vec2::new(cell_w, 1.5),
+            [0.17, 0.15, 0.13, 1.0],
+        );
     }
 
     let pixels = render(&device, &queue, &batch);
     write_png(&out, W, H, &pixels);
     println!("wrote {out}");
-    println!("rows: grass, dirt, stone   columns: {px_per_m:?} px/m (near to far)");
+    for (i, (_, _, name)) in swatches.iter().enumerate() {
+        let (col, row) = (i % COLS, i / COLS);
+        println!("  r{row} c{col}  {name}");
+    }
 }
 
 fn render(device: &wgpu::Device, queue: &wgpu::Queue, batch: &Batch) -> Vec<u8> {

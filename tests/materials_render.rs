@@ -399,6 +399,129 @@ fn materials_draw_distinct_patterns() {
     }
 }
 
+/// Every material in the library, so a new one cannot be added without being
+/// held to the same bar as the rest.
+const ALL: [(Material, &str); 20] = [
+    (Material::Grass, "grass"),
+    (Material::Dirt, "dirt"),
+    (Material::Stone, "stone"),
+    (Material::Scree, "scree"),
+    (Material::Gravel, "gravel"),
+    (Material::Sand, "sand"),
+    (Material::Cracked, "cracked"),
+    (Material::Timber, "timber"),
+    (Material::EndGrain, "end grain"),
+    (Material::Alluvium, "alluvium"),
+    (Material::Shale, "shale"),
+    (Material::Sandstone, "sandstone"),
+    (Material::Limestone, "limestone"),
+    (Material::Dolomite, "dolomite"),
+    (Material::Quartzite, "quartzite"),
+    (Material::Granite, "granite"),
+    (Material::Gossan, "gossan"),
+    (Material::OreSulphide, "sulphide ore"),
+    (Material::Quartz, "quartz"),
+    (Material::Timbered, "timbered"),
+];
+
+/// The whole library must be mutually distinguishable by pattern alone.
+///
+/// This is the spec's actual requirement, and the one that matters as the set
+/// grows: it is easy to add a twenty-first material that looks fine on its own
+/// and is indistinguishable from the fourth. Every pair is compared, drawn in
+/// the same grey, so only pattern can separate them.
+#[test]
+fn every_material_is_distinguishable_from_every_other() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    const PPM: f32 = 26.0;
+    let rendered: Vec<(&str, Vec<u8>)> = ALL
+        .iter()
+        .map(|(m, name)| {
+            let px = render(
+                &gpu,
+                &quad_with(Some(
+                    Surface::new(*m).scale_m(0.35 * PPM).m_per_px(1.0 / PPM),
+                )),
+            );
+            (*name, px)
+        })
+        .collect();
+
+    // Each must draw something with structure at a legible size.
+    for (name, px) in &rendered {
+        assert!(
+            variation(px) > 0.015,
+            "{name} draws nothing: variation {:.4}",
+            variation(px)
+        );
+        assert!(
+            coarse_variation(px) > 0.008,
+            "{name} is noise rather than a pattern: coarse variation {:.4}",
+            coarse_variation(px)
+        );
+    }
+
+    // And every pair must differ. Colour is identical across all of them here,
+    // so any difference found is pattern alone.
+    let mut worst = (f32::MAX, "", "");
+    for (i, (a_name, a)) in rendered.iter().enumerate() {
+        for (b_name, b) in &rendered[i + 1..] {
+            let d = difference(a, b);
+            if d < worst.0 {
+                worst = (d, a_name, b_name);
+            }
+            assert!(
+                d > 0.004,
+                "{a_name} and {b_name} are too alike with colour removed: {d:.4}"
+            );
+        }
+    }
+    println!(
+        "closest pair: {} and {} at {:.4}",
+        worst.1, worst.2, worst.0
+    );
+}
+
+/// Dolomite is limestone plus a tick in each course. That tick is the whole
+/// convention distinguishing two rocks a miner must not confuse, and it is the
+/// most likely thing in the set to be lost to a scaling change.
+#[test]
+fn dolomite_is_not_limestone() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+    const PPM: f32 = 26.0;
+    let at = |m| {
+        render(
+            &gpu,
+            &quad_with(Some(
+                Surface::new(m).scale_m(0.35 * PPM).m_per_px(1.0 / PPM),
+            )),
+        )
+    };
+    let lime = at(Material::Limestone);
+    let dol = at(Material::Dolomite);
+    let d = difference(&lime, &dol);
+    // A tick in every brick over a ten-metre view. The measure is a mean over
+    // every pixel, and ticks are ink on a mostly plain field, so a few
+    // thousandths here is a plainly visible difference on screen -- confirmed
+    // by eye against the rendered swatches, not assumed.
+    assert!(
+        d > 0.004,
+        "the dolomite tick must read against limestone's courses, differ by only {d:.4}"
+    );
+    // Dolomite carries strictly more ink: the same courses, plus the ticks.
+    assert!(
+        variation(&dol) > variation(&lime) * 0.9,
+        "dolomite should not be plainer than limestone"
+    );
+}
+
 #[test]
 fn a_pattern_fades_out_before_it_aliases() {
     let Some(gpu) = gpu() else {
@@ -407,14 +530,17 @@ fn a_pattern_fades_out_before_it_aliases() {
     };
 
     // Zoomed far out, one pattern cell is smaller than a pixel. Drawing the
-    // hatch there would moire, so it must fade to honest flat colour.
-    let tiny = Surface::new(Material::Stone).scale_m(0.35).m_per_px(1.0);
-    let far = render(&gpu, &quad_with(Some(tiny)));
-    assert!(
-        variation(&far) < 0.01,
-        "a pattern finer than a pixel must fade to flat, got {:.4}",
-        variation(&far)
-    );
+    // hatch there would moire, so every material must fade to honest flat
+    // colour -- a single material that refuses would shimmer on the map.
+    for (m, name) in ALL {
+        let tiny = Surface::new(m).scale_m(0.35).m_per_px(1.0);
+        let far = render(&gpu, &quad_with(Some(tiny)));
+        assert!(
+            variation(&far) < 0.01,
+            "{name} must fade to flat when finer than a pixel, got {:.4}",
+            variation(&far)
+        );
+    }
 
     // Close in, the same material must show its pattern.
     let near = Surface::new(Material::Stone)

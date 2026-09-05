@@ -91,12 +91,54 @@ pub enum Material {
     /// Flat colour. What every primitive draws unless told otherwise.
     #[default]
     Solid = 0,
+
+    // --- Ground cover ---------------------------------------------------
     /// Fine short strokes at varied angles, denser in clumps: turf.
     Grass = 1,
     /// Irregular fine stipple with occasional coarser grains: bare earth.
     Dirt = 2,
     /// Angular cracks and mottled patches: broken rock.
     Stone = 3,
+    /// Loose angular fragments of every size: talus, and a mine's waste dump.
+    Scree = 4,
+    /// Rounded, sorted, water-worn: a creek bed or a placer wash.
+    Gravel = 5,
+    /// Wind-drifted ripples, no fragments at all.
+    Sand = 6,
+    /// Cracked polygons of dried mud: a playa or a dry wash bottom.
+    Cracked = 7,
+    /// Rough bark and radiating grain: a stump or a cut end of timber.
+    Timber = 8,
+    /// Sawn end grain: concentric rings, for a beam seen end-on.
+    EndGrain = 9,
+
+    // --- Lithology ------------------------------------------------------
+    // The eight the UI spec names, each with the pattern a survey drawing
+    // uses for it. Colour never distinguishes a rock on its own.
+    /// Scattered stipple dots of irregular size.
+    Alluvium = 16,
+    /// Dense horizontal fine lines, close spaced: bedded shale.
+    Shale = 17,
+    /// Uniform fine stipple, even across the field.
+    Sandstone = 18,
+    /// Brick courses: horizontal lines with offset verticals.
+    Limestone = 19,
+    /// Brick courses with a 45 degree tick in each: the dolomite convention.
+    Dolomite = 20,
+    /// Fine cross-hatch at 45 and 135 degrees.
+    Quartzite = 21,
+    /// Randomised crosses and plus marks at low density.
+    Granite = 22,
+    /// Irregular blotches: the iron-oxide cap over a sulphide body.
+    Gossan = 23,
+
+    // --- Mineralisation and workings ------------------------------------
+    /// Bright cubic glints: galena and the like in a face.
+    OreSulphide = 32,
+    /// Massive, glassy, faintly banded: a quartz vein.
+    Quartz = 33,
+    /// Timbered ground: regular set marks, for a driven and supported drift.
+    Timbered = 34,
 }
 
 /// How a material is applied over its region.

@@ -148,6 +148,264 @@ fn pat_stone(p: vec2<f32>) -> f32 {
     return clamp(crack + mottle, 0.0, 1.0);
 }
 
+// --- Shared drawing helpers -------------------------------------------------
+
+// Worley cells: nearest and next-nearest site distance. The basis for anything
+// that breaks into blocks or fragments.
+fn worley(p: vec2<f32>) -> vec2<f32> {
+    let base = floor(p);
+    var d1 = 8.0;
+    var d2 = 8.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            let cell = base + vec2<f32>(f32(x), f32(y));
+            let site = cell + hash2v(cell);
+            let d = length(site - p);
+            if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) { d2 = d; }
+        }
+    }
+    return vec2<f32>(d1, d2);
+}
+
+// A ruled line every unit in y. The basis for bedding, courses, and hatching.
+fn rule_h(y: f32, thickness: f32) -> f32 {
+    let d = abs(fract(y) - 0.5);
+    return 1.0 - smoothstep(thickness * 0.5, thickness, d);
+}
+
+// Rotate into a hatch direction.
+fn rot(p: vec2<f32>, a: f32) -> vec2<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return vec2<f32>(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+// Scattered dots: `density` of cells carry one, `size` sets the radius.
+fn stipple(p: vec2<f32>, density: f32, size: f32, vary: f32) -> f32 {
+    let cell = floor(p);
+    let local = fract(p) - 0.5;
+    let r = hash2v(cell);
+    let has = step(1.0 - density, hash2(cell + vec2<f32>(5.2, 1.3)));
+    let radius = size * (1.0 - vary + vary * r.y * 2.0);
+    let d = length(local - (r - 0.5) * 0.6);
+    return has * (1.0 - smoothstep(radius * 0.55, radius, d));
+}
+
+// --- Ground cover -----------------------------------------------------------
+
+// Talus and mine waste: angular fragments of every size, jumbled.
+fn pat_scree(p: vec2<f32>) -> f32 {
+    let a = worley(p);
+    let coarse = 1.0 - smoothstep(0.01, 0.07, a.y - a.x);
+    let b = worley(p * 2.7 + vec2<f32>(11.3, 4.1));
+    let fine = 1.0 - smoothstep(0.02, 0.10, b.y - b.x);
+    // Shading on each face, so fragments read as solid rather than as outlines.
+    let facet = smoothstep(0.3, 0.9, value_noise(p * 3.5)) * 0.25;
+    return clamp(max(coarse, fine * 0.7) + facet, 0.0, 1.0);
+}
+
+// Creek bed: rounded, sorted, water-worn stones packed together.
+fn pat_gravel(p: vec2<f32>) -> f32 {
+    let w = worley(p);
+    // Shade by distance from each cell centre, so stones read as domed rather
+    // than as cracked.
+    let dome = smoothstep(0.0, 0.55, w.x);
+    let seam = 1.0 - smoothstep(0.02, 0.09, w.y - w.x);
+    return clamp(dome * 0.55 + seam * 0.7, 0.0, 1.0);
+}
+
+// Wind-drifted sand: ripples, no fragments at all.
+fn pat_sand(p: vec2<f32>) -> f32 {
+    // Crests bent by a slow field, so they are not ruled lines.
+    let bend = value_noise(p * 0.35) * 2.4;
+    let ripple = sin((p.y + bend) * 6.2831) * 0.5 + 0.5;
+    let grain = value_noise(p * 9.0) * 0.18;
+    return clamp(smoothstep(0.55, 0.95, ripple) * 0.7 + grain, 0.0, 1.0);
+}
+
+// Dried mud: the polygon crack pattern of a playa.
+fn pat_cracked(p: vec2<f32>) -> f32 {
+    let w = worley(p);
+    // Wide, soft-shouldered cracks: mud shrinks away from itself.
+    let crack = 1.0 - smoothstep(0.015, 0.09, w.y - w.x);
+    // Each plate curls, so its middle is lighter than its edge.
+    let curl = smoothstep(0.2, 0.6, w.x) * 0.2;
+    return clamp(crack - curl, 0.0, 1.0);
+}
+
+// Timber from the side: bark furrows running along the grain.
+fn pat_timber(p: vec2<f32>) -> f32 {
+    let wander = value_noise(p * vec2<f32>(0.6, 2.2)) * 0.55;
+    let furrow = rule_h(p.y * 2.4 + wander, 0.35);
+    // Broken along their length, because bark is not continuous.
+    let breaks = smoothstep(0.35, 0.75, value_noise(p * vec2<f32>(3.5, 0.8)));
+    return clamp(furrow * (0.45 + 0.55 * breaks), 0.0, 1.0);
+}
+
+// Sawn end grain: growth rings about the pith.
+fn pat_endgrain(p: vec2<f32>) -> f32 {
+    // Rings, unevenly spaced the way seasons actually are.
+    let r = length(p) + value_noise(p * 1.7) * 0.25;
+    let ring = rule_h(r * 3.6, 0.32);
+    // Radial drying checks, running out from the centre.
+    let ang = atan2(p.y, p.x);
+    let check = step(0.86, value_noise(vec2<f32>(ang * 2.4, 0.0)) + 0.35)
+        * (1.0 - smoothstep(0.1, 1.2, length(p)));
+    return clamp(ring * 0.8 + check * 0.5, 0.0, 1.0);
+}
+
+// --- Lithology --------------------------------------------------------------
+
+// Alluvium: scattered stipple of irregular size, loose and unbedded.
+fn pat_alluvium(p: vec2<f32>) -> f32 {
+    let big = stipple(p * 1.6, 0.55, 0.30, 0.7);
+    let small = stipple(p * 3.1 + vec2<f32>(7.0, 7.0), 0.35, 0.16, 0.5);
+    return clamp(big + small * 0.6, 0.0, 1.0);
+}
+
+// Shale: dense horizontal bedding, close spaced. The most ruled of the set.
+fn pat_shale(p: vec2<f32>) -> f32 {
+    // Slight waviness, because bedding is never dead straight.
+    let wave = value_noise(p * vec2<f32>(0.4, 0.15)) * 0.2;
+    let bed = rule_h(p.y * 3.2 + wave, 0.22);
+    // Partings: occasional heavier lines where the rock splits.
+    let parting = rule_h(p.y * 0.8 + wave * 0.5, 0.12) * 0.6;
+    return clamp(bed * 0.75 + parting, 0.0, 1.0);
+}
+
+// Sandstone: uniform fine stipple. Deliberately plain -- it is the neutral rock
+// the others are read against.
+fn pat_sandstone(p: vec2<f32>) -> f32 {
+    return clamp(stipple(p * 3.4, 0.7, 0.22, 0.25), 0.0, 1.0);
+}
+
+// Brick courses, shared by limestone and dolomite: horizontal beds with
+// staggered vertical joints, the standard carbonate convention.
+// A brick is `BRICK_W` wide and one unit tall in course space. Wide, because a
+// carbonate course on a survey drawing is a long flat brick, and because a
+// nearly square brick reads as woven cloth rather than as masonry.
+const BRICK_W: f32 = 1.15;
+/// Courses per pattern unit. Well below one: a carbonate bed is a broad band,
+/// and drawing one per unit turns the rock into ruled paper on which the
+/// dolomite tick cannot be seen at all.
+const COURSE: f32 = 0.22;
+
+fn courses(p: vec2<f32>) -> f32 {
+    let course = floor(p.y);
+    // Every other course offset half a brick, so joints never line up.
+    let stagger = fract(course * 0.5);
+    let bed = rule_h(p.y, 0.13);
+    let joint_x = p.x / BRICK_W + stagger;
+    let joint = 1.0 - smoothstep(0.010, 0.028, abs(fract(joint_x) - 0.5));
+    // Joints run within their own course, never across the bedding.
+    let inside = 1.0 - rule_h(p.y, 0.26);
+    return clamp(bed + joint * inside, 0.0, 1.0);
+}
+
+fn pat_limestone(p: vec2<f32>) -> f32 {
+    return courses(p * COURSE);
+}
+
+// Dolomite: the same courses, with the 45 degree tick in each that is the
+// standard convention distinguishing it from limestone.
+fn pat_dolomite(p: vec2<f32>) -> f32 {
+    let q = p * COURSE;
+    let base = courses(q);
+    // One tick per brick, in the middle of its own course.
+    let brick = vec2<f32>(q.x / BRICK_W + fract(floor(q.y) * 0.5), q.y);
+    let local = vec2<f32>(fract(brick.x) - 0.5, fract(brick.y) - 0.5);
+    // Undo the brick's aspect so the tick sits at a true 45 degrees.
+    let square = vec2<f32>(local.x * BRICK_W, local.y);
+    let d = rot(square, -0.7854);
+    let tick = (1.0 - smoothstep(0.05, 0.10, abs(d.y)))
+        * (1.0 - smoothstep(0.22, 0.32, abs(d.x)));
+    return clamp(base + tick, 0.0, 1.0);
+}
+
+// Quartzite: fine cross-hatch at 45 and 135 degrees.
+fn pat_quartzite(p: vec2<f32>) -> f32 {
+    let a = rot(p, 0.7854);
+    let b = rot(p, -0.7854);
+    let h1 = rule_h(a.y * 2.6, 0.16);
+    let h2 = rule_h(b.y * 2.6, 0.16);
+    return clamp(max(h1, h2) * 0.85, 0.0, 1.0);
+}
+
+// Granite: randomised crosses and plus marks at low density -- the crystalline
+// convention. Individual marks scattered on the field, not a hatch.
+fn pat_granite(p: vec2<f32>) -> f32 {
+    var mark = 0.0;
+    // One lattice, at pattern scale, so each mark has room to be a drawn
+    // symbol rather than a speck. Low density is the convention: granite is
+    // mostly open ground with crosses scattered on it.
+    for (var k = 0; k < 2; k = k + 1) {
+        let q = p * 0.62 + vec2<f32>(f32(k) * 0.5, f32(k) * 0.27);
+        let cell = floor(q);
+        let local = fract(q) - 0.5;
+        let r = hash2v(cell);
+        if (hash2(cell + vec2<f32>(4.4, 8.8)) < 0.42) { continue; }
+        // Half plus marks, half crosses, as a geological drawing has both.
+        var ang = 0.0;
+        if (r.x > 0.5) { ang = 0.7854; }
+        let d = rot(local - (r - 0.5) * 0.35, ang);
+        let arm = 0.20 + r.y * 0.10;
+        let w = 0.035;
+        let bar1 = (1.0 - smoothstep(w, w * 1.8, abs(d.y)))
+            * (1.0 - smoothstep(arm * 0.85, arm, abs(d.x)));
+        let bar2 = (1.0 - smoothstep(w, w * 1.8, abs(d.x)))
+            * (1.0 - smoothstep(arm * 0.85, arm, abs(d.y)));
+        mark = max(mark, max(bar1, bar2));
+    }
+    // A very light speckle between the marks, well under them.
+    let speck = stipple(p * 2.6, 0.18, 0.07, 0.4) * 0.22;
+    return clamp(mark + speck, 0.0, 1.0);
+}
+
+// Gossan: irregular blotches of iron oxide, pitted through with boxwork voids.
+fn pat_gossan(p: vec2<f32>) -> f32 {
+    let a = value_noise(p * 1.1);
+    let b = value_noise(p * 2.7 + vec2<f32>(13.0, 13.0));
+    let blotch = smoothstep(0.45, 0.75, a * 0.65 + b * 0.35);
+    let pit = stipple(p * 3.2, 0.4, 0.20, 0.6) * 0.55;
+    return clamp(blotch * 0.8 + pit, 0.0, 1.0);
+}
+
+// --- Mineralisation and workings --------------------------------------------
+
+// Sulphide ore: bright cubic glints scattered through the rock.
+fn pat_ore_sulphide(p: vec2<f32>) -> f32 {
+    var glint = 0.0;
+    for (var k = 0; k < 2; k = k + 1) {
+        let q = p * 1.8 + vec2<f32>(f32(k) * 0.41, f32(k) * 0.67);
+        let cell = floor(q);
+        let local = fract(q) - 0.5;
+        let r = hash2v(cell);
+        if (hash2(cell + vec2<f32>(6.1, 2.2)) < 0.55) { continue; }
+        // A little square, turned: galena breaks in cubes.
+        let d = rot(local - (r - 0.5) * 0.45, r.x * 1.57);
+        let s = 0.10 + r.y * 0.09;
+        let cube = (1.0 - smoothstep(s * 0.75, s, abs(d.x)))
+            * (1.0 - smoothstep(s * 0.75, s, abs(d.y)));
+        glint = max(glint, cube);
+    }
+    return clamp(glint, 0.0, 1.0);
+}
+
+// Quartz: massive and glassy, faintly banded, with sparse curved fracture.
+fn pat_quartz(p: vec2<f32>) -> f32 {
+    let band = smoothstep(0.4, 0.6, value_noise(p * vec2<f32>(0.5, 1.8)));
+    let w = worley(p * 0.8);
+    let frac = (1.0 - smoothstep(0.03, 0.13, w.y - w.x)) * 0.5;
+    return clamp(band * 0.30 + frac, 0.0, 1.0);
+}
+
+// Timbered ground: the regular marks of sets standing in a drift.
+fn pat_timbered(p: vec2<f32>) -> f32 {
+    let posts = rule_h(p.x * 1.0, 0.22);
+    let lag = rule_h(p.y * 3.0, 0.10) * 0.4;
+    return clamp(posts * 0.85 + lag, 0.0, 1.0);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
@@ -168,12 +426,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     var v = 0.0;
-    if (id == 1u) {
-        v = pat_grass(in.pattern);
-    } else if (id == 2u) {
-        v = pat_dirt(in.pattern);
-    } else if (id == 3u) {
-        v = pat_stone(in.pattern);
+    switch (id) {
+        // Ground cover.
+        case 1u: { v = pat_grass(in.pattern); }
+        case 2u: { v = pat_dirt(in.pattern); }
+        case 3u: { v = pat_stone(in.pattern); }
+        case 4u: { v = pat_scree(in.pattern); }
+        case 5u: { v = pat_gravel(in.pattern); }
+        case 6u: { v = pat_sand(in.pattern); }
+        case 7u: { v = pat_cracked(in.pattern); }
+        case 8u: { v = pat_timber(in.pattern); }
+        case 9u: { v = pat_endgrain(in.pattern); }
+        // Lithology.
+        case 16u: { v = pat_alluvium(in.pattern); }
+        case 17u: { v = pat_shale(in.pattern); }
+        case 18u: { v = pat_sandstone(in.pattern); }
+        case 19u: { v = pat_limestone(in.pattern); }
+        case 20u: { v = pat_dolomite(in.pattern); }
+        case 21u: { v = pat_quartzite(in.pattern); }
+        case 22u: { v = pat_granite(in.pattern); }
+        case 23u: { v = pat_gossan(in.pattern); }
+        // Mineralisation and workings.
+        case 32u: { v = pat_ore_sulphide(in.pattern); }
+        case 33u: { v = pat_quartz(in.pattern); }
+        case 34u: { v = pat_timbered(in.pattern); }
+        default: { v = 0.0; }
     }
 
     let strength = f32((in.material >> 16u) & 0xFFu) / 255.0;
