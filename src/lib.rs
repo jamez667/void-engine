@@ -16,6 +16,7 @@ pub mod renderer;
 pub mod rng;
 pub mod sector;
 pub mod text;
+pub mod terrain;
 pub mod tile_collide;
 pub mod tilegrid;
 pub mod time;
