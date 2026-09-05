@@ -106,8 +106,11 @@ fn pat_grass(p: vec2<f32>) -> f32 {
         let base = local - (r - 0.5) * 0.55;
         let along = clamp(dot(base, dir), -0.42, 0.42);
         let d = length(base - dir * along);
-        // Thin and crisp: a blade is a line, not a smudge.
-        blade = max(blade, 1.0 - smoothstep(0.015, 0.075, d));
+        // Wide enough to survive. A blade at 0.015 of a cell is under a pixel
+        // wherever the cell is small enough to hold several blades, so it
+        // averages away and the cover comes out as flat colour -- which is
+        // exactly what turf did on the map before this was widened.
+        blade = max(blade, 1.0 - smoothstep(0.05, 0.16, d));
     }
     return blade * clamp(clump * 1.6, 0.35, 1.0);
 }
