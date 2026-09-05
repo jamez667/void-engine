@@ -5,6 +5,8 @@ fixed-timestep loop, and an immediate-mode UI layer.
 
 Extracted from [void-claim](https://github.com/jamez667/void-claim), where it
 had been a workspace crate. It has no dependencies on that game — only crates.io.
+The `terrain` module came the same way out of
+[idle-city-sim](https://github.com/jamez667/idle-city-sim).
 
 ## Use
 
@@ -31,6 +33,7 @@ void_engine = { git = "ssh://git@github.com/jamez667/void-engine.git", default-f
 | `fx` | Particles, starfield, rings, bubbles, floaty text |
 | `input` | Keyboard/mouse state and rebindable keybinds |
 | `math`, `render_math`, `physics`, `collision`, `pathfind` | Simulation primitives |
+| `terrain` | Procedural worldgen building blocks: seeded noise/fBm, heightfield ramps and erosion operators, rivers |
 | `tilegrid`, `tile_collide`, `walk`, `sector`, `world` | World representation |
 | `net` | Snapshot interpolation |
 | `audio` | MP3 playback (feature-gated) |
