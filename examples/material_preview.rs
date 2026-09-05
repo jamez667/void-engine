@@ -7,7 +7,7 @@
 //! Run with:
 //!     cargo run -p void_engine --example material_preview -- out.png
 
-use void_engine::renderer::batch::{Batch, Material, Surface, Vertex};
+use void_engine::renderer::batch::{Batch, Blend, Material, Overlay, Surface, Vertex};
 
 const W: u32 = 1000;
 const H: u32 = 820;
@@ -31,59 +31,107 @@ fn main() {
     ))
     .expect("device");
 
-    // Every material, in its own colour, at one working zoom. Laid out in a
-    // grid so the whole library can be compared at a glance -- which is the
-    // point: these have to be told apart from one another, not merely look
-    // like something on their own.
-    let swatches: [(Material, [f32; 4], &str); 20] = [
-        (Material::Grass, [0.38, 0.46, 0.28, 1.0], "grass"),
-        (Material::Dirt, [0.52, 0.42, 0.30, 1.0], "dirt"),
-        (Material::Stone, [0.56, 0.56, 0.54, 1.0], "stone"),
-        (Material::Scree, [0.60, 0.57, 0.51, 1.0], "scree"),
-        (Material::Gravel, [0.63, 0.60, 0.54, 1.0], "gravel"),
-        (Material::Sand, [0.78, 0.70, 0.52, 1.0], "sand"),
-        (Material::Cracked, [0.66, 0.58, 0.46, 1.0], "cracked mud"),
-        (Material::Timber, [0.42, 0.33, 0.21, 1.0], "timber"),
-        (Material::EndGrain, [0.58, 0.46, 0.30, 1.0], "end grain"),
-        (Material::Alluvium, [0.85, 0.79, 0.64, 1.0], "alluvium"),
-        (Material::Shale, [0.55, 0.58, 0.63, 1.0], "shale"),
-        (Material::Sandstone, [0.82, 0.66, 0.36, 1.0], "sandstone"),
-        (Material::Limestone, [0.62, 0.71, 0.72, 1.0], "limestone"),
-        (Material::Dolomite, [0.66, 0.69, 0.65, 1.0], "dolomite"),
-        (Material::Quartzite, [0.77, 0.66, 0.63, 1.0], "quartzite"),
-        (Material::Granite, [0.69, 0.54, 0.51, 1.0], "granite"),
-        (Material::Gossan, [0.56, 0.35, 0.18, 1.0], "gossan"),
-        (Material::OreSulphide, [0.42, 0.44, 0.47, 1.0], "sulphide ore"),
-        (Material::Quartz, [0.86, 0.84, 0.80, 1.0], "quartz"),
-        (Material::Timbered, [0.47, 0.40, 0.31, 1.0], "timbered"),
-    ];
+    // Two boards: the material library, and what colouring and layering do to
+    // it. Pass "blend" as a second argument for the latter.
+    let show_blend = std::env::args().nth(2).as_deref() == Some("blend");
 
-    const COLS: usize = 5;
     const PPM: f32 = 26.0;
+    let base = |m| {
+        Surface::new(m)
+            .scale_m(0.35 * PPM)
+            .m_per_px(1.0 / PPM)
+    };
+
+    // (surface, ground colour, label)
+    let mut swatches: Vec<(Surface, [f32; 4], String)> = Vec::new();
+
+    if show_blend {
+        let lime = [0.62, 0.71, 0.72, 1.0];
+        let rock = [0.56, 0.56, 0.54, 1.0];
+        let rust = [0.62, 0.26, 0.10];
+        let pale = [0.92, 0.90, 0.84];
+
+        // One pattern, four inks: the ink is not baked into the material.
+        swatches.push((base(Material::Shale), lime, "shale, survey ink".into()));
+        swatches.push((base(Material::Shale).ink(rust), lime, "shale, rust ink".into()));
+        swatches.push((base(Material::Shale).ink([0.18, 0.31, 0.48]), lime, "shale, blue ink".into()));
+        swatches.push((base(Material::Shale).ink(pale), [0.35, 0.33, 0.30, 1.0], "shale, pale ink".into()));
+
+        // One pattern, four blend modes.
+        swatches.push((base(Material::Stone).ink(rust).blend(Blend::Ink), rock, "stone, ink".into()));
+        swatches.push((base(Material::Stone).ink(rust).blend(Blend::Shade), rock, "stone, shade".into()));
+        swatches.push((base(Material::Stone).ink(pale).blend(Blend::Lighten), rock, "stone, lighten".into()));
+        swatches.push((base(Material::Stone).ink(rust).blend(Blend::Stain), rock, "stone, stain".into()));
+
+        // Layering: one rock, then the same rock with a history.
+        swatches.push((base(Material::Limestone), lime, "limestone".into()));
+        swatches.push((
+            base(Material::Limestone).ink(rust).over(
+                Overlay::new(Material::Gossan).strength(0.75).blend(Blend::Stain),
+            ),
+            lime,
+            "limestone + gossan".into(),
+        ));
+        swatches.push((
+            base(Material::Quartzite).ink(pale).over(
+                Overlay::new(Material::Quartz).strength(0.8).blend(Blend::Lighten),
+            ),
+            [0.70, 0.62, 0.60, 1.0],
+            "quartzite + quartz".into(),
+        ));
+        swatches.push((
+            base(Material::Shale).over(
+                Overlay::new(Material::OreSulphide)
+                    .strength(0.9)
+                    .blend(Blend::Lighten)
+                    .scale_ratio(0.8),
+            ),
+            [0.44, 0.46, 0.50, 1.0],
+            "shale + sulphide".into(),
+        ));
+    } else {
+        let lib: [(Material, [f32; 4], &str); 20] = [
+            (Material::Grass, [0.38, 0.46, 0.28, 1.0], "grass"),
+            (Material::Dirt, [0.52, 0.42, 0.30, 1.0], "dirt"),
+            (Material::Stone, [0.56, 0.56, 0.54, 1.0], "stone"),
+            (Material::Scree, [0.60, 0.57, 0.51, 1.0], "scree"),
+            (Material::Gravel, [0.63, 0.60, 0.54, 1.0], "gravel"),
+            (Material::Sand, [0.78, 0.70, 0.52, 1.0], "sand"),
+            (Material::Cracked, [0.66, 0.58, 0.46, 1.0], "cracked mud"),
+            (Material::Timber, [0.42, 0.33, 0.21, 1.0], "timber"),
+            (Material::EndGrain, [0.58, 0.46, 0.30, 1.0], "end grain"),
+            (Material::Alluvium, [0.85, 0.79, 0.64, 1.0], "alluvium"),
+            (Material::Shale, [0.55, 0.58, 0.63, 1.0], "shale"),
+            (Material::Sandstone, [0.82, 0.66, 0.36, 1.0], "sandstone"),
+            (Material::Limestone, [0.62, 0.71, 0.72, 1.0], "limestone"),
+            (Material::Dolomite, [0.66, 0.69, 0.65, 1.0], "dolomite"),
+            (Material::Quartzite, [0.77, 0.66, 0.63, 1.0], "quartzite"),
+            (Material::Granite, [0.69, 0.54, 0.51, 1.0], "granite"),
+            (Material::Gossan, [0.56, 0.35, 0.18, 1.0], "gossan"),
+            (Material::OreSulphide, [0.42, 0.44, 0.47, 1.0], "sulphide ore"),
+            (Material::Quartz, [0.86, 0.84, 0.80, 1.0], "quartz"),
+            (Material::Timbered, [0.47, 0.40, 0.31, 1.0], "timbered"),
+        ];
+        for (m, c, name) in lib {
+            swatches.push((base(m), c, name.into()));
+        }
+    }
+
+    const COLS: usize = 4;
     let pad = 14.0;
     let cell_w = (W as f32 - pad * (COLS as f32 + 1.0)) / COLS as f32;
     let rows = swatches.len().div_ceil(COLS);
     let cell_h = (H as f32 - pad * (rows as f32 + 1.0)) / rows as f32;
 
     let mut batch = Batch::new();
-    for (i, (material, colour, _)) in swatches.iter().enumerate() {
+    for (i, (surface, colour, _)) in swatches.iter().enumerate() {
         let (col, row) = (i % COLS, i / COLS);
         let x = -(W as f32) * 0.5 + pad + col as f32 * (cell_w + pad) + cell_w * 0.5;
         let y = (H as f32) * 0.5 - pad - row as f32 * (cell_h + pad) - cell_h * 0.5;
 
-        batch.with_surface(
-            Surface::new(*material)
-                .scale_m(0.35 * PPM)
-                .m_per_px(1.0 / PPM),
-            |b| {
-                b.rect(
-                    glam::Vec2::new(x, y),
-                    glam::Vec2::new(cell_w, cell_h),
-                    *colour,
-                );
-            },
-        );
-        // A ruled top edge, drawn flat, so each swatch reads as a sample.
+        batch.with_surface(*surface, |b| {
+            b.rect(glam::Vec2::new(x, y), glam::Vec2::new(cell_w, cell_h), *colour);
+        });
         batch.rect(
             glam::Vec2::new(x, y + cell_h * 0.5),
             glam::Vec2::new(cell_w, 1.5),
@@ -95,8 +143,7 @@ fn main() {
     write_png(&out, W, H, &pixels);
     println!("wrote {out}");
     for (i, (_, _, name)) in swatches.iter().enumerate() {
-        let (col, row) = (i % COLS, i / COLS);
-        println!("  r{row} c{col}  {name}");
+        println!("  r{} c{}  {name}", i / COLS, i % COLS);
     }
 }
 

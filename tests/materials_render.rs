@@ -9,7 +9,7 @@
 //! Skipped, not failed, when no adapter is available: CI without a GPU should
 //! not report a red build for a machine limitation.
 
-use void_engine::renderer::batch::{Batch, Material, Surface, Vertex};
+use void_engine::renderer::batch::{Batch, Blend, Material, Overlay, Surface, Vertex};
 
 const W: u32 = 256;
 const H: u32 = 256;
@@ -550,6 +550,191 @@ fn a_pattern_fades_out_before_it_aliases() {
     assert!(
         variation(&close) > 0.02,
         "the same material must pattern when its features are visible"
+    );
+}
+
+/// Mean colour of a render, so a change of ink can be checked for.
+fn mean_rgb(px: &[u8]) -> [f32; 3] {
+    let mut sum = [0.0f32; 3];
+    let n = (px.len() / 4) as f32;
+    for p in px.chunks(4) {
+        sum[0] += p[0] as f32;
+        sum[1] += p[1] as f32;
+        sum[2] += p[2] as f32;
+    }
+    [sum[0] / n / 255.0, sum[1] / n / 255.0, sum[2] / n / 255.0]
+}
+
+const WORKING_PPM: f32 = 26.0;
+
+fn surf(m: Material) -> Surface {
+    Surface::new(m)
+        .scale_m(0.35 * WORKING_PPM)
+        .m_per_px(1.0 / WORKING_PPM)
+}
+
+/// The colour a pattern draws in is separate from the ground it sits on.
+///
+/// This is what makes one pattern serve many rocks: the same hatch in rust for
+/// oxidation, in blue-grey for a parting, in near-black for survey ink. If ink
+/// were baked into the shader, every recolour would need a new material.
+#[test]
+fn ink_colour_is_independent_of_the_ground() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    let dark = render(&gpu, &quad_with(Some(surf(Material::Shale))));
+    let rust = render(
+        &gpu,
+        &quad_with(Some(surf(Material::Shale).ink([0.65, 0.22, 0.08]))),
+    );
+
+    // Same ground, same pattern, different ink: the render must differ, and
+    // must differ toward red.
+    assert!(
+        difference(&dark, &rust) > 0.004,
+        "changing the ink must change the render"
+    );
+    let (a, b) = (mean_rgb(&dark), mean_rgb(&rust));
+    assert!(
+        b[0] - b[2] > a[0] - a[2] + 0.005,
+        "rust ink must push the render red: {a:?} -> {b:?}"
+    );
+
+    // And the ground colour still governs: the same ink over a different
+    // ground gives a different result, so neither is baked into the other.
+    let mut pale = Batch::new();
+    pale.set_surface(surf(Material::Shale).ink([0.65, 0.22, 0.08]));
+    pale.rect(
+        glam::Vec2::ZERO,
+        glam::Vec2::new(W as f32, H as f32),
+        [0.85, 0.85, 0.80, 1.0],
+    );
+    let on_pale = render(&gpu, &pale);
+    assert!(
+        difference(&on_pale, &rust) > 0.02,
+        "the ground under the ink must still show through"
+    );
+}
+
+/// Each blend mode must do something different to the same pattern, or the
+/// mode is decoration rather than a control.
+#[test]
+fn blend_modes_are_distinct() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    let at = |b: Blend| {
+        render(
+            &gpu,
+            &quad_with(Some(surf(Material::Stone).blend(b).ink([0.70, 0.30, 0.12]))),
+        )
+    };
+    let ink = at(Blend::Ink);
+    let shade = at(Blend::Shade);
+    let lighten = at(Blend::Lighten);
+    let stain = at(Blend::Stain);
+
+    for (a_name, a, b_name, b) in [
+        ("ink", &ink, "shade", &shade),
+        ("ink", &ink, "lighten", &lighten),
+        ("ink", &ink, "stain", &stain),
+        ("shade", &shade, "lighten", &lighten),
+        ("shade", &shade, "stain", &stain),
+        ("lighten", &lighten, "stain", &stain),
+    ] {
+        assert!(
+            difference(a, b) > 0.004,
+            "{a_name} and {b_name} must differ, got {:.4}",
+            difference(a, b)
+        );
+    }
+
+    // Lighten must lighten and shade must darken: the names have to be true.
+    let flat = mean_rgb(&render(&gpu, &quad_with(None)));
+    let l = mean_rgb(&lighten);
+    let s = mean_rgb(&shade);
+    let lum = |c: [f32; 3]| c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+    assert!(lum(l) > lum(flat), "Lighten must lighten the ground");
+    assert!(lum(s) < lum(flat), "Shade must darken the ground");
+}
+
+/// Two materials must compose into one surface, in one pass.
+///
+/// This is the point of layering: gossan staining over limestone is one rock
+/// with a history, not a new material that has to be authored from scratch.
+#[test]
+fn an_overlay_modifies_the_material_under_it() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    let plain = render(&gpu, &quad_with(Some(surf(Material::Limestone))));
+    let stained = render(
+        &gpu,
+        &quad_with(Some(
+            surf(Material::Limestone).over(
+                Overlay::new(Material::Gossan)
+                    .strength(0.7)
+                    .blend(Blend::Stain),
+            ),
+        )),
+    );
+
+    assert!(
+        difference(&plain, &stained) > 0.006,
+        "an overlay must change what is drawn: {:.4}",
+        difference(&plain, &stained)
+    );
+
+    // The base must still be in there: staining a rock does not replace it.
+    // Gossan alone should be further from stained limestone than plain
+    // limestone is, or the overlay has simply painted over the base.
+    let gossan = render(&gpu, &quad_with(Some(surf(Material::Gossan))));
+    assert!(
+        difference(&plain, &stained) < difference(&gossan, &stained),
+        "the base material must still read through its overlay"
+    );
+
+    // And no overlay is the same as before: the feature costs nothing unused.
+    let none = render(&gpu, &quad_with(Some(surf(Material::Limestone))));
+    assert_eq!(
+        difference(&plain, &none),
+        0.0,
+        "a surface with no overlay must render identically"
+    );
+}
+
+/// An overlay fades on its own terms. A fine overlay on a coarse base aliases
+/// sooner than its base does, and must drop out first rather than shimmering.
+#[test]
+fn an_overlay_fades_on_its_own_scale() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    // Zoomed out far enough that the fine overlay is sub-pixel but the coarse
+    // base is not.
+    let base = Surface::new(Material::Limestone)
+        .scale_m(3.0)
+        .m_per_px(0.5)
+        .over(Overlay::new(Material::Sandstone).scale_ratio(8.0));
+    let with_overlay = render(&gpu, &quad_with(Some(base)));
+    let without = render(
+        &gpu,
+        &quad_with(Some(Surface::new(Material::Limestone).scale_m(3.0).m_per_px(0.5))),
+    );
+
+    assert!(
+        difference(&with_overlay, &without) < 0.004,
+        "a sub-pixel overlay must fade out rather than alias: {:.4}",
+        difference(&with_overlay, &without)
     );
 }
 

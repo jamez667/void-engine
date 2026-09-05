@@ -13,10 +13,25 @@ pub struct Vertex {
     /// space, so a hatch stays locked to the ground: it does not swim when the
     /// camera pans, and its scale is stable under zoom.
     pub pattern: [f32; 2],
-    /// Material id in the low 16 bits, flags in the high 16. Zero is the plain
-    /// solid-colour material every existing primitive already uses, so a vertex
-    /// built without thinking about materials behaves exactly as before.
+    /// Base layer: material id in the low 16 bits, strength in bits 16-23, and
+    /// the composite mode in bits 24-27. Zero is the plain solid-colour
+    /// material every existing primitive already uses, so a vertex built
+    /// without thinking about materials behaves exactly as before.
     pub material: u32,
+    /// Second layer, packed the same way, drawn over the first. Zero means no
+    /// overlay -- one layer is the common case and costs nothing extra.
+    ///
+    /// Two layers is what lets a material be *modified* rather than replaced:
+    /// gossan staining over limestone, wet ground over dry, ore glinting in
+    /// its host rock. The pair is composed in the shader, in one pass.
+    pub overlay: u32,
+    /// The colour the pattern draws *in*, as the ink of the base layer.
+    ///
+    /// Kept apart from the vertex colour, which is the ground the pattern sits
+    /// on, so the two can be chosen independently: rust-red staining on grey
+    /// rock, pale efflorescence on dark, blue-grey partings in buff shale.
+    /// Alpha is the overlay's ink weight, so both layers ride in one field.
+    pub ink: [f32; 4],
     /// Metres per pixel at the time the vertex was built.
     ///
     /// The fragment shader needs this to know how dense the hatch would come
@@ -33,6 +48,9 @@ impl Default for Vertex {
             color: [1.0, 1.0, 1.0, 1.0],
             pattern: [0.0, 0.0],
             material: 0,
+            overlay: 0,
+            // Survey ink: the default any pattern draws in until told otherwise.
+            ink: [0.05, 0.05, 0.05, 1.0],
             scale: 1.0,
         }
     }
@@ -73,6 +91,16 @@ impl Vertex {
                 wgpu::VertexAttribute {
                     offset: 44,
                     shader_location: 5,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 48,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 64,
+                    shader_location: 7,
                     format: wgpu::VertexFormat::Float32,
                 },
             ],
@@ -141,7 +169,31 @@ pub enum Material {
     Timbered = 34,
 }
 
+/// How a pattern is combined with the surface under it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum Blend {
+    /// Draw the pattern in its ink, over the ground colour. The usual case:
+    /// hatching on a survey drawing is ink laid on paper.
+    #[default]
+    Ink = 0,
+    /// Darken the ground where the pattern falls, keeping its hue. Shading and
+    /// crevices: what a shadow in a crack actually does to the colour.
+    Shade = 1,
+    /// Lighten the ground where the pattern falls. Quartz, efflorescence, frost
+    /// -- anything that reads as brighter than what it sits on.
+    Lighten = 2,
+    /// Multiply ground and ink together, for staining that takes the colour of
+    /// both: oxidation over rock, damp over dust.
+    Stain = 3,
+}
+
 /// How a material is applied over its region.
+///
+/// A surface is deliberately a value rather than a set of arguments: it is
+/// built once, passed around, stored in a palette table beside a colour, and
+/// composed with another surface as an overlay. That is what makes materials
+/// reusable across the game rather than re-specified at every call site.
 #[derive(Copy, Clone, Debug)]
 pub struct Surface {
     pub material: Material,
@@ -150,14 +202,66 @@ pub struct Surface {
     pub scale_m: f32,
     /// How strongly the pattern departs from the flat colour, 0..1.
     pub strength: f32,
+    /// How the pattern is combined with what is under it.
+    pub blend: Blend,
+    /// The colour the pattern draws in. `None` leaves it at survey ink.
+    pub ink: Option<[f32; 3]>,
+    /// A second material drawn over the first, with its own strength, blend
+    /// and ink weight. This is how a material is modified rather than replaced.
+    pub over: Option<Overlay>,
     /// Metres per pixel on screen, used to fade the pattern out before it
     /// aliases. Set this from the camera zoom.
     pub m_per_px: f32,
 }
 
+/// A second pattern laid over a surface.
+#[derive(Copy, Clone, Debug)]
+pub struct Overlay {
+    pub material: Material,
+    pub strength: f32,
+    pub blend: Blend,
+    /// Feature size relative to the base layer's. Two layers at the same scale
+    /// tend to read as one muddled pattern; a contrasting scale reads as two.
+    pub scale_ratio: f32,
+}
+
+impl Overlay {
+    pub fn new(material: Material) -> Self {
+        Overlay {
+            material,
+            strength: 0.6,
+            blend: Blend::Stain,
+            scale_ratio: 1.7,
+        }
+    }
+
+    pub fn strength(mut self, s: f32) -> Self {
+        self.strength = s.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn blend(mut self, b: Blend) -> Self {
+        self.blend = b;
+        self
+    }
+
+    pub fn scale_ratio(mut self, r: f32) -> Self {
+        self.scale_ratio = r.max(0.01);
+        self
+    }
+}
+
 impl Surface {
     pub fn new(material: Material) -> Self {
-        Surface { material, scale_m: 1.0, strength: 1.0, m_per_px: 1.0 }
+        Surface {
+            material,
+            scale_m: 1.0,
+            strength: 1.0,
+            blend: Blend::Ink,
+            ink: None,
+            over: None,
+            m_per_px: 1.0,
+        }
     }
 
     pub fn scale_m(mut self, m: f32) -> Self {
@@ -170,15 +274,43 @@ impl Surface {
         self
     }
 
+    pub fn blend(mut self, b: Blend) -> Self {
+        self.blend = b;
+        self
+    }
+
+    /// Draw the pattern in a given colour rather than survey ink.
+    pub fn ink(mut self, rgb: [f32; 3]) -> Self {
+        self.ink = Some(rgb);
+        self
+    }
+
+    /// Lay a second pattern over this one.
+    pub fn over(mut self, o: Overlay) -> Self {
+        self.over = Some(o);
+        self
+    }
+
     pub fn m_per_px(mut self, m: f32) -> Self {
         self.m_per_px = m.max(0.0);
         self
     }
 
-    /// Pack the material id and its strength into the vertex material word.
+    /// Pack a material id, strength and blend into one word.
+    fn pack(material: Material, strength: f32, blend: Blend) -> u32 {
+        let s = (strength.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (material as u32 & 0xFFFF) | (s << 16) | ((blend as u32 & 0xF) << 24)
+    }
+
     fn packed(&self) -> u32 {
-        let strength = (self.strength.clamp(0.0, 1.0) * 255.0).round() as u32;
-        (self.material as u32 & 0xFFFF) | (strength << 16)
+        Self::pack(self.material, self.strength, self.blend)
+    }
+
+    fn packed_overlay(&self) -> u32 {
+        match self.over {
+            None => 0,
+            Some(o) => Self::pack(o.material, o.strength, o.blend),
+        }
     }
 }
 
@@ -237,18 +369,28 @@ impl Batch {
     fn vertex(&self, pos: Vec2, uv: [f32; 2], color: [f32; 4]) -> Vertex {
         match self.surface {
             None => Vertex { pos: [pos.x, pos.y], uv, color, ..Default::default() },
-            Some(s) => Vertex {
-                pos: [pos.x, pos.y],
-                uv,
-                color,
-                // Pattern space is world space, divided by the feature size so
-                // the shader always works in units of one pattern cell.
-                pattern: [pos.x / s.scale_m, pos.y / s.scale_m],
-                material: s.packed(),
-                // Carried in the same units, so the shader can compare feature
-                // size against pixel size and fade before it aliases.
-                scale: s.m_per_px / s.scale_m,
-            },
+            Some(s) => {
+                let rgb = s.ink.unwrap_or([0.05, 0.05, 0.05]);
+                // Alpha carries the overlay's feature size relative to the
+                // base, so both layers ride in the fields already present
+                // rather than growing the vertex again.
+                let ratio = s.over.map_or(1.0, |o| o.scale_ratio);
+                Vertex {
+                    pos: [pos.x, pos.y],
+                    uv,
+                    color,
+                    // Pattern space is world space, divided by the feature size
+                    // so the shader always works in units of one pattern cell.
+                    pattern: [pos.x / s.scale_m, pos.y / s.scale_m],
+                    material: s.packed(),
+                    overlay: s.packed_overlay(),
+                    ink: [rgb[0], rgb[1], rgb[2], ratio],
+                    // Carried in the same units, so the shader can compare
+                    // feature size against pixel size and fade before it
+                    // aliases.
+                    scale: s.m_per_px / s.scale_m,
+                }
+            }
         }
     }
 

@@ -16,10 +16,14 @@ struct VertexInput {
     @location(2) color: vec4<f32>,
     // Position in pattern space (world metres / feature size).
     @location(3) pattern: vec2<f32>,
-    // Material id in the low 16 bits, strength 0-255 in the high 16.
+    // Base layer: id in bits 0-15, strength in 16-23, blend mode in 24-27.
     @location(4) material: u32,
+    // Overlay layer, packed the same way. Zero means none.
+    @location(5) overlay: u32,
+    // Ink colour the pattern draws in; alpha is the overlay's scale ratio.
+    @location(6) ink: vec4<f32>,
     // Pattern cells per pixel, for anti-aliasing the hatch away before it moires.
-    @location(5) scale: f32,
+    @location(7) scale: f32,
 };
 
 struct VertexOutput {
@@ -28,7 +32,9 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
     @location(2) pattern: vec2<f32>,
     @location(3) @interpolate(flat) material: u32,
-    @location(4) @interpolate(flat) scale: f32,
+    @location(4) @interpolate(flat) overlay: u32,
+    @location(5) ink: vec4<f32>,
+    @location(6) @interpolate(flat) scale: f32,
 };
 
 @vertex
@@ -39,6 +45,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.color = in.color;
     out.pattern = in.pattern;
     out.material = in.material;
+    out.overlay = in.overlay;
+    out.ink = in.ink;
     out.scale = in.scale;
     return out;
 }
@@ -406,58 +414,114 @@ fn pat_timbered(p: vec2<f32>) -> f32 {
     return clamp(posts * 0.85 + lag, 0.0, 1.0);
 }
 
+// --- Material dispatch ------------------------------------------------------
+//
+// One place where an id becomes a pattern value. Everything else -- colouring,
+// blending, layering, fading -- is downstream of this and applies to every
+// material alike, so adding one means adding a pattern function and a case
+// here, and nothing more.
+
+fn pattern_of(id: u32, p: vec2<f32>) -> f32 {
+    switch (id) {
+        // Ground cover.
+        case 1u: { return pat_grass(p); }
+        case 2u: { return pat_dirt(p); }
+        case 3u: { return pat_stone(p); }
+        case 4u: { return pat_scree(p); }
+        case 5u: { return pat_gravel(p); }
+        case 6u: { return pat_sand(p); }
+        case 7u: { return pat_cracked(p); }
+        case 8u: { return pat_timber(p); }
+        case 9u: { return pat_endgrain(p); }
+        // Lithology.
+        case 16u: { return pat_alluvium(p); }
+        case 17u: { return pat_shale(p); }
+        case 18u: { return pat_sandstone(p); }
+        case 19u: { return pat_limestone(p); }
+        case 20u: { return pat_dolomite(p); }
+        case 21u: { return pat_quartzite(p); }
+        case 22u: { return pat_granite(p); }
+        case 23u: { return pat_gossan(p); }
+        // Mineralisation and workings.
+        case 32u: { return pat_ore_sulphide(p); }
+        case 33u: { return pat_quartz(p); }
+        case 34u: { return pat_timbered(p); }
+        default: { return 0.0; }
+    }
+}
+
+// --- Layer unpacking and compositing ----------------------------------------
+
+fn layer_id(word: u32) -> u32 { return word & 0xFFFFu; }
+fn layer_strength(word: u32) -> f32 { return f32((word >> 16u) & 0xFFu) / 255.0; }
+fn layer_blend(word: u32) -> u32 { return (word >> 24u) & 0xFu; }
+
+// Combine one layer's pattern into the colour under it.
+//
+// `ground` is what has been built so far, `ink` the colour this layer draws in,
+// and `amount` how much of it lands here. Every blend mode is a function of
+// exactly those, which is what lets layers stack without special cases.
+fn composite(ground: vec3<f32>, ink: vec3<f32>, amount: f32, mode: u32) -> vec3<f32> {
+    switch (mode) {
+        // Ink on paper: the pattern is drawn in its own colour.
+        case 0u: { return mix(ground, ink, amount); }
+        // Shade: darken, keeping the ground's hue.
+        case 1u: { return ground * (1.0 - 0.75 * amount); }
+        // Lighten: quartz, efflorescence, frost.
+        case 2u: { return mix(ground, ground + (vec3<f32>(1.0) - ground) * 0.85, amount); }
+        // Stain: a true multiply, so the result takes the colour of both and
+        // is never lighter than either. The doubling this once carried made
+        // stain collapse onto plain ink at mid-grey, where ground * ink * 2
+        // happens to equal ink exactly.
+        case 3u: { return mix(ground, ground * ink, amount); }
+        default: { return mix(ground, ink, amount); }
+    }
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
-    var out = in.color * tex_color;
+    let base = in.color * tex_color;
 
-    let id = in.material & 0xFFFFu;
+    let id = layer_id(in.material);
     if (id == 0u) {
-        return out;
+        return base;
     }
 
-    // Fade the pattern out as its features approach pixel size. Past that point
+    // Fade patterns out as their features approach pixel size. Past that point
     // a hatch stops reading as texture and starts aliasing into moire, so it is
     // better to show honest flat colour -- which is also what a survey drawing
-    // does when the scale no longer supports the hatch.
+    // does when the scale no longer supports the hatch. Applied once, to every
+    // layer, so no material can forget it.
     let fade = 1.0 - smoothstep(0.18, 0.55, in.scale);
     if (fade <= 0.001) {
-        return out;
+        return base;
     }
 
-    var v = 0.0;
-    switch (id) {
-        // Ground cover.
-        case 1u: { v = pat_grass(in.pattern); }
-        case 2u: { v = pat_dirt(in.pattern); }
-        case 3u: { v = pat_stone(in.pattern); }
-        case 4u: { v = pat_scree(in.pattern); }
-        case 5u: { v = pat_gravel(in.pattern); }
-        case 6u: { v = pat_sand(in.pattern); }
-        case 7u: { v = pat_cracked(in.pattern); }
-        case 8u: { v = pat_timber(in.pattern); }
-        case 9u: { v = pat_endgrain(in.pattern); }
-        // Lithology.
-        case 16u: { v = pat_alluvium(in.pattern); }
-        case 17u: { v = pat_shale(in.pattern); }
-        case 18u: { v = pat_sandstone(in.pattern); }
-        case 19u: { v = pat_limestone(in.pattern); }
-        case 20u: { v = pat_dolomite(in.pattern); }
-        case 21u: { v = pat_quartzite(in.pattern); }
-        case 22u: { v = pat_granite(in.pattern); }
-        case 23u: { v = pat_gossan(in.pattern); }
-        // Mineralisation and workings.
-        case 32u: { v = pat_ore_sulphide(in.pattern); }
-        case 33u: { v = pat_quartz(in.pattern); }
-        case 34u: { v = pat_timbered(in.pattern); }
-        default: { v = 0.0; }
+    var rgb = base.rgb;
+    let ink = in.ink.rgb;
+
+    // Base layer.
+    let v = pattern_of(id, in.pattern);
+    rgb = composite(rgb, ink, v * layer_strength(in.material) * fade, layer_blend(in.material));
+
+    // Overlay, if there is one. Drawn at its own feature size so two layers
+    // read as two rather than merging into one muddled pattern, and faded on
+    // its own terms because a finer overlay aliases sooner than its base.
+    let over_id = layer_id(in.overlay);
+    if (over_id != 0u) {
+        let ratio = max(in.ink.a, 0.01);
+        let over_fade = 1.0 - smoothstep(0.18, 0.55, in.scale * ratio);
+        if (over_fade > 0.001) {
+            let ov = pattern_of(over_id, in.pattern * ratio);
+            rgb = composite(
+                rgb,
+                ink,
+                ov * layer_strength(in.overlay) * over_fade,
+                layer_blend(in.overlay),
+            );
+        }
     }
 
-    let strength = f32((in.material >> 16u) & 0xFFu) / 255.0;
-    // The pattern darkens and lightens the vertex colour rather than replacing
-    // it, so a material and a palette colour compose: one grass shader serves
-    // spring green and dry summer buff alike.
-    let amount = v * strength * fade;
-    let shaded = out.rgb * (1.0 - 0.62 * amount) + vec3<f32>(0.05) * amount;
-    return vec4<f32>(shaded, out.a);
+    return vec4<f32>(rgb, base.a);
 }
