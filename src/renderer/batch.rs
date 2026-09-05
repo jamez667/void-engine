@@ -38,6 +38,18 @@ pub struct Vertex {
     /// out on screen, so it can fade to flat colour before the pattern aliases
     /// into moire rather than after.
     pub scale: f32,
+    /// Position within the tile being drawn, -1 to 1 on each axis, and how far
+    /// in from the edge the overlay crosses over.
+    ///
+    /// `xy` is the local coordinate, interpolated across the quad, so a
+    /// fragment knows whether it is in the middle of its tile or near an edge.
+    /// `z` is where the crossover sits, as a fraction of the half-width -- 0.5
+    /// puts it a quarter of the way in from the edge. `w` is unused.
+    ///
+    /// This is what lets a blend happen *inside* a tile rather than across the
+    /// whole of it: without it an overlay is uniform, and two tiles meeting
+    /// change over on their shared edge however the mix is chosen.
+    pub local: [f32; 4],
 }
 
 impl Default for Vertex {
@@ -52,6 +64,7 @@ impl Default for Vertex {
             // Survey ink: the default any pattern draws in until told otherwise.
             ink: [0.05, 0.05, 0.05, 1.0],
             scale: 1.0,
+            local: [0.0, 0.0, 1.0, 0.0],
         }
     }
 }
@@ -102,6 +115,11 @@ impl Vertex {
                     offset: 64,
                     shader_location: 7,
                     format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 68,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
                 },
             ],
         }
@@ -209,6 +227,14 @@ pub struct Surface {
     /// A second material drawn over the first, with its own strength, blend
     /// and ink weight. This is how a material is modified rather than replaced.
     pub over: Option<Overlay>,
+    /// Which way the overlay comes from, as a direction in tile space, and how
+    /// far in from that edge it takes over.
+    ///
+    /// `None` applies the overlay evenly across the whole tile. With a
+    /// direction, the overlay is absent at the far edge and full at the near
+    /// one, crossing over `depth` of the way in -- so two tiles that each blend
+    /// toward the other meet in a band rather than on a line.
+    pub edge: Option<(Vec2, f32)>,
     /// Metres per pixel on screen, used to fade the pattern out before it
     /// aliases. Set this from the camera zoom.
     pub m_per_px: f32,
@@ -268,6 +294,7 @@ impl Surface {
             blend: Blend::Ink,
             ink: None,
             over: None,
+            edge: None,
             m_per_px: 1.0,
             camera: Vec2::ZERO,
         }
@@ -309,6 +336,18 @@ impl Surface {
         self
     }
 
+    /// Bring the overlay in from one side of the tile rather than evenly.
+    ///
+    /// `dir` points toward the neighbour the overlay belongs to; `depth` is how
+    /// far in from that edge the crossover sits, as a fraction of the tile's
+    /// half-width. 0.5 puts it a quarter of the way in from the edge, which is
+    /// wide enough to read as a gradation and narrow enough to leave the middle
+    /// of the tile as its own ground.
+    pub fn from_edge(mut self, dir: Vec2, depth: f32) -> Self {
+        self.edge = Some((dir.normalize_or_zero(), depth.clamp(0.0, 1.0)));
+        self
+    }
+
     pub fn m_per_px(mut self, m: f32) -> Self {
         self.m_per_px = m.max(0.0);
         self
@@ -338,6 +377,9 @@ pub struct Batch {
     /// The surface applied to geometry pushed from now on. `None` means flat
     /// colour, which is what every existing caller gets without asking.
     surface: Option<Surface>,
+    /// Centre and half-size of the tile being drawn, so each vertex can be
+    /// given its position within it. Set by the primitives themselves.
+    tile: Option<(Vec2, Vec2)>,
 }
 
 impl Batch {
@@ -346,6 +388,7 @@ impl Batch {
             vertices: Vec::with_capacity(8192),
             indices: Vec::with_capacity(32768),
             surface: None,
+            tile: None,
         }
     }
 
@@ -353,6 +396,7 @@ impl Batch {
         self.vertices.clear();
         self.indices.clear();
         self.surface = None;
+        self.tile = None;
     }
 
     /// Draw following geometry with a procedural surface.
@@ -397,6 +441,22 @@ impl Batch {
                 // pattern is a function of the ground rather than of where the
                 // camera happens to be pointing.
                 let world = s.camera + pos * s.m_per_px;
+                // Where this corner sits inside the tile, -1..1. Interpolated
+                // across the quad, it tells each fragment how near an edge it
+                // is -- which is what a blend that happens inside a tile
+                // needs and a uniform overlay does not.
+                let local = match self.tile {
+                    Some((centre, half)) if half.x > 0.0 && half.y > 0.0 => {
+                        let d = (pos - centre) / half;
+                        // Project onto the edge direction, so the gradient runs
+                        // toward the neighbour rather than along an axis.
+                        match s.edge {
+                            Some((dir, depth)) => [d.dot(dir), 0.0, depth, 0.0],
+                            None => [d.x, d.y, 1.0, 0.0],
+                        }
+                    }
+                    _ => [0.0, 0.0, 1.0, 0.0],
+                };
                 Vertex {
                     pos: [pos.x, pos.y],
                     uv,
@@ -411,6 +471,7 @@ impl Batch {
                     // feature size against pixel size and fade before it
                     // aliases.
                     scale: s.m_per_px / s.scale_m,
+                    local,
                 }
             }
         }
@@ -426,8 +487,13 @@ impl Batch {
     }
 
     /// Axis-aligned colored rect (no rotation)
+    ///
+    /// A rect is the tile primitive: terrain, ground cover and level plans are
+    /// all drawn as grids of them, so it records its own extent for any surface
+    /// that blends within a tile.
     pub fn rect(&mut self, center: Vec2, size: Vec2, color: [f32; 4]) {
         let h = size * 0.5;
+        self.tile = Some((center, h));
         let corners = [
             center + Vec2::new(-h.x, h.y),
             center + Vec2::new(h.x, h.y),
@@ -436,6 +502,7 @@ impl Batch {
         ];
         let uv = [[0.5, 0.5]; 4];
         self.push_quad(corners, uv, color);
+        self.tile = None;
     }
 
     /// Rotated rect (angle in radians)

@@ -24,6 +24,9 @@ struct VertexInput {
     @location(6) ink: vec4<f32>,
     // Pattern cells per pixel, for anti-aliasing the hatch away before it moires.
     @location(7) scale: f32,
+    // Position within the tile (-1..1 along the blend direction), and where the
+    // overlay crosses over as a fraction of the half-width.
+    @location(8) local: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -35,6 +38,9 @@ struct VertexOutput {
     @location(4) @interpolate(flat) overlay: u32,
     @location(5) ink: vec4<f32>,
     @location(6) @interpolate(flat) scale: f32,
+    // Interpolated across the quad: this is what lets the blend happen inside
+    // a tile rather than uniformly over it.
+    @location(7) local: vec4<f32>,
 };
 
 @vertex
@@ -48,6 +54,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.overlay = in.overlay;
     out.ink = in.ink;
     out.scale = in.scale;
+    out.local = in.local;
     return out;
 }
 
@@ -513,11 +520,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let ratio = max(in.ink.a, 0.01);
         let over_fade = 1.0 - smoothstep(0.18, 0.55, in.scale * ratio);
         if (over_fade > 0.001) {
+            // How much of the overlay lands on *this fragment*.
+            //
+            // With a blend direction the overlay is absent at the far side of
+            // the tile and full at the near one, crossing over a band around
+            // the given depth. That band is what makes a boundary a gradation:
+            // two tiles each blending toward the other meet in a shared strip
+            // rather than changing over on the edge between them.
+            //
+            // depth of 1 means no direction was given, and the overlay applies
+            // evenly across the whole tile as it always did.
+            var edge = 1.0;
+            let depth = in.local.z;
+            if (depth < 0.999) {
+                // local.x runs -1 at the far edge to +1 at the near one. The
+                // crossover sits at `1 - 2 * depth`, so a depth of 0.5 puts it
+                // at the centre and a smaller one nearer the edge.
+                let at = 1.0 - 2.0 * depth;
+                edge = smoothstep(at - depth, at + depth, in.local.x);
+            }
             let ov = pattern_of(over_id, in.pattern * ratio);
             rgb = composite(
                 rgb,
                 ink,
-                ov * layer_strength(in.overlay) * over_fade,
+                ov * layer_strength(in.overlay) * over_fade * edge,
                 layer_blend(in.overlay),
             );
         }

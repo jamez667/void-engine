@@ -579,6 +579,153 @@ fn a_pattern_is_anchored_to_the_world() {
     );
 }
 
+/// Mean luminance of one vertical strip of the render, left to right.
+fn strips(px: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0; n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let x0 = i * W as usize / n;
+        let x1 = (i + 1) * W as usize / n;
+        let mut sum = 0.0;
+        let mut count = 0.0;
+        for y in 0..H as usize {
+            for x in x0..x1 {
+                let p = (y * W as usize + x) * 4;
+                sum += (px[p] as f32 * 0.299
+                    + px[p + 1] as f32 * 0.587
+                    + px[p + 2] as f32 * 0.114)
+                    / 255.0;
+                count += 1.0;
+            }
+        }
+        *slot = sum / count;
+    }
+    out
+}
+
+/// An overlay can be brought in from one side, crossing over inside the tile.
+///
+/// Without this an overlay is uniform across whatever it is drawn on, so two
+/// tiles meeting change over on the edge between them -- a staircase at tile
+/// resolution. Blending within the tile is what turns that edge into a band.
+#[test]
+fn an_overlay_can_cross_over_inside_its_tile() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    // Every render here sits on the same ground, or the comparison is between
+    // different tiles rather than between different blends.
+    const GROUND: [f32; 4] = [0.55, 0.55, 0.50, 1.0];
+
+    // Grass tile with rock coming in from the right, crossing a quarter of the
+    // way in from that edge.
+    let mut b = Batch::new();
+    b.set_surface(
+        Surface::new(Material::Grass)
+            .scale_m(2.0)
+            .anchored(glam::Vec2::ZERO, 26.0)
+            .over(Overlay::new(Material::Stone).strength(1.0).blend(Blend::Shade))
+            .from_edge(glam::Vec2::X, 0.5),
+    );
+    b.rect(
+        glam::Vec2::ZERO,
+        glam::Vec2::new(W as f32, H as f32),
+        GROUND,
+    );
+    let graded = render(&gpu, &b);
+
+    // The same tile with the overlay applied evenly.
+    let mut u = Batch::new();
+    u.set_surface(
+        Surface::new(Material::Grass)
+            .scale_m(2.0)
+            .anchored(glam::Vec2::ZERO, 26.0)
+            .over(Overlay::new(Material::Stone).strength(1.0).blend(Blend::Shade)),
+    );
+    u.rect(
+        glam::Vec2::ZERO,
+        glam::Vec2::new(W as f32, H as f32),
+        GROUND,
+    );
+    let even = render(&gpu, &u);
+
+    assert!(
+        difference(&graded, &even) > 0.006,
+        "a directed blend must differ from a uniform one: {:.4}",
+        difference(&graded, &even)
+    );
+
+    // The overlay darkens (Shade), so the side it comes from must end up
+    // darker, and the far side must be left nearly alone.
+    //
+    // The bar is set from what this overlay can actually do rather than from a
+    // round number: measure the difference a *uniform* overlay makes, and
+    // require the graded one to cross most of that range from one side of the
+    // tile to the other. An absolute threshold here would be a guess about
+    // material strengths that a later tweak would silently invalidate.
+    let mut bare = Batch::new();
+    bare.set_surface(
+        Surface::new(Material::Grass)
+            .scale_m(2.0)
+            .anchored(glam::Vec2::ZERO, 26.0),
+    );
+    bare.rect(glam::Vec2::ZERO, glam::Vec2::new(W as f32, H as f32), GROUND);
+    let plain_strips = strips(&render(&gpu, &bare), 4);
+    let even_strips = strips(&even, 4);
+    let ceiling = plain_strips[3] - even_strips[3];
+    assert!(
+        ceiling > 0.002,
+        "the overlay must darken at all for this test to mean anything: {ceiling:.4}"
+    );
+
+    // The far strip must look like bare ground and the near strip like the
+    // overlay at full strength: that is what "crosses over inside the tile"
+    // means. Comparing strip *means* against each other would understate it,
+    // because a strip averages a range of the gradient rather than sampling
+    // one point of it.
+    let s = strips(&graded, 4);
+    assert!(
+        (s[0] - plain_strips[0]).abs() < ceiling * 0.35,
+        "the far side must be nearly untouched ground: {:.4} vs plain {:.4}",
+        s[0],
+        plain_strips[0]
+    );
+    assert!(
+        (s[3] - even_strips[3]).abs() < ceiling * 0.35,
+        "the near side must be nearly the full overlay: {:.4} vs uniform {:.4}",
+        s[3],
+        even_strips[3]
+    );
+    // No third check on the total range: the two ends already pin the gradient
+    // to bare ground at one side and full overlay at the other, and a range
+    // measured between two *different* strips also carries the difference
+    // between the patterns under them, so it says less than it appears to.
+
+    // The middle must sit between the ends, which is what makes it a gradation
+    // rather than a step somewhere inside the tile.
+    assert!(
+        s[1] <= s[0] + 0.004 && s[2] >= s[3] - 0.004,
+        "the blend must run monotonically across the tile: {s:?}"
+    );
+    // Monotonic across the tile: a gradation, not a step.
+    for i in 1..s.len() {
+        assert!(
+            s[i] <= s[i - 1] + 0.004,
+            "the blend must run one way across the tile, got {s:?}"
+        );
+    }
+
+    // The far side must still be its own ground: if the overlay reached all the
+    // way across there would be nothing left of the tile's own material.
+    assert!(
+        (s[0] - plain_strips[0]).abs() < 0.02,
+        "the far side of the tile must keep its own cover: {:.3} vs {:.3}",
+        s[0],
+        plain_strips[0]
+    );
+}
+
 #[test]
 fn a_pattern_fades_out_before_it_aliases() {
     let Some(gpu) = gpu() else {
