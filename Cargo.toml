@@ -1,0 +1,38 @@
+[package]
+name = "void_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30"
+wgpu = "22"
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+env_logger = "0.11"
+log = "0.4"
+chrono = "0.4"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+rodio = { version = "0.19", default-features = false, features = ["symphonia-mp3"], optional = true }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# Audio is client-only. Headless consumers (servers, simulation) link this
+# crate purely for its ECS + math, so they take it with
+# `default-features = false`; that keeps `rodio` (and thus `alsa-sys`, which
+# needs pkg-config and libasound2-dev) out of headless Docker images
+# entirely. Clients opt back in with `features = ["audio"]`.
+default = ["audio"]
+audio = ["dep:rodio"]
+
+[workspace]
+# Standalone crate: an empty workspace table stops Cargo walking up to a
+# parent workspace if this repo is ever checked out inside one.
+
+# Debug builds: optimize deps fully, engine code lightly — carried over from
+# the void-claim workspace so unoptimized runs stay usable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
