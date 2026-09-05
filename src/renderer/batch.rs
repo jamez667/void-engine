@@ -212,6 +212,14 @@ pub struct Surface {
     /// Metres per pixel on screen, used to fade the pattern out before it
     /// aliases. Set this from the camera zoom.
     pub m_per_px: f32,
+    /// Where the camera is, in world units.
+    ///
+    /// Primitives are drawn in screen space, but a pattern has to be anchored
+    /// to the *ground* or it swims as the camera moves and its features come
+    /// out the size of pixels rather than the size of things. This is the one
+    /// piece the batch cannot work out for itself, so the caller supplies it
+    /// along with the zoom.
+    pub camera: Vec2,
 }
 
 /// A second pattern laid over a surface.
@@ -261,7 +269,17 @@ impl Surface {
             ink: None,
             over: None,
             m_per_px: 1.0,
+            camera: Vec2::ZERO,
         }
+    }
+
+    /// Anchor the pattern to the world: `camera` is the world position at the
+    /// centre of the screen, `px_per_m` the zoom. Without this a pattern is
+    /// locked to the screen and slides across the ground as the view moves.
+    pub fn anchored(mut self, camera: Vec2, px_per_m: f32) -> Self {
+        self.camera = camera;
+        self.m_per_px = 1.0 / px_per_m.max(0.0001);
+        self
     }
 
     pub fn scale_m(mut self, m: f32) -> Self {
@@ -375,13 +393,17 @@ impl Batch {
                 // base, so both layers ride in the fields already present
                 // rather than growing the vertex again.
                 let ratio = s.over.map_or(1.0, |o| o.scale_ratio);
+                // Recover the world position from the screen one, so the
+                // pattern is a function of the ground rather than of where the
+                // camera happens to be pointing.
+                let world = s.camera + pos * s.m_per_px;
                 Vertex {
                     pos: [pos.x, pos.y],
                     uv,
                     color,
                     // Pattern space is world space, divided by the feature size
                     // so the shader always works in units of one pattern cell.
-                    pattern: [pos.x / s.scale_m, pos.y / s.scale_m],
+                    pattern: [world.x / s.scale_m, world.y / s.scale_m],
                     material: s.packed(),
                     overlay: s.packed_overlay(),
                     ink: [rgb[0], rgb[1], rgb[2], ratio],

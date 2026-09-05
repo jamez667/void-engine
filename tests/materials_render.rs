@@ -350,14 +350,10 @@ fn materials_draw_distinct_patterns() {
 
     // Each material seen at 24 px per metre, which is a working zoom in game.
     // Pattern features are then several pixels across: big enough to read.
+    // A 2 m feature seen at 24 px per metre: about 48 px across, which is the
+    // size ground detail actually reads at in the game.
     const PPM: f32 = 24.0;
-    let surface = |m| {
-        Some(
-            Surface::new(m)
-                .scale_m(0.35 * PPM)
-                .m_per_px(1.0 / PPM),
-        )
-    };
+    let surface = |m| Some(Surface::new(m).scale_m(2.0).anchored(glam::Vec2::ZERO, PPM));
     let grass = render(&gpu, &quad_with(surface(Material::Grass)));
     let dirt = render(&gpu, &quad_with(surface(Material::Dirt)));
     let stone = render(&gpu, &quad_with(surface(Material::Stone)));
@@ -444,7 +440,7 @@ fn every_material_is_distinguishable_from_every_other() {
             let px = render(
                 &gpu,
                 &quad_with(Some(
-                    Surface::new(*m).scale_m(0.35 * PPM).m_per_px(1.0 / PPM),
+                    Surface::new(*m).scale_m(2.0).anchored(glam::Vec2::ZERO, PPM),
                 )),
             );
             (*name, px)
@@ -499,9 +495,7 @@ fn dolomite_is_not_limestone() {
     let at = |m| {
         render(
             &gpu,
-            &quad_with(Some(
-                Surface::new(m).scale_m(0.35 * PPM).m_per_px(1.0 / PPM),
-            )),
+            &quad_with(Some(Surface::new(m).scale_m(2.0).anchored(glam::Vec2::ZERO, PPM))),
         )
     };
     let lime = at(Material::Limestone);
@@ -522,6 +516,69 @@ fn dolomite_is_not_limestone() {
     );
 }
 
+/// A pattern belongs to the ground, not to the screen.
+///
+/// Primitives are drawn in screen coordinates, so without being told where the
+/// camera is, a pattern is a function of pixels: its features come out the size
+/// of pixels instead of the size of things, and the whole surface slides under
+/// the camera as it pans. Both are the same bug, and this catches it.
+#[test]
+fn a_pattern_is_anchored_to_the_world() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+
+    const PPM: f32 = 20.0;
+    // A camera is defined by the ground at the centre of its screen. Two
+    // cameras pointed at the *same* ground must therefore draw the same
+    // picture, whatever numbers they were built from -- and a pattern locked to
+    // the screen instead of the ground would draw the same picture from every
+    // camera, which is the bug, so the second half of this test checks that a
+    // camera pointed somewhere else draws something different.
+    let shot = |cam: glam::Vec2| {
+        let mut b = Batch::new();
+        b.set_surface(
+            Surface::new(Material::Scree)
+                .scale_m(4.0)
+                .anchored(cam, PPM),
+        );
+        // Fills the view, centred: the screen shows the ground around `cam`.
+        b.rect(
+            glam::Vec2::ZERO,
+            glam::Vec2::new(W as f32, H as f32),
+            [0.55, 0.55, 0.53, 1.0],
+        );
+        render(&gpu, &b)
+    };
+
+    let here = glam::Vec2::new(40.0, 25.0);
+    let same = shot(here);
+    let again = shot(here);
+    assert_eq!(
+        difference(&same, &again),
+        0.0,
+        "the same view must draw identically"
+    );
+
+    // Pointed at different ground, the view must show different ground. If the
+    // pattern were locked to the screen these would be pixel-identical.
+    let elsewhere = shot(here + glam::Vec2::new(37.0, -21.0));
+    assert!(
+        difference(&same, &elsewhere) > 0.01,
+        "different ground must look different: {:.4}",
+        difference(&same, &elsewhere)
+    );
+
+    // And the features must be sized in metres: at 20 px/m a 4 m feature is
+    // 80 px, so a 256 px view holds only a few of them and is far from noise.
+    assert!(
+        coarse_variation(&same) > 0.02,
+        "world-anchored features must be big on screen, got {:.4}",
+        coarse_variation(&same)
+    );
+}
+
 #[test]
 fn a_pattern_fades_out_before_it_aliases() {
     let Some(gpu) = gpu() else {
@@ -533,7 +590,7 @@ fn a_pattern_fades_out_before_it_aliases() {
     // hatch there would moire, so every material must fade to honest flat
     // colour -- a single material that refuses would shimmer on the map.
     for (m, name) in ALL {
-        let tiny = Surface::new(m).scale_m(0.35).m_per_px(1.0);
+        let tiny = Surface::new(m).scale_m(0.004).anchored(glam::Vec2::ZERO, 1.0);
         let far = render(&gpu, &quad_with(Some(tiny)));
         assert!(
             variation(&far) < 0.01,
@@ -544,8 +601,8 @@ fn a_pattern_fades_out_before_it_aliases() {
 
     // Close in, the same material must show its pattern.
     let near = Surface::new(Material::Stone)
-        .scale_m(0.35 * 24.0)
-        .m_per_px(1.0 / 24.0);
+        .scale_m(2.0)
+        .anchored(glam::Vec2::ZERO, 24.0);
     let close = render(&gpu, &quad_with(Some(near)));
     assert!(
         variation(&close) > 0.02,
@@ -569,8 +626,8 @@ const WORKING_PPM: f32 = 26.0;
 
 fn surf(m: Material) -> Surface {
     Surface::new(m)
-        .scale_m(0.35 * WORKING_PPM)
-        .m_per_px(1.0 / WORKING_PPM)
+        .scale_m(2.0)
+        .anchored(glam::Vec2::ZERO, WORKING_PPM)
 }
 
 /// The colour a pattern draws in is separate from the ground it sits on.
@@ -723,12 +780,14 @@ fn an_overlay_fades_on_its_own_scale() {
     // base is not.
     let base = Surface::new(Material::Limestone)
         .scale_m(3.0)
-        .m_per_px(0.5)
-        .over(Overlay::new(Material::Sandstone).scale_ratio(8.0));
+        .anchored(glam::Vec2::ZERO, 2.0)
+        .over(Overlay::new(Material::Sandstone).scale_ratio(60.0));
     let with_overlay = render(&gpu, &quad_with(Some(base)));
     let without = render(
         &gpu,
-        &quad_with(Some(Surface::new(Material::Limestone).scale_m(3.0).m_per_px(0.5))),
+        &quad_with(Some(
+            Surface::new(Material::Limestone).scale_m(3.0).anchored(glam::Vec2::ZERO, 2.0),
+        )),
     );
 
     assert!(
@@ -750,8 +809,8 @@ fn strength_controls_how_far_the_pattern_departs_from_colour() {
             &gpu,
             &quad_with(Some(
                 Surface::new(Material::Stone)
-                    .scale_m(0.35 * 24.0)
-                    .m_per_px(1.0 / 24.0)
+                    .scale_m(2.0)
+                    .anchored(glam::Vec2::ZERO, 24.0)
                     .strength(s),
             )),
         )
