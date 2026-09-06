@@ -49,6 +49,18 @@ pub trait App: 'static {
         alpha: f32,
     );
     fn on_resize(&mut self, _width: u32, _height: u32) {}
+    /// Checked before every fixed step. Return `false` to defer the tick
+    /// instead of running it.
+    ///
+    /// Exists for deterministic lockstep (`net::lockstep`), where a tick may
+    /// not run until both peers' inputs for it are in hand — the game cannot
+    /// simply advance with input it does not have. Returning `false` stops
+    /// the catch-up loop and refunds the un-run steps to the timestep
+    /// accumulator, so they are deferred to a later frame rather than lost.
+    ///
+    /// Defaulted to `true`, so single-player games never implement it and
+    /// behave exactly as before.
+    fn can_advance(&self) -> bool { true }
     /// Window title. Override to name your window; default keeps the
     /// engine generic. Called once at `resumed`, so a static string is
     /// enough — no need to react to state changes here.
@@ -303,6 +315,21 @@ impl<A: App> ApplicationHandler for Handler<A> {
 
         let update_start = Instant::now();
         for step in 0..steps {
+            // Lockstep games stall here when the peer's input for the next
+            // tick has not arrived. Refund the steps we are not going to run
+            // so they come back on a later frame — dropping them would let
+            // this peer fall permanently behind the other one.
+            //
+            // Checked BEFORE the step, so a stall on step 0 leaves the input
+            // edge flags untouched: they are cleared only after a step has
+            // actually consumed them (see below), and a deferred tick has
+            // consumed nothing. Clearing them here would swallow the
+            // keypress entirely, which is the bug the `step == 0` guard was
+            // added to fix in the first place.
+            if !self.app.can_advance() {
+                self.timestep.refund(steps - step);
+                break;
+            }
             let renderer = self.renderer.as_mut().unwrap();
             let mut ctx = EngineCtx {
                 world: &mut self.world,

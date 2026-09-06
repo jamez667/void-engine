@@ -8,6 +8,7 @@ pub mod fx;
 pub mod input;
 pub mod log;
 pub mod math;
+#[cfg(feature = "net")]
 pub mod net;
 pub mod pathfind;
 pub mod physics;

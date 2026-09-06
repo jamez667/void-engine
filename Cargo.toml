@@ -25,6 +25,14 @@ serde = { version = "1", features = ["derive"] }
 default = ["audio"]
 audio = ["dep:rodio"]
 
+# Networking is opt-in for the same reason audio is: a game that has no
+# netcode should not carry the code, the threads, or the attack surface of a
+# transport it never opens. Single-player games (mini-miner-2) and headless
+# consumers take the engine without this and the `net` module vanishes
+# entirely. Off by default because most games built on this engine are
+# single-player; multiplayer ones opt in with `features = ["net"]`.
+net = []
+
 [workspace]
 # Standalone crate: an empty workspace table stops Cargo walking up to a
 # parent workspace if this repo is ever checked out inside one.
