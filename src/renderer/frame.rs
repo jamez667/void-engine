@@ -363,7 +363,7 @@ impl Renderer {
                         view: &lp.light_map_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(AMBIENT_CLEAR),
+                            load: wgpu::LoadOp::Clear(self.ambient),
                             store: wgpu::StoreOp::Store,
                         },
                     })],

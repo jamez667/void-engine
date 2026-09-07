@@ -65,6 +65,16 @@ pub const LIGHT_TAPS: u32 = 12;
 
 /// Ambient clear colour for the light-map. Almost-black with a slight cool
 /// tint. Everything gets multiplied by this in unlit regions.
+/// What an unlit pixel keeps when nothing is shining on it.
+///
+/// A cool, very dim blue: enough that a room away from any lamp reads as dark
+/// rather than as a hole in the screen, and tinted because unlit interiors go
+/// blue to the eye rather than grey.
+///
+/// This is the default. A game whose darkness means something different --
+/// a mine, where the absence of a candle is the whole constraint and the rock
+/// really does go black -- overrides it with
+/// [`Renderer::set_ambient_light`].
 pub const AMBIENT_CLEAR: wgpu::Color = wgpu::Color {
     r: 0.06,
     g: 0.08,

@@ -11,6 +11,7 @@
 //! fields directly — no visibility widening was needed for the split.
 
 use super::*;
+use super::lights::AMBIENT_CLEAR;
 
 const WHITE_PIXEL: &[u8] = &[255, 255, 255, 255];
 
@@ -323,6 +324,7 @@ impl Renderer {
             pending_shadow: None,
             shadow_split_index: None,
             lights_pass,
+            ambient: AMBIENT_CLEAR,
             pending_lights: Vec::with_capacity(MAX_LIGHTS_PER_FRAME),
             lights_split_index: None,
             lights_pending: false,

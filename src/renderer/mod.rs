@@ -25,7 +25,7 @@ use camera::Camera2D;
 use batch::{Batch, Vertex};
 use postprocess::PostProcess;
 use shadow::ShadowPass;
-use lights::{LightPass, LightUniform, MAX_LIGHTS_PER_FRAME, AMBIENT_CLEAR};
+use lights::{LightPass, LightUniform, MAX_LIGHTS_PER_FRAME};
 use sun::SunPass;
 use godray::GodrayPass;
 use glam::Vec2;
@@ -111,6 +111,8 @@ pub struct Renderer {
     // Reuses the `mask_batch` / `wall_mask` texture from `shadow` as its
     // occlusion source (same tile+character silhouettes, different consumer).
     lights_pass: Option<LightPass>,
+    /// What an unlit pixel keeps. `AMBIENT_CLEAR` unless a game sets its own.
+    ambient: wgpu::Color,
     /// Emitters queued for this frame via `push_light`. Drained + uploaded
     /// into the LightPass ring buffer inside `end_frame`.
     pending_lights: Vec<LightUniform>,
@@ -249,6 +251,27 @@ impl Renderer {
     /// `MAX_LIGHTS_PER_FRAME` — the on-foot lattice + windows fits well
     /// inside this budget in normal play. `color` is linear RGB; `radius_px`
     /// is the falloff cutoff; `intensity` scales the peak contribution.
+    /// Set what an unlit pixel keeps, overriding [`lights::AMBIENT_CLEAR`].
+    ///
+    /// The default suits an interior lit by lamps, where darkness is gloom.
+    /// Some games want it to mean more than that -- underground, away from a
+    /// candle, there is genuinely nothing to see, and a floor of six percent
+    /// is the difference between a dark mine and a dim one. Components are
+    /// linear RGB and are clamped to sane values.
+    pub fn set_ambient_light(&mut self, rgb: [f32; 3]) {
+        self.ambient = wgpu::Color {
+            r: rgb[0].clamp(0.0, 1.0) as f64,
+            g: rgb[1].clamp(0.0, 1.0) as f64,
+            b: rgb[2].clamp(0.0, 1.0) as f64,
+            a: 1.0,
+        };
+    }
+
+    /// What an unlit pixel currently keeps.
+    pub fn ambient_light(&self) -> [f32; 3] {
+        [self.ambient.r as f32, self.ambient.g as f32, self.ambient.b as f32]
+    }
+
     pub fn push_light(
         &mut self,
         pos_px: Vec2,
