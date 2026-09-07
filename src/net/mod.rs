@@ -1,4 +1,4 @@
-//! Netcode primitives for use inside a client. These do not talk to any
+//! Netcode primitives. These do not talk to any
 //! particular wire format — they're the pieces every fixed-tick netcode
 //! setup ends up reinventing (interpolation clock, prediction ring, …).
 //!
@@ -13,5 +13,15 @@
 //! questions, nothing in the tree used it, and a second netcode next to the
 //! one actually in use is a standing invitation to wire a game to the wrong
 //! half.
+//!
+//! The transport pieces sit alongside it: [`quic`] builds the endpoints,
+//! [`framing`] restores message boundaries on the reliable-stream side,
+//! and [`chunk`] fits an oversized packet into datagrams without ever
+//! dropping a world-state item. All three are lifted from a shipped
+//! authoritative-server game and generalised — none of them knows what a
+//! snapshot, an entity or a tick is.
 
+pub mod chunk;
+pub mod framing;
 pub mod interp;
+pub mod quic;
