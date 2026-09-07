@@ -2,12 +2,16 @@
 //! particular wire format — they're the pieces every fixed-tick netcode
 //! setup ends up reinventing (interpolation clock, prediction ring, …).
 //!
-//! The two modules here answer opposite questions and are not meant to be
-//! combined. [`interp`] smooths *state* streamed from an authoritative
-//! server, hiding latency by rendering slightly in the past. [`lockstep`]
-//! has no server and streams no state at all: two peers exchange only inputs
-//! and run identical simulations. A lockstep peer has nothing to interpolate
-//! — it holds the authoritative world itself.
+//! The model these serve is an authoritative server streaming state to
+//! clients: [`interp`] hides the latency by rendering slightly in the past,
+//! blending between the snapshots that have arrived rather than guessing at
+//! the one that has not.
+//!
+//! A lockstep transport lived here briefly — two peers exchanging inputs and
+//! running identical simulations, no server and no state on the wire. It was
+//! removed rather than kept alongside: the two models answer opposite
+//! questions, nothing in the tree used it, and a second netcode next to the
+//! one actually in use is a standing invitation to wire a game to the wrong
+//! half.
 
 pub mod interp;
-pub mod lockstep;

@@ -1,5 +1,7 @@
 # Rust
 /target
+# Alternate target dirs, used to build while a game holds the exe in /target.
+/target-*
 
 # Claude tooling state
 .claude/settings.local.json
