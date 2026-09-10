@@ -185,6 +185,9 @@ pub struct PgLedger {
     core: Ledger,
     shared: Arc<Shared>,
     max_journal: usize,
+    /// Kept so `reconcile_now` can open its own short-lived connection.
+    /// The writer thread owns the long-lived one.
+    url: String,
     /// Kept so the runtime outlives the writer task.
     _runtime: tokio::runtime::Runtime,
 }
@@ -258,7 +261,13 @@ impl PgLedger {
             writer_loop(client, writer_shared, writer_cfg).await;
         });
 
-        Ok(Self { core, shared, max_journal: cfg.max_journal, _runtime: runtime })
+        Ok(Self {
+            core,
+            shared,
+            max_journal: cfg.max_journal,
+            url: cfg.url.clone(),
+            _runtime: runtime,
+        })
     }
 
     /// Block until everything accepted so far is durable.
@@ -301,6 +310,34 @@ impl PgLedger {
             return WriterHealth::Degraded(why);
         }
         WriterHealth::Healthy
+    }
+
+    /// Audit the durable log on demand: does every asset sum to zero?
+    ///
+    /// The writer runs this automatically when recovering from an outage,
+    /// but an operator wants it as a command too. A non-zero sum means
+    /// value entered or left the economy outside the transfer API, which
+    /// is either a bug or an exploit, and it is the one question worth
+    /// being able to ask at any moment rather than only after a fault.
+    ///
+    /// Opens its own connection rather than borrowing the writer's, so it
+    /// can be called while the writer is busy or degraded.
+    pub fn reconcile_now(&self) -> Result<(), String> {
+        let url = self.url.clone();
+        self._runtime.block_on(async move {
+            let (client, conn) = tokio_postgres::connect(&url, NoTls)
+                .await
+                .map_err(|e| format!("connecting for reconciliation: {e}"))?;
+            let handle = tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    log::debug!("[ledger] reconciliation connection closed: {e}");
+                }
+            });
+            let result = reconcile(&client).await;
+            drop(client);
+            handle.abort();
+            result
+        })
     }
 
     /// The in-memory core, for the audits phase 3 defined.

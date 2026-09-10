@@ -161,6 +161,20 @@ jobs:
       # The tests skip themselves when the URL is unset, so a
       # misconfigured environment would look like a pass. Assert they
       # actually ran.
+      # The crash matrix needs only a connection string, not control of
+      # the container, so unlike the outage tests it runs fine against a
+      # service container.
+      - name: Crash matrix
+        env:
+          VOID_ENGINE_PG_URL: "host=127.0.0.1 port=5432 user=postgres password=devpw dbname=void_engine"
+        run: |
+          out=$(cargo test --test crash_matrix --no-default-features --features ledger-pg -- --test-threads=1 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "4 passed" || {
+            echo "expected 4 crash-matrix tests; they may have skipped"
+            exit 1
+          }
+
       - name: The durable tests actually ran
         env:
           VOID_ENGINE_PG_URL: "host=127.0.0.1 port=5432 user=postgres password=devpw dbname=void_engine"

@@ -431,10 +431,45 @@ unblocks the most downstream work.
       job that owns its own docker, since a `services:` container cannot
       be stopped from inside the job.
 
-      *Still deferred: the rest of the crash matrix (kills at each
-      boundary), an injected synthetic dupe caught by a job rather than by
-      a player, and somewhere for a reconciliation failure to shout - it
-      must page a human, not append to a log nobody reads.*
+      **Phase 5 complete (2026-09-10).** 4 more tests, 293 total across
+      six axes. R2 is done.
+
+      Nine boundaries were already covered by earlier phases: process
+      death between checkpoints, a torn checkpoint write, first boot, the
+      database vanishing mid-flight, recovery, reads during an outage, a
+      rolled-back transaction, a full journal, and a retry across a
+      restart. `tests/crash_matrix.rs` closes the four that were not:
+
+      - **The exit criterion.** A row forged directly into Postgres -
+        value with no counterparty, the way a bad migration, a direct
+        edit or a compromised service would create it - is caught by
+        `reconcile_now`, naming the offending asset. A dupe found by a job
+        rather than by a player noticing their balance is wrong.
+      - Half a double-entry pair reaching disk is caught the same way. A
+        transaction makes this unreachable through the writer, so it is
+        forged directly; the point is that the audit does not depend on
+        the writer having behaved.
+      - A checkpoint may not claim a tick above the watermark. A transfer
+        accepted but not flushed does not advance `acked_tick`, so a
+        checkpoint taken mid-flight records the durable value, not the
+        sim's current tick. Restoring one that showed an uncommitted
+        purchase would be a dupe: the player keeps the goods, the payment
+        never happened.
+      - A fatal fault terminates rather than retrying forever. Dropping
+        the table gives `UNDEFINED_TABLE`, which the classifier calls
+        fatal; with `max_retries` set to 10,000 the writer still stops,
+        proving the *classifier* stopped it and not the retry budget. And
+        it stays stopped - no self-healing from an unrecoverable fault.
+
+      `reconcile_now` is public because an operator wants "check the
+      books" as a command, not only as something the writer does after an
+      outage. It opens its own short-lived connection so it works while
+      the writer is busy or degraded.
+
+      Reconciliation failures now shout through the log pipeline
+      (`event=ledger_reconciliation_failed`), so the earlier risk about
+      having nowhere to page is closed - see the promtail config in
+      `docs/`.
 
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the
