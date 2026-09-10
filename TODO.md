@@ -112,7 +112,7 @@ unblocks the most downstream work.
       `HeadlessConfig::uncapped` runs an exact tick count with a synthetic
       clock so replays and CI are reproducible.
 
-- [ ] **R2 - Persistence and ledger.** Designed 2026-09-10 (rev 2), not
+- [ ] **R2 - Persistence and ledger.** Designed 2026-09-10 (rev 3), not
       built. Full design published as an artifact; decisions recorded here so
       they outlive the link.
 
@@ -194,13 +194,39 @@ unblocks the most downstream work.
       by reason; item conservation (a unique item has exactly one holder).
       An audit trail nobody checks is a log file.
 
-      **Four constraints still hold from rev 1, verified against the tree:**
-      `TypeId` cannot key a save file (opaque, no cross-build guarantee - ids
-      hand-assigned, engine reserves <1000); RNG position is not capturable
-      (`Pcg32 { state, inc }` private, `Lcg` a bare tuple struct - seed-only
-      checkpoints replay from the start and diverge); `World` has no restore
-      path (all fields private, `spawn()` cannot be told which id to assign);
-      the engine creates no async runtime and `fixed_update` is sync.
+      **Decision (rev 3): component identity is an explicit string, not a
+      number and not the Rust type path.** `registry.register::<Transform2D>
+      ("transform2d", Persist::Volatile)`. Rev 2 said numeric ids were frozen
+      by the first save file ever written; that framing was wrong. What a
+      save file commits to is a *name*, and a name you assign is data you
+      control rather than a fact about your source tree - so renaming a Rust
+      type or moving a module must never change what a save file says.
+
+      Not `TypeId`: opaque 128-bit hash, no cross-build guarantee, changes
+      silently on recompile. Not `type_name`: `core::any` says its output "is
+      not specified", is "intended for diagnostic use", and "may change
+      between versions of the compiler" - and it embeds the module path, so
+      moving a component into a submodule silently changes every key, the
+      same shape as void-claim's serde-flatten bug. Not integers: they need a
+      taken-numbers registry, two branches both picking 1047 collide silently
+      at merge, and a save file of bare numbers is hostile to debug; a
+      duplicate *name* fails loudly at startup.
+
+      Names intern to a `u16` at startup, so checkpoints and R3's per-entity
+      wire encoding pay two bytes, not a string - the name appears once per
+      component type in a storage header, never per entity.
+      `registry.rename("old", "new")` is applied by the load path, so a bad
+      name is recoverable, which a wrong integer id is not. Precedent:
+      void-claim's `persist.rs` keys station records by a stable id, with a
+      test asserting "records must leave keyed by the stable id, never the
+      entity index" - the same lesson one layer up.
+
+      **Three constraints still hold from rev 1, verified against the tree:**
+      RNG position is not capturable (`Pcg32 { state, inc }` private, `Lcg` a
+      bare tuple struct - seed-only checkpoints replay from the start and
+      diverge); `World` has no restore path (all fields private, `spawn()`
+      cannot be told which id to assign); the engine creates no async runtime
+      and `fixed_update` is sync.
 
       **Build order:** (1) registry + snapshot/restore, no DB; (2) on-disk
       checkpoints - `persist` tier ships, useful alone; (3) ledger core
@@ -209,8 +235,10 @@ unblocks the most downstream work.
       being that an injected synthetic dupe is caught by reconciliation
       rather than by a player noticing.
 
-      *Open risks: component ids are frozen by the first save file ever
-      written; ledger volume needs partitioning and an archive-not-delete
+      *Open risks: a component's registry name is fixed once written to a
+      save file (downgraded from rev 2's "frozen forever" - it lives in the
+      registry, not the type, so refactoring is free and `rename` recovers a
+      bad choice); ledger volume needs partitioning and an archive-not-delete
       retention policy; a reconciliation mismatch must page a human, not
       append to a log nobody reads.*
 
