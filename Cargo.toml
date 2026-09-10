@@ -77,3 +77,11 @@ opt-level = 3
 naga = { version = "22", features = ["wgsl-in"] }
 pollster = "0.4"
 bytemuck = "1"
+
+# Hot-path regression guards. `harness = false` because these are budget
+# assertions with a plain main(), not libtest micro-benchmarks; the same
+# budgets are also enforced as #[test] so plain `cargo test` catches a
+# regression without needing `cargo bench`.
+[[bench]]
+name = "hot_paths"
+harness = false

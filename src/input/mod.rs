@@ -170,8 +170,13 @@ mod edge_flag_tests {
         let mut input = InputState::default();
         input.on_key_down(KeyCode::KeyA);
 
-        // Frame with steps == 0: the loop body never runs, so nothing clears.
-        for step in 0..0 {
+        // Mirror `app.rs`'s catch-up loop for a frame the timestep gave no
+        // steps. `steps` is a binding rather than a literal `0..0` so the
+        // range is not statically empty — clippy denies that by default,
+        // and the point here is that the loop body never runs, not how the
+        // bound is spelled.
+        let steps = 0;
+        for step in 0..steps {
             if step == 0 { input.begin_frame(); }
         }
         assert!(input.key_pressed(KeyCode::KeyA),

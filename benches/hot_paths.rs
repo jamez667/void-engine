@@ -1,0 +1,128 @@
+//! Regression guards for the hot paths the MMO-readiness audit measured.
+//!
+//! These are not micro-benchmarks for tuning; they are *ceilings*. Each one
+//! asserts a budget generous enough that ordinary machine-to-machine variance
+//! and CI noise pass, but tight enough that an order-of-magnitude regression
+//! (an accidental clone in an inner loop, a broadphase rebuilt twice per tick)
+//! fails the build instead of being discovered in a profile months later.
+//!
+//! `cargo bench` prints the numbers and **exits non-zero if any budget is
+//! blown**, so CI enforces these by running it as an ordinary step.
+//!
+//! Baselines recorded on the audit machine, release build:
+//!
+//! | Path                                    | Measured   |
+//! | --------------------------------------- | ---------- |
+//! | `iter2`, 50k entities x 20 systems      | 11.32 ms   |
+//! | same workload over contiguous arrays    |  0.39 ms   |
+//! | `iter2`, 250k entities, 1 system        |  2.73 ms   |
+//! | collision rebuild+query, 10k colliders  |  4.4 ms    |
+
+use std::hint::black_box;
+use std::time::Instant;
+
+use glam::DVec2;
+use void_engine::collision::SpatialGrid;
+use void_engine::components::{Transform2D, Velocity};
+use void_engine::World;
+
+/// Run `f` `iters` times and return the best per-iteration time in ms.
+///
+/// Best-of rather than mean: we are bounding the achievable cost, and the
+/// worst samples on a shared CI runner are scheduler noise, not the code.
+fn best_ms(iters: u32, mut f: impl FnMut()) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..iters {
+        let t = Instant::now();
+        f();
+        best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    best
+}
+
+fn world_with(n: usize) -> World {
+    let mut w = World::new();
+    for i in 0..n {
+        let e = w.spawn();
+        w.insert(e, Transform2D { pos: DVec2::new(i as f64, 0.0), rot: 0.0 });
+        w.insert(e, Velocity { linear: DVec2::ONE, angular: 0.0 });
+    }
+    w
+}
+
+/// The dominant per-tick cost in any real game loop: many systems, each
+/// running its own query. `iter`/`iter2` allocate a pointer `Vec` per call,
+/// so this scales with (entities x systems), not entities alone.
+fn ecs_many_systems() -> f64 {
+    let w = world_with(50_000);
+    best_ms(5, || {
+        let mut acc = 0.0;
+        for _ in 0..20 {
+            for (_id, t, v) in w.iter2::<Transform2D, Velocity>() {
+                acc += black_box(t.pos.x + v.linear.x);
+            }
+        }
+        black_box(acc);
+    })
+}
+
+/// A single wide query. Guards the per-entity cost independently of the
+/// per-query overhead that `ecs_many_systems` dominates.
+fn ecs_wide_single_query() -> f64 {
+    let w = world_with(250_000);
+    best_ms(5, || {
+        let mut acc = 0.0;
+        for (_id, t, v) in w.iter2::<Transform2D, Velocity>() {
+            acc += black_box(t.pos.x + v.linear.x);
+        }
+        black_box(acc);
+    })
+}
+
+/// Broadphase rebuild + pair query, which is what a server tick actually
+/// pays: `SpatialGrid` has no incremental update, so the whole structure is
+/// rebuilt from scratch every tick.
+fn collision_rebuild_and_query(n: usize) -> f64 {
+    // Spread colliders over a grid roughly `cell_size` apart so bucket
+    // occupancy stays realistic rather than degenerate.
+    let side = (n as f64).sqrt().ceil() as usize;
+    best_ms(5, || {
+        let mut g = SpatialGrid::new(40.0);
+        for i in 0..n {
+            let (x, y) = ((i % side) as f64 * 30.0, (i / side) as f64 * 30.0);
+            g.insert(DVec2::new(x, y), 12.0);
+        }
+        black_box(g.query_pairs().len());
+    })
+}
+
+fn report(label: &str, ms: f64, budget_ms: f64) -> bool {
+    let ok = ms <= budget_ms;
+    println!(
+        "{:<44} {:>8.2} ms   budget {:>7.2} ms   {}",
+        label,
+        ms,
+        budget_ms,
+        if ok { "ok" } else { "REGRESSION" }
+    );
+    ok
+}
+
+fn main() {
+    println!("void_engine hot-path guards (release)\n");
+    let mut all_ok = true;
+    all_ok &= report("ecs iter2: 50k entities x 20 systems", ecs_many_systems(), BUDGET_MANY_SYSTEMS);
+    all_ok &= report("ecs iter2: 250k entities, 1 system", ecs_wide_single_query(), BUDGET_WIDE_QUERY);
+    all_ok &= report("collision rebuild+query: 10k", collision_rebuild_and_query(10_000), BUDGET_COLLISION_10K);
+    println!();
+    if !all_ok {
+        eprintln!("one or more hot paths regressed past budget");
+        std::process::exit(1);
+    }
+}
+
+// Budgets: ~3x the audit-machine measurement. Wide enough for a slower CI
+// runner, narrow enough to catch a real algorithmic regression.
+const BUDGET_MANY_SYSTEMS: f64 = 35.0; // measured 11.32
+const BUDGET_WIDE_QUERY: f64 = 9.0; // measured  2.73
+const BUDGET_COLLISION_10K: f64 = 15.0; // measured  4.40

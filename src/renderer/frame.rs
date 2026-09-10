@@ -24,12 +24,20 @@ fn upload_batch(
     vbuf: &mut wgpu::Buffer, vcap: &mut usize, vlabel: &str,
     ibuf: &mut wgpu::Buffer, icap: &mut usize, ilabel: &str,
 ) {
-    // Hard upper bound on batch size. 8M verts × 32B = 256MB per
-    // buffer — the wgpu default `max_buffer_size` limit. Above this,
-    // buffer creation fails and the whole client panics with "wgpu
-    // errors as fatal" (observed under heavy scene stress when a burst
-    // of vertex-heavy geometry briefly hit 3M+ verts and doubled to
-    // ~6M-vert cap allocation attempt).
+    // Hard upper bound on batch size, set against the wgpu default
+    // `max_buffer_size` limit of 256MB. Above it, buffer creation fails
+    // and the whole client panics with "wgpu errors as fatal" (observed
+    // under heavy scene stress when a burst of vertex-heavy geometry
+    // briefly hit 3M+ verts and doubled to a ~6M-vert allocation).
+    //
+    // `Vertex` is 84 bytes (9 attributes — see `batch.rs`), NOT the 32
+    // this comment claimed until the numbers were actually checked. So
+    // the real ceiling is 256MB / 84B ≈ 3.19M verts, and the 8M cap
+    // below sat *above* the limit it was written to respect: a batch
+    // between 3.2M and 8M verts passed the guard and then panicked in
+    // buffer creation, which is the exact failure the cap exists to
+    // prevent. `MAX_VERTS` is now derived from the stride instead of
+    // hardcoded, so it cannot drift out of step with `Vertex` again.
     //
     // First cut of this fix set the cap at 1M verts, which was
     // *too aggressive* — truncating verts while leaving indices
@@ -40,8 +48,16 @@ fn upload_batch(
     // boundary; simpler + correct: keep the cap generous enough
     // that real scenes never trip it. 8M verts covers thousands of
     // dynamic entities with their full geometry + labels.
-    const MAX_VERTS:   usize = 8_000_000;
-    const MAX_INDICES: usize = 24_000_000;
+    // 256MB is wgpu's default `max_buffer_size`. The growth step below is
+    // clamped to these caps too, so the cap can be the true limit rather
+    // than a fraction of it.
+    const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+    const MAX_VERTS: usize = MAX_BUFFER_BYTES / std::mem::size_of::<Vertex>();
+    // Indices are u32, and the 3:1 ratio matches the triangle-list
+    // topology every primitive in `batch.rs` emits (6 indices per 4-vert
+    // quad, 3 per triangle) — keep them in step so a truncating batch
+    // never leaves indices pointing past the sliced-off vertex tail.
+    const MAX_INDICES: usize = MAX_VERTS * 3;
     let vlen_raw = batch.vertices.len();
     let ilen_raw = batch.indices.len();
     let vlen = vlen_raw.min(MAX_VERTS);
@@ -55,7 +71,11 @@ fn upload_batch(
         );
     }
     if vlen > *vcap {
-        *vcap = vlen * 2;
+        // Clamp the doubling, not just the batch: `vlen * 2` on a batch near
+        // MAX_VERTS is what actually reaches `create_buffer`, so leaving it
+        // unclamped reintroduces the same over-limit allocation the cap
+        // exists to prevent.
+        *vcap = (vlen * 2).min(MAX_VERTS);
         *vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(vlabel),
             size: (*vcap * std::mem::size_of::<Vertex>()) as u64,
@@ -64,7 +84,7 @@ fn upload_batch(
         });
     }
     if ilen > *icap {
-        *icap = ilen * 2;
+        *icap = (ilen * 2).min(MAX_INDICES);
         *ibuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(ilabel),
             size: (*icap * std::mem::size_of::<u32>()) as u64,
@@ -103,9 +123,34 @@ impl Renderer {
     }
 
     pub fn end_frame(&mut self) {
+        // `Lost`/`Outdated` are recoverable and routine — a device reset, a
+        // driver update, or alt-tabbing out of exclusive fullscreen all
+        // produce one. They mean "reconfigure and ask again", so do exactly
+        // that once. Swallowing them (the old `Err(_) => return`) left the
+        // window black permanently and silently, because nothing else in the
+        // engine ever reconfigures the surface outside `resize`.
         let surface_tex = match self.gpu.surface.get_current_texture() {
             Ok(t) => t,
-            Err(_) => return,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                let (w, h) = (self.gpu.surface_config.width, self.gpu.surface_config.height);
+                log::warn!("surface lost/outdated; reconfiguring at {w}x{h}");
+                self.gpu.surface.configure(&self.gpu.device, &self.gpu.surface_config);
+                match self.gpu.surface.get_current_texture() {
+                    Ok(t) => t,
+                    // Still bad after a reconfigure: skip this frame rather
+                    // than spin. The next frame retries from the top.
+                    Err(e) => {
+                        log::error!("surface still unavailable after reconfigure: {e}");
+                        return;
+                    }
+                }
+            }
+            // OOM is unrecoverable; Timeout resolves on its own next frame.
+            // Both are worth a line in the log — the old code produced none.
+            Err(e) => {
+                log::error!("surface acquire failed: {e}");
+                return;
+            }
         };
         let view = surface_tex.texture.create_view(&Default::default());
 

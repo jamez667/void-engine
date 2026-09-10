@@ -259,3 +259,263 @@ impl Default for World {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Pos(i32, i32);
+    #[derive(Clone, Debug, PartialEq)]
+    struct Vel(i32);
+    #[derive(Clone, Debug, PartialEq)]
+    struct Tag;
+
+    // -- identity and liveness ---------------------------------------
+
+    #[test]
+    fn spawn_yields_distinct_live_ids() {
+        let mut w = World::new();
+        let a = w.spawn();
+        let b = w.spawn();
+        assert_ne!(a, b);
+        assert!(w.alive(a) && w.alive(b));
+    }
+
+    #[test]
+    fn despawn_kills_only_its_own_entity() {
+        let mut w = World::new();
+        let a = w.spawn();
+        let b = w.spawn();
+        w.despawn(a);
+        assert!(!w.alive(a));
+        assert!(w.alive(b), "despawn must not affect unrelated entities");
+    }
+
+    #[test]
+    fn despawning_twice_is_a_no_op() {
+        let mut w = World::new();
+        let a = w.spawn();
+        w.despawn(a);
+        w.despawn(a);
+        // The second despawn must not push the index onto the free list a
+        // second time -- that would hand the same slot to two live entities.
+        let x = w.spawn();
+        let y = w.spawn();
+        assert_ne!(x.index, y.index, "a slot was handed out twice");
+    }
+
+    /// The core of the generational scheme: a reused slot must not answer
+    /// to the old id.
+    #[test]
+    fn a_reused_slot_rejects_the_stale_id() {
+        let mut w = World::new();
+        let old = w.spawn();
+        w.despawn(old);
+        let new = w.spawn();
+        assert_eq!(new.index, old.index, "expected the slot to be reused");
+        assert_ne!(new.generation, old.generation, "generation must advance");
+        assert!(!w.alive(old));
+        assert!(w.alive(new));
+    }
+
+    #[test]
+    fn an_out_of_range_id_is_not_alive() {
+        let mut w = World::new();
+        let real = w.spawn();
+        let far = EntityId { index: 999, generation: 0 };
+        assert!(!w.alive(far), "out-of-range index must not report alive");
+        assert!(w.get::<Pos>(far).is_none());
+        assert!(w.alive(real));
+    }
+
+    // -- component storage -------------------------------------------
+
+    #[test]
+    fn insert_get_and_remove_round_trip() {
+        let mut w = World::new();
+        let e = w.spawn();
+        assert!(w.get::<Pos>(e).is_none());
+        w.insert(e, Pos(3, 4));
+        assert_eq!(w.get::<Pos>(e), Some(&Pos(3, 4)));
+        assert!(w.has::<Pos>(e));
+        w.remove::<Pos>(e);
+        assert!(w.get::<Pos>(e).is_none());
+        assert!(!w.has::<Pos>(e));
+    }
+
+    #[test]
+    fn insert_overwrites_the_previous_value() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, Pos(1, 1));
+        w.insert(e, Pos(2, 2));
+        assert_eq!(w.get::<Pos>(e), Some(&Pos(2, 2)));
+    }
+
+    #[test]
+    fn get_mut_mutates_in_place() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, Vel(1));
+        w.get_mut::<Vel>(e).unwrap().0 = 42;
+        assert_eq!(w.get::<Vel>(e), Some(&Vel(42)));
+    }
+
+    #[test]
+    fn components_are_keyed_by_type_not_slot() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, Pos(1, 2));
+        w.insert(e, Vel(9));
+        assert_eq!(w.get::<Pos>(e), Some(&Pos(1, 2)));
+        assert_eq!(w.get::<Vel>(e), Some(&Vel(9)));
+    }
+
+    #[test]
+    fn insert_on_a_dead_entity_is_ignored() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.despawn(e);
+        w.insert(e, Pos(1, 1));
+        assert!(w.get::<Pos>(e).is_none());
+    }
+
+    /// The invariant the `despawn` comment calls out by name: a recycled
+    /// slot must not inherit the previous occupant components.
+    #[test]
+    fn a_recycled_slot_inherits_no_components() {
+        let mut w = World::new();
+        let old = w.spawn();
+        w.insert(old, Pos(7, 7));
+        w.insert(old, Vel(7));
+        w.insert(old, Tag);
+        w.despawn(old);
+
+        let new = w.spawn();
+        assert_eq!(new.index, old.index, "expected slot reuse");
+        assert!(w.get::<Pos>(new).is_none(), "stale Pos leaked into a new entity");
+        assert!(w.get::<Vel>(new).is_none(), "stale Vel leaked into a new entity");
+        assert!(w.get::<Tag>(new).is_none(), "stale Tag leaked into a new entity");
+    }
+
+    // -- iteration ---------------------------------------------------
+
+    #[test]
+    fn iter_visits_only_live_entities_with_the_component() {
+        let mut w = World::new();
+        let a = w.spawn();
+        let b = w.spawn();
+        let c = w.spawn();
+        w.insert(a, Pos(1, 0));
+        w.insert(b, Pos(2, 0));
+        // c deliberately has no Pos.
+        let _ = c;
+        w.despawn(b);
+
+        let seen: Vec<_> = w.iter::<Pos>().map(|(id, p)| (id, p.clone())).collect();
+        assert_eq!(seen, vec![(a, Pos(1, 0))],
+            "iter must skip dead and component-less entities");
+    }
+
+    #[test]
+    fn iter_yields_ids_whose_generation_matches() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.despawn(e);
+        let reused = w.spawn();
+        w.insert(reused, Pos(5, 5));
+
+        let ids: Vec<_> = w.iter::<Pos>().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![reused]);
+        assert!(w.alive(ids[0]), "an id handed out by iter must be alive");
+    }
+
+    #[test]
+    fn iter_mut_writes_are_visible_afterwards() {
+        let mut w = World::new();
+        let a = w.spawn();
+        let b = w.spawn();
+        w.insert(a, Vel(1));
+        w.insert(b, Vel(2));
+        for (_, v) in w.iter_mut::<Vel>() {
+            v.0 *= 10;
+        }
+        assert_eq!(w.get::<Vel>(a), Some(&Vel(10)));
+        assert_eq!(w.get::<Vel>(b), Some(&Vel(20)));
+    }
+
+    #[test]
+    fn iter2_yields_only_entities_having_both() {
+        let mut w = World::new();
+        let both = w.spawn();
+        let only_a = w.spawn();
+        let only_b = w.spawn();
+        w.insert(both, Pos(1, 1));
+        w.insert(both, Vel(1));
+        w.insert(only_a, Pos(2, 2));
+        w.insert(only_b, Vel(2));
+
+        let seen: Vec<_> = w.iter2::<Pos, Vel>().map(|(id, _, _)| id).collect();
+        assert_eq!(seen, vec![both]);
+    }
+
+    #[test]
+    fn iter2_skips_despawned_entities() {
+        let mut w = World::new();
+        let a = w.spawn();
+        let b = w.spawn();
+        for e in [a, b] {
+            w.insert(e, Pos(0, 0));
+            w.insert(e, Vel(0));
+        }
+        w.despawn(a);
+        let seen: Vec<_> = w.iter2::<Pos, Vel>().map(|(id, _, _)| id).collect();
+        assert_eq!(seen, vec![b]);
+    }
+
+    #[test]
+    fn iterating_an_unknown_component_is_empty_not_a_panic() {
+        let w = World::new();
+        assert_eq!(w.iter::<Pos>().count(), 0);
+        assert_eq!(w.iter2::<Pos, Vel>().count(), 0);
+    }
+
+    #[test]
+    fn entities_lists_exactly_the_live_set() {
+        let mut w = World::new();
+        let a = w.spawn();
+        let b = w.spawn();
+        let c = w.spawn();
+        w.despawn(b);
+        let mut live: Vec<_> = w.entities().collect();
+        live.sort_by_key(|e| e.index);
+        assert_eq!(live, vec![a, c]);
+    }
+
+    // -- the monotonic-spawn watermark contract ----------------------
+
+    #[test]
+    fn spawns_are_monotonic_until_a_slot_is_freed() {
+        let mut w = World::new();
+        assert!(w.spawns_are_monotonic());
+        let mark = w.next_index();
+        let a = w.spawn();
+        let b = w.spawn();
+        assert!(w.spawns_are_monotonic(), "no despawn yet, so still monotonic");
+        assert!(a.index >= mark && b.index >= mark,
+            "ids issued after the mark must be at or above it");
+
+        w.despawn(a);
+        assert!(!w.spawns_are_monotonic(),
+            "a freed slot breaks the watermark contract");
+    }
+
+    #[test]
+    fn next_index_predicts_the_next_fresh_slot() {
+        let mut w = World::new();
+        let predicted = w.next_index();
+        let e = w.spawn();
+        assert_eq!(e.index, predicted);
+    }
+}

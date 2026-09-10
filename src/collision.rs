@@ -87,7 +87,17 @@ impl SpatialGrid {
     /// Enumerate every unique index pair (`a < b`) whose bounding
     /// squares share at least one cell. Deduplicated via a packed-u64
     /// hash set so multi-cell colliders don't yield the same pair
-    /// twice. Pair order within the result is unspecified.
+    /// twice.
+    ///
+    /// **Pair order is deterministic**: the result is sorted ascending by
+    /// `(a, b)`. It did not used to be — pairs came out in `HashMap`
+    /// bucket order, and `RandomState` is seeded per process, so the same
+    /// world produced a different pair order on every run. Any caller
+    /// whose resolution is order-sensitive (impulses applied in sequence,
+    /// first-hit-wins damage) therefore produced a different simulation
+    /// from identical inputs, which silently breaks replay, lockstep and
+    /// server/client agreement. Sorting costs one O(n log n) pass over
+    /// the pair list and buys back reproducibility.
     pub fn query_pairs(&self) -> Vec<(u32, u32)> {
         let mut checked: HashSet<u64> = HashSet::new();
         let pack = |a: u32, b: u32| -> u64 { ((a as u64) << 32) | b as u64 };
@@ -107,6 +117,9 @@ impl SpatialGrid {
                 }
             }
         }
+        // See the doc comment: the traversal above reads `HashMap` buckets,
+        // so insertion order into `pairs` is process-seed dependent.
+        pairs.sort_unstable();
         pairs
     }
 
@@ -629,5 +642,33 @@ mod partition_tests {
         assert_eq!(g.query_circle_in(DVec2::ZERO, 100.0, 3), vec![mine]);
         assert_eq!(g.query_segment_in(DVec2::new(-500.0, 0.0), DVec2::new(500.0, 0.0), 3),
                    vec![mine]);
+    }
+
+    /// `query_pairs` must return the same order every time. It used to
+    /// inherit `HashMap` bucket order, which `RandomState` seeds per
+    /// process — so this assertion failed across runs, not within one.
+    /// Building several grids in one process and comparing is the part
+    /// that is testable here; the sort is what makes it hold across
+    /// processes too.
+    #[test]
+    fn query_pairs_order_is_deterministic() {
+        let build = || {
+            let mut g = SpatialGrid::new(10.0);
+            // Enough overlapping colliders to span many cells and buckets.
+            for i in 0..64u32 {
+                let f = i as f64;
+                g.insert(DVec2::new(f * 3.0, (f * 7.0) % 40.0), 6.0);
+            }
+            g.query_pairs()
+        };
+        let first = build();
+        assert!(first.len() > 32, "expected a substantial pair list, got {}", first.len());
+        for _ in 0..8 {
+            assert_eq!(build(), first, "pair order varied between identical grids");
+        }
+        // And it is genuinely sorted, not merely stable by luck.
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        assert_eq!(first, sorted, "pairs are not in ascending (a, b) order");
     }
 }

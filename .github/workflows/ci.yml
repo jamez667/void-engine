@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are failures in CI but not in a local `cargo build`, so a work
+  # in progress stays comfortable while `main` stays clean.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: build · test · clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `audio` pulls rodio -> alsa-sys, which needs pkg-config and ALSA
+      # headers. Installing them here keeps the default feature set (the one
+      # games actually build with) under test rather than only the headless
+      # subset.
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      # No `cargo fmt --check` step on purpose. This codebase is hand-aligned
+      # (struct fields in columns, compact single-line literals) and rustfmt
+      # would rewrite ~586 sites across the tree. Adopting it is a defensible
+      # call, but it belongs in its own commit — not smuggled in as a CI gate
+      # that turns `main` red on day one.
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The two feature axes that change what compiles: `net` gates the whole
+      # netcode module, and headless consumers build without `audio`.
+      - name: Clippy (net)
+        run: cargo clippy --all-targets --features net -- -D warnings
+
+      - name: Clippy (headless)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --all-targets
+
+      - name: Test (net)
+        run: cargo test --all-targets --features net
+
+      - name: Test (headless)
+        run: cargo test --all-targets --no-default-features
+
+  perf:
+    name: hot-path budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `benches/hot_paths.rs` exits non-zero when a measured path blows its
+      # budget, so this step is the regression gate. Headless: the guards
+      # cover ECS and collision, neither of which needs audio.
+      #
+      # Runner variance is real; the budgets are ~3x the recorded baseline so
+      # only an algorithmic regression trips them, not a noisy neighbour.
+      - name: Hot-path guards
+        run: cargo bench --no-default-features
