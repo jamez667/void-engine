@@ -73,11 +73,32 @@ pub struct PgConfig {
     /// Entries per transaction. Batching amortises round-trips; too large
     /// and a single failure re-does more work.
     pub batch: usize,
+    /// Consecutive transient failures tolerated before the writer gives
+    /// up and declares the ledger dead.
+    ///
+    /// A failover, a dropped connection or a brief network partition are
+    /// all recoverable and all routine; dying on the first one turns a
+    /// three-second blip into an outage needing a human. Dying *never* is
+    /// the opposite mistake, so this is bounded.
+    pub max_retries: u32,
+    /// Delay before the first retry. Doubles each attempt, capped at
+    /// `retry_max_delay`.
+    pub retry_base_delay: std::time::Duration,
+    /// Ceiling on the backoff, so a long outage still polls at a sane
+    /// rate rather than sleeping for hours.
+    pub retry_max_delay: std::time::Duration,
 }
 
 impl PgConfig {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into(), max_journal: 10_000, batch: 64 }
+        Self {
+            url: url.into(),
+            max_journal: 10_000,
+            batch: 64,
+            max_retries: 10,
+            retry_base_delay: std::time::Duration::from_millis(100),
+            retry_max_delay: std::time::Duration::from_secs(5),
+        }
     }
 }
 
@@ -129,10 +150,32 @@ struct Shared {
     /// rows — which is exactly the bug this pair of counters fixes.
     committed: AtomicU64,
     acked_tick: AtomicU64,
-    /// Set when the writer dies. A ledger whose writer is gone must stop
-    /// accepting value movements rather than silently becoming in-memory
-    /// only — that would be durable-looking data loss.
+    /// Set when the writer dies *terminally*. A ledger whose writer is
+    /// gone must stop accepting value movements rather than silently
+    /// becoming in-memory only — that would be durable-looking data loss.
+    ///
+    /// Distinct from [`Shared::degraded`]: this one never clears.
     writer_failed: Mutex<Option<String>>,
+    /// Set while the writer is retrying a transient fault.
+    ///
+    /// Writes are refused exactly as in the terminal case — value the
+    /// store cannot accept must not be accepted — but this clears by
+    /// itself once the connection comes back and reconciliation passes,
+    /// so a failover does not need an operator.
+    degraded: Mutex<Option<String>>,
+}
+
+/// What the durable writer is doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriterHealth {
+    /// Committing normally.
+    Healthy,
+    /// Retrying a transient fault. Writes are refused, but this clears
+    /// itself once the connection returns and reconciliation passes.
+    Degraded(String),
+    /// Terminal. Writes are refused permanently and the process needs
+    /// restarting once the underlying cause is fixed.
+    Failed(String),
 }
 
 /// A [`LedgerStore`] backed by Postgres.
@@ -162,7 +205,7 @@ impl PgLedger {
             .map_err(PgError::Runtime)?;
 
         let url = cfg.url.clone();
-        let (mut client, replayed) = runtime.block_on(async move {
+        let (client, replayed) = runtime.block_on(async move {
             let (mut client, conn) = tokio_postgres::connect(&url, NoTls)
                 .await
                 .map_err(PgError::Connect)?;
@@ -206,12 +249,13 @@ impl PgLedger {
             committed: AtomicU64::new(0),
             acked_tick: AtomicU64::new(acked.max(0) as u64),
             writer_failed: Mutex::new(None),
+            degraded: Mutex::new(None),
         });
 
         let writer_shared = shared.clone();
-        let batch = cfg.batch;
+        let writer_cfg = cfg.clone();
         runtime.spawn(async move {
-            writer_loop(&mut client, writer_shared, batch).await;
+            writer_loop(client, writer_shared, writer_cfg).await;
         });
 
         Ok(Self { core, shared, max_journal: cfg.max_journal, _runtime: runtime })
@@ -243,6 +287,20 @@ impl PgLedger {
     /// a number that only grows means the writer is losing.
     pub fn journal_depth(&self) -> usize {
         self.shared.journal.lock().unwrap().len()
+    }
+
+    /// What the writer is doing, for a health check or an operator.
+    ///
+    /// Worth distinguishing: [`WriterHealth::Degraded`] resolves itself,
+    /// [`WriterHealth::Failed`] does not and needs a human.
+    pub fn health(&self) -> WriterHealth {
+        if let Some(why) = self.shared.writer_failed.lock().unwrap().clone() {
+            return WriterHealth::Failed(why);
+        }
+        if let Some(why) = self.shared.degraded.lock().unwrap().clone() {
+            return WriterHealth::Degraded(why);
+        }
+        WriterHealth::Healthy
     }
 
     /// The in-memory core, for the audits phase 3 defined.
@@ -322,11 +380,50 @@ fn account_parts(a: &Account) -> (&'static str, String) {
 }
 
 /// Drain the journal into Postgres, forever.
-async fn writer_loop(client: &mut tokio_postgres::Client, shared: Arc<Shared>, batch: usize) {
+/// Is this fault worth retrying, or is the ledger genuinely broken?
+///
+/// The distinction is the whole point of the retry path. A dropped
+/// connection, a failover, a restarting database are all routine and all
+/// recoverable, and dying on the first one turns a three-second blip into
+/// an outage that needs a human. A constraint or schema violation is the
+/// opposite: retrying `UNDEFINED_TABLE` forever accomplishes nothing and
+/// hides a real problem behind an infinite loop.
+fn is_transient(e: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    match e.as_db_error() {
+        // The server answered, so the connection is fine and the
+        // *statement* is wrong. Schema and constraint faults will fail
+        // identically forever.
+        Some(db) => !matches!(
+            *db.code(),
+            SqlState::UNIQUE_VIOLATION
+                | SqlState::CHECK_VIOLATION
+                | SqlState::NOT_NULL_VIOLATION
+                | SqlState::FOREIGN_KEY_VIOLATION
+                | SqlState::UNDEFINED_TABLE
+                | SqlState::UNDEFINED_COLUMN
+                | SqlState::DATATYPE_MISMATCH
+        ),
+        // No `DbError` means the server never answered: a closed socket, a
+        // timeout, a TLS fault. Worth another attempt.
+        None => true,
+    }
+}
+
+/// Drain the journal into Postgres, retrying transient faults.
+///
+/// Two states matter to a caller. *Degraded* means a transient fault is
+/// being retried: writes are refused, because value the store cannot
+/// accept must not be accepted, but the flag clears itself once the
+/// connection returns and reconciliation passes. *Failed* is terminal, and
+/// covers a fatal fault or transient ones past `max_retries`.
+async fn writer_loop(mut client: tokio_postgres::Client, shared: Arc<Shared>, cfg: PgConfig) {
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         let work: Vec<Pending> = {
             let mut j = shared.journal.lock().unwrap();
-            let take = j.len().min(batch);
+            let take = j.len().min(cfg.batch);
             j.drain(..take).collect()
         };
 
@@ -336,26 +433,133 @@ async fn writer_loop(client: &mut tokio_postgres::Client, shared: Arc<Shared>, b
         }
 
         let highest = work.iter().map(|p| p.tick).max().unwrap_or(0);
-        match commit_batch(client, &work, highest).await {
+        match commit_batch(&mut client, &work, highest).await {
             Ok(()) => {
                 // Only now is it safe to say these ticks are durable.
                 shared.acked_tick.fetch_max(highest, Ordering::SeqCst);
                 shared.committed.fetch_add(work.len() as u64, Ordering::SeqCst);
+
+                // Coming back from a degraded spell: the connection works
+                // and this batch committed, so verify the durable log is
+                // still internally consistent before accepting new value
+                // movements again. An outage is exactly when things can
+                // diverge, and a divergence here is the dupe signal this
+                // whole tier exists to catch.
+                let was_degraded = shared.degraded.lock().unwrap().is_some();
+                if was_degraded {
+                    match reconcile(&client).await {
+                        Ok(()) => {
+                            log::info!("[ledger] writer recovered; reconciliation clean");
+                            *shared.degraded.lock().unwrap() = None;
+                            consecutive_failures = 0;
+                        }
+                        Err(why) => {
+                            // Not retryable: the books disagree with the
+                            // log, so refusing writes permanently is the
+                            // only safe answer.
+                            let msg = format!("reconciliation failed after recovery: {why}");
+                            log::error!("[ledger] {msg}");
+                            *shared.writer_failed.lock().unwrap() = Some(msg);
+                            return;
+                        }
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
             }
             Err(e) => {
-                let msg = format!("ledger writer failed: {e}");
-                log::error!("[ledger] {msg}");
-                *shared.writer_failed.lock().unwrap() = Some(msg);
-                // Put the work back so a flush sees it as outstanding
-                // rather than silently vanished.
-                let mut j = shared.journal.lock().unwrap();
-                for (i, p) in work.into_iter().enumerate() {
-                    j.insert(i, p);
+                // Put the work back first, so a flush sees it outstanding
+                // rather than silently vanished, and so a retry re-sends
+                // exactly what failed. `commit_batch` treats an
+                // already-written row as success (the UNIQUE constraint
+                // plus the 23505 check), so re-running a partially
+                // committed batch is safe.
+                {
+                    let mut j = shared.journal.lock().unwrap();
+                    for (i, p) in work.into_iter().enumerate() {
+                        j.insert(i, p);
+                    }
                 }
-                return;
+
+                if !is_transient(&e) {
+                    let msg = format!("ledger writer failed (fatal): {e}");
+                    log::error!("[ledger] {msg}");
+                    *shared.writer_failed.lock().unwrap() = Some(msg);
+                    return;
+                }
+
+                consecutive_failures += 1;
+                if consecutive_failures > cfg.max_retries {
+                    let msg = format!(
+                        "ledger writer failed after {} consecutive attempts: {e}",
+                        cfg.max_retries
+                    );
+                    log::error!("[ledger] {msg}");
+                    *shared.writer_failed.lock().unwrap() = Some(msg);
+                    return;
+                }
+
+                let msg = format!("transient fault (attempt {consecutive_failures}): {e}");
+                log::warn!("[ledger] {msg}; retrying");
+                *shared.degraded.lock().unwrap() = Some(msg);
+
+                // Exponential backoff, capped so a long outage still polls
+                // at a sane rate instead of sleeping for hours.
+                let shift = (consecutive_failures - 1).min(16);
+                let delay = cfg
+                    .retry_base_delay
+                    .saturating_mul(1u32 << shift)
+                    .min(cfg.retry_max_delay);
+                tokio::time::sleep(delay).await;
+
+                // A closed connection cannot be reused, so rebuild it.
+                if e.is_closed() {
+                    match tokio_postgres::connect(&cfg.url, NoTls).await {
+                        Ok((fresh, conn)) => {
+                            tokio::spawn(async move {
+                                if let Err(e) = conn.await {
+                                    log::error!("[ledger] postgres connection lost: {e}");
+                                }
+                            });
+                            client = fresh;
+                            log::info!("[ledger] reconnected to postgres");
+                        }
+                        Err(e) => {
+                            log::warn!("[ledger] reconnect failed: {e}");
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+/// Verify the durable log is internally consistent before trusting it
+/// again after an outage.
+///
+/// Sums every delta per asset in the database. The books must come to
+/// exactly zero, for the same reason `Ledger::audit_zero_sum` requires it
+/// in memory: a non-zero sum means value was created or destroyed outside
+/// the transfer API.
+async fn reconcile(client: &tokio_postgres::Client) -> Result<(), String> {
+    let rows = client
+        .query(
+            "SELECT asset FROM ledger_entries GROUP BY asset HAVING SUM(delta) <> 0",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("querying the ledger: {e}"))?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let offenders: Vec<String> = rows.iter().map(|r| r.get::<_, String>("asset")).collect();
+    Err(format!(
+        "{} asset(s) do not sum to zero: {}",
+        offenders.len(),
+        offenders.join(", ")
+    ))
 }
 
 /// One transaction: every entry in the batch, plus the watermark.
@@ -424,6 +628,13 @@ impl LedgerStore for PgLedger {
     fn transfer(&mut self, req: TransferRequest) -> Result<StoredReceipt, LedgerError> {
         if let Some(err) = self.shared.writer_failed.lock().unwrap().clone() {
             return Err(LedgerError::WriterFailed(err));
+        }
+        // Refuse while degraded too. The fault is transient and the flag
+        // will clear itself, but until it does the store cannot accept
+        // anything, and accepting value movements we cannot persist is
+        // the one failure mode this tier exists to prevent.
+        if let Some(why) = self.shared.degraded.lock().unwrap().clone() {
+            return Err(LedgerError::WriterDegraded(why));
         }
         if self.journal_depth() >= self.max_journal {
             return Err(LedgerError::WriterBehind {

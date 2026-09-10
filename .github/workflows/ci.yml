@@ -172,6 +172,43 @@ jobs:
             exit 1
           }
 
+  ledger-outage:
+    name: ledger survives a database outage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Not a `services:` container: these tests stop and start the
+      # database mid-flight, and a service container cannot be controlled
+      # from inside the job. This one owns its own docker.
+      - name: Start postgres
+        run: |
+          docker run -d --name ve_pg_ci             -e POSTGRES_PASSWORD=devpw -e POSTGRES_DB=void_engine             -p 55432:5432 postgres:17-alpine
+          for i in $(seq 1 60); do
+            docker exec ve_pg_ci pg_isready -U postgres && break
+            sleep 1
+          done
+
+      - name: Outage behaviour
+        env:
+          VOID_ENGINE_PG_URL: "host=127.0.0.1 port=55432 user=postgres password=devpw dbname=void_engine"
+          VOID_ENGINE_PG_CONTAINER: ve_pg_ci
+        run: |
+          out=$(cargo test --test ledger_outage --no-default-features --features ledger-pg -- --test-threads=1 2>&1)
+          echo "$out"
+          # They skip themselves when the env is unset, so a misconfigured
+          # job would look like a pass. Assert they actually ran.
+          echo "$out" | grep -q "3 passed" || {
+            echo "expected 3 outage tests; they may have skipped"
+            exit 1
+          }
+
+      - name: Stop postgres
+        if: always()
+        run: docker rm -f ve_pg_ci || true
+
   perf:
     name: hot-path budgets
     runs-on: ubuntu-latest

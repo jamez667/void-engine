@@ -44,6 +44,8 @@ pub mod store;
 pub use checkpoint::{
     clear, load, save, CheckpointConfig, CheckpointError, DEFAULT_KEEP,
 };
+#[cfg(feature = "ledger-pg")]
+pub use ledger_pg::{PgConfig, PgError, PgLedger, WriterHealth};
 #[cfg(feature = "ledger")]
 pub use ledger::{
     Account, Amount, Asset, Discrepancy, Entry as LedgerEntry, IdemKey, Ledger, LedgerError,

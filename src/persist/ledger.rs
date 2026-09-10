@@ -215,6 +215,14 @@ pub enum LedgerError {
     /// treat this as "try again shortly", and an operator should treat a
     /// sustained one as an outage.
     WriterBehind { depth: usize, limit: usize },
+    /// The durable writer is retrying a transient fault.
+    ///
+    /// Distinct from [`LedgerError::WriterFailed`]: this one clears by
+    /// itself once the connection returns and reconciliation passes, so a
+    /// caller should treat it as "try again shortly" rather than as an
+    /// outage needing a human. Writes are refused either way, because
+    /// value the durable store cannot accept must not be accepted.
+    WriterDegraded(String),
     /// The durable writer died. Every subsequent transfer is refused.
     ///
     /// Continuing to accept value movements with no way to persist them
@@ -237,6 +245,8 @@ impl std::fmt::Display for LedgerError {
                 write!(f, "released a reservation that was never taken"),
             LedgerError::WriterBehind { depth, limit } =>
                 write!(f, "durable writer is behind: {depth} queued, limit {limit}"),
+            LedgerError::WriterDegraded(why) =>
+                write!(f, "durable writer is degraded, retrying: {why}"),
             LedgerError::WriterFailed(why) =>
                 write!(f, "durable writer has failed: {why}"),
         }

@@ -390,9 +390,51 @@ unblocks the most downstream work.
         `cargo test`; CI runs it against a Postgres service container and
         asserts the count so a misconfigured env cannot look like a pass.
 
-      *Deferred to phase 5: reconciliation jobs and the crash matrix -
-      kills at each boundary, and an injected synthetic dupe that must be
-      caught by a job rather than by a player noticing.*
+      **Phase 5, first slice (2026-09-10): surviving a database outage.**
+      3 more tests, 281 total across six axes.
+
+      This started as a question about policy and turned out not to be
+      one. If the durable store is unreachable, every value movement the
+      sim accepts is unbacked, so "degrade to read-only" and "queue and
+      hope" are not real options - the only correct behaviour is to stop
+      accepting value movements. Presenting that as a product decision was
+      a mistake.
+
+      The real defect was the opposite of laxity: the writer died on the
+      *first* error with no retry, so a three-second failover permanently
+      bricked the ledger until a restart. Now:
+
+      - `is_transient` classifies by SQLSTATE. A constraint or schema
+        fault (unique, check, undefined table/column, datatype) is fatal -
+        retrying `UNDEFINED_TABLE` forever hides a real problem behind an
+        infinite loop. Anything with no `DbError` at all means the server
+        never answered: a closed socket, a timeout. Retryable.
+      - Exponential backoff, capped, bounded by `max_retries`, with a
+        reconnect when the connection is closed.
+      - A **degraded** state distinct from **failed**. Both refuse writes,
+        because value the store cannot accept must not be accepted; but
+        degraded clears itself once the connection returns, so a failover
+        no longer needs an operator. `WriterHealth` exposes the three
+        states for a health check.
+      - **Reconciliation before trusting the log again.** On recovery the
+        writer sums every delta per asset in the database and requires
+        exactly zero before clearing the flag. An outage is precisely when
+        things diverge, and a divergence is the dupe signal this tier
+        exists to catch. A failed reconciliation is terminal, not
+        retryable.
+      - Reads stay available throughout - refusing them would break the
+        exact tooling an operator needs mid-outage.
+
+      `tests/ledger_outage.rs` stops and starts a real container
+      mid-flight: writes refused while down, the ledger healing itself
+      without a restart, and reads working throughout. CI runs them in a
+      job that owns its own docker, since a `services:` container cannot
+      be stopped from inside the job.
+
+      *Still deferred: the rest of the crash matrix (kills at each
+      boundary), an injected synthetic dupe caught by a job rather than by
+      a player, and somewhere for a reconciliation failure to shout - it
+      must page a human, not append to a log nobody reads.*
 
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the
