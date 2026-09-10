@@ -85,6 +85,9 @@ impl PgConfig {
 #[derive(Debug)]
 pub enum PgError {
     Connect(tokio_postgres::Error),
+    /// The durable log could not be replayed into a consistent state.
+    /// Starting anyway would mean serving wrong balances.
+    Replay(String),
     Migrate(String),
     Runtime(std::io::Error),
 }
@@ -93,6 +96,7 @@ impl std::fmt::Display for PgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PgError::Connect(e) => write!(f, "connecting to postgres: {e}"),
+            PgError::Replay(e) => write!(f, "replaying the ledger: {e}"),
             PgError::Migrate(e) => write!(f, "running migrations: {e}"),
             PgError::Runtime(e) => write!(f, "starting the writer runtime: {e}"),
         }
@@ -194,7 +198,7 @@ impl PgLedger {
 
         let (rows, acked) = replayed;
         let mut core = Ledger::new();
-        replay_into(&mut core, &rows);
+        replay_into(&mut core, &rows).map_err(PgError::Replay)?;
 
         let shared = Arc::new(Shared {
             journal: Mutex::new(Vec::new()),
@@ -248,7 +252,7 @@ impl PgLedger {
 }
 
 /// Rebuild an in-memory ledger from committed rows.
-fn replay_into(core: &mut Ledger, rows: &[tokio_postgres::Row]) {
+fn replay_into(core: &mut Ledger, rows: &[tokio_postgres::Row]) -> Result<(), String> {
     // Replay through the public API so the cache is rebuilt by exactly
     // the code that maintains it normally — a separate rebuild path is a
     // second implementation that can disagree, and a disagreement here is
@@ -269,8 +273,12 @@ fn replay_into(core: &mut Ledger, rows: &[tokio_postgres::Row]) {
         let from = account_from_row(&rows[i], "account_kind", "account_id");
         let to = account_from_row(&rows[i], "counterparty_kind", "counterparty_id");
 
-        let _ = core.transfer(TransferRequest {
-            idem_key: IdemKey::server(idem_key),
+        // Not `let _ =`. A refused replay means the reconstructed state
+        // disagrees with the durable log, and continuing would leave
+        // balances silently wrong on the one path that exists to recover
+        // from a crash. Better to refuse to start than to start wrong.
+        if let Err(e) = core.transfer(TransferRequest {
+            idem_key: IdemKey::server(idem_key.clone()),
             from,
             to,
             asset,
@@ -278,9 +286,14 @@ fn replay_into(core: &mut Ledger, rows: &[tokio_postgres::Row]) {
             reason,
             actor,
             tick: tick.max(0) as u64,
-        });
+        }) {
+            return Err(format!(
+                "replaying entry {idem_key:?} (seq order {i}): {e}"
+            ));
+        }
         i += 1;
     }
+    Ok(())
 }
 
 fn account_from_row(row: &tokio_postgres::Row, kind_col: &str, id_col: &str) -> Account {

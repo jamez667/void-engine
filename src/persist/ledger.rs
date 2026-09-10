@@ -108,7 +108,23 @@ impl IdemKey {
     /// The normal construction: session identity plus the client's
     /// monotonic sequence number, plus what the action was.
     pub fn new(session: &str, client_seq: u64, action: &str) -> Self {
-        IdemKey(format!("{session}:{client_seq}:{action}"))
+        // Length-prefixed, not delimiter-joined. A plain
+        // `"{session}:{seq}:{action}"` is ambiguous whenever a field can
+        // contain the delimiter: ("bob", 5, "5:trade") and
+        // ("bob:5", 5, "trade") both render as "bob:5:5:trade", so one
+        // player's genuine second purchase is silently deduplicated
+        // against the first and the value never moves.
+        //
+        // That failure is invisible to the zero-sum audit, because
+        // nothing is *forged* — the books still balance, a transfer just
+        // vanishes. Prefixing each field with its byte length makes the
+        // encoding injective, so distinct inputs cannot collide however
+        // the caller composes them.
+        IdemKey(format!(
+            "{}:{session}|{client_seq}|{}:{action}",
+            session.len(),
+            action.len(),
+        ))
     }
 
     /// For server-originated movements that have no client packet behind
@@ -593,6 +609,43 @@ mod tests {
         let acct = Account::player(who);
         l.transfer(req(Account::Mint, acct.clone(), amount, "seed")).unwrap();
         (l, acct)
+    }
+
+    /// Two genuinely different transfers must never share a key.
+    ///
+    /// A delimiter-joined `"{session}:{seq}:{action}"` is ambiguous
+    /// whenever a field can contain the delimiter: ("bob", 5, "5:trade")
+    /// and ("bob:5", 5, "trade") both rendered as "bob:5:5:trade", so the
+    /// second player's real purchase was silently deduplicated against the
+    /// first and the value never moved. Invisible to the zero-sum audit,
+    /// because nothing is forged — a transfer simply vanishes.
+    #[test]
+    fn distinct_inputs_cannot_collide_on_one_idem_key() {
+        let a = IdemKey::new("bob", 5, "5:trade");
+        let b = IdemKey::new("bob:5", 5, "trade");
+        assert_ne!(a, b, "delimiter injection must not forge a collision");
+
+        let c = IdemKey::new("s", 1, "x");
+        let d = IdemKey::new("s", 1, "x");
+        assert_eq!(c, d, "identical inputs must still produce one key");
+    }
+
+    /// The end-to-end consequence: both purchases must land.
+    #[test]
+    fn a_colliding_shaped_pair_moves_value_twice() {
+        let (mut l, alice) = funded("alice", 1000);
+        let shop = Account::system("shop");
+
+        let mut first = req(alice.clone(), shop.clone(), 100, "unused");
+        first.idem_key = IdemKey::new("bob", 5, "5:trade");
+        let mut second = req(alice.clone(), shop.clone(), 700, "unused");
+        second.idem_key = IdemKey::new("bob:5", 5, "trade");
+
+        assert!(!l.transfer(first).unwrap().deduplicated);
+        assert!(!l.transfer(second).unwrap().deduplicated, "the second must not be swallowed");
+        assert_eq!(l.balance(&alice, "credits"), 200);
+        assert_eq!(l.balance(&shop, "credits"), 800);
+        assert!(l.audit_zero_sum().is_empty());
     }
 
     #[test]

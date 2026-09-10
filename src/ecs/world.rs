@@ -30,6 +30,9 @@ trait AnyStorage: Any + Send + Sync {
     fn install_column(&mut self, decoded: Box<dyn Any + Send + Sync>) -> bool;
     /// Diagnostic name for audit failures. Never written to a file.
     fn type_name(&self) -> &'static str;
+    /// Slot count, so a restore can reject a column that does not fit the
+    /// allocator it is being installed into.
+    fn column_len(&self) -> usize;
 }
 
 struct ComponentStorage<T> {
@@ -79,6 +82,7 @@ impl<T: Send + Sync + 'static> AnyStorage for ComponentStorage<T> {
         }
     }
     fn type_name(&self) -> &'static str { std::any::type_name::<T>() }
+    fn column_len(&self) -> usize { self.data.len() }
 }
 
 /// Build an empty `ComponentStorage<T>`, boxed twice: once as the trait
@@ -234,6 +238,21 @@ impl World {
         if let Some(bad) = free_list.iter().find(|&&i| alive[i as usize]) {
             return Err(format!("free_list entry {bad} is marked alive"));
         }
+        // A slot named twice would be handed out twice, and the two ids
+        // would be *byte-identical* — same index, same generation. That is
+        // not aliasing the generation counter can catch: writing a
+        // component through one is visible through the other, and
+        // despawning one silently kills the other. It defeats exactly the
+        // stale-id guarantee this function exists to preserve, and a
+        // corrupt or hand-edited checkpoint reaches it directly.
+        let mut seen = vec![false; generations.len()];
+        for &i in &free_list {
+            let slot = &mut seen[i as usize];
+            if *slot {
+                return Err(format!("free_list names slot {i} more than once"));
+            }
+            *slot = true;
+        }
         self.generations = generations;
         self.alive = alive;
         self.free_list = free_list;
@@ -277,11 +296,23 @@ impl World {
                 e.insert(*storage)
             }
         };
-        if slot.install_column(decoded) {
-            Ok(())
-        } else {
-            Err("decoded column does not match the storage type".to_string())
+        if !slot.install_column(decoded) {
+            return Err("decoded column does not match the storage type".to_string());
         }
+        // A column longer than the allocator is silently unreachable: the
+        // iterators guard on `alive.get(i)`, so every component past the
+        // end is skipped. That turns a corrupt save into a world quietly
+        // missing entities, which then gets checkpointed back over the
+        // good copy on the next interval — a load that reports success
+        // while losing data is worse than one that fails.
+        let slots = self.generations.len();
+        let col = self.components[&type_id].column_len();
+        if col > slots {
+            return Err(format!(
+                "column has {col} entries but the allocator has {slots} slots"
+            ));
+        }
+        Ok(())
     }
 
     pub fn entities(&self) -> impl Iterator<Item = EntityId> + '_ {
@@ -698,6 +729,58 @@ mod tests {
         w.insert(e, Vel(5));
         assert_eq!(w.component_kinds(), 2);
         assert_eq!(w.iter_mut::<Vel>().count(), 1);
+    }
+
+    /// A `free_list` naming one slot twice hands out two *byte-identical*
+    /// live ids — same index, same generation, so nothing distinguishes
+    /// them. Writing through one is visible through the other and
+    /// despawning one silently kills the other, which defeats exactly the
+    /// stale-id guarantee this validation exists to provide. Reachable
+    /// from a corrupt checkpoint.
+    #[test]
+    fn a_duplicated_free_list_slot_is_rejected() {
+        let mut w = World::new();
+        let err = w
+            .restore_allocator(vec![0, 0], vec![false, false], vec![0, 0])
+            .expect_err("a slot named twice must not load");
+        assert!(err.contains("more than once"), "got {err}");
+    }
+
+    /// The legitimate shape must still load, or the check above is just
+    /// breaking restore.
+    #[test]
+    fn a_valid_allocator_still_restores() {
+        let mut w = World::new();
+        w.restore_allocator(vec![0, 1, 0], vec![true, false, true], vec![1])
+            .expect("a well-formed allocator must load");
+        assert_eq!(w.entities().count(), 2);
+        // And the freed slot is the one handed out next.
+        assert_eq!(w.spawn().index, 1);
+    }
+
+    /// A column longer than the allocator is silently unreachable — the
+    /// iterators guard on `alive.get(i)` — so it would load "successfully"
+    /// as a world quietly missing entities, then be checkpointed back over
+    /// the good copy.
+    #[test]
+    fn an_oversized_column_is_rejected() {
+        let mut w = World::new();
+        w.restore_allocator(vec![0, 0], vec![true, true], vec![]).unwrap();
+        let col: Vec<Option<Pos>> = (0..6).map(|i| Some(Pos(i, i))).collect();
+        let err = w
+            .install_column(TypeId::of::<Pos>(), Box::new(col), empty_storage_of::<Pos>)
+            .expect_err("a column larger than the allocator must not install");
+        assert!(err.contains("6 entries") && err.contains("2 slots"), "got {err}");
+    }
+
+    #[test]
+    fn a_fitting_column_still_installs() {
+        let mut w = World::new();
+        w.restore_allocator(vec![0, 0], vec![true, true], vec![]).unwrap();
+        let col: Vec<Option<Pos>> = vec![Some(Pos(9, 9)), None];
+        w.install_column(TypeId::of::<Pos>(), Box::new(col), empty_storage_of::<Pos>)
+            .expect("a fitting column must install");
+        assert_eq!(w.iter::<Pos>().count(), 1);
     }
 
     #[test]
