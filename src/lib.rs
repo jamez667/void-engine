@@ -35,6 +35,10 @@ pub mod math;
 pub mod net;
 pub mod pathfind;
 pub mod perf;
+/// Saving and loading a `World` — component name registry, snapshots,
+/// checkpoints. Off by default; a game that never saves carries none of it.
+#[cfg(feature = "persist")]
+pub mod persist;
 pub mod physics;
 pub mod render_math;
 /// wgpu renderer — client-only.

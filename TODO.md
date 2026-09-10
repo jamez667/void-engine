@@ -228,12 +228,46 @@ unblocks the most downstream work.
       cannot be told which id to assign); the engine creates no async runtime
       and `fixed_update` is sync.
 
-      **Build order:** (1) registry + snapshot/restore, no DB; (2) on-disk
-      checkpoints - `persist` tier ships, useful alone; (3) ledger core
-      in-memory, semantics proven without IO; (4) Postgres behind the ledger
-      trait, feature-gated; (5) reconciliation + crash matrix, exit criterion
-      being that an injected synthetic dupe is caught by reconciliation
-      rather than by a player noticing.
+      **Build order:** (1) registry + snapshot/restore, no DB - **DONE
+      2026-09-10**; (2) on-disk checkpoints - `persist` tier ships, useful
+      alone; (3) ledger core in-memory, semantics proven without IO; (4)
+      Postgres behind the ledger trait, feature-gated; (5) reconciliation +
+      crash matrix, exit criterion being that an injected synthetic dupe is
+      caught by reconciliation rather than by a player noticing.
+
+      **Phase 1 shipped (2026-09-10).** `persist` feature, off by default.
+      34 new tests; four CI axes now (default / net / headless / persist).
+
+      - `persist::registry` - names, not integers or `TypeId`. Interned to
+        `NameId(u16)`. `register` carries the serde bounds;
+        `register_transient` deliberately does not, so a particle needs no
+        serde to be classified. Duplicate names and one-type-two-names fail
+        at startup. `rename` aliases make a bad name recoverable. `audit`
+        catches a component present in the world but never classified.
+      - `persist::snapshot` - `capture`/`restore`, `to_bytes`/`from_bytes`.
+        Walks the registry, not the world's storages, so an unregistered
+        component is not silently saved. Columns keep their holes so slot
+        indices survive; the allocator (`generations`/`alive`/`free_list`)
+        is captured verbatim rather than replayed through `spawn()`, which
+        would renumber every entity and dangle saved cross-references.
+      - `Pcg32::state()`/`from_state()` - checkpoints capture stream
+        *position*, not seed. `Lcg` needed nothing: its state is a public
+        field, pinned by a test so a future refactor cannot quietly break it.
+      - Codec design forced by bincode: `serialize` is generic over
+        `T: Serialize` and cannot cross a `&dyn` boundary, so `Entry` holds
+        monomorphised `encode`/`decode`/`make_storage` fn pointers captured
+        at `register` time.
+      - Rejections are errors, never silent: unknown component, schema
+        mismatch, future format version, inconsistent allocator arrays.
+      - `World` gained a doc-hidden persistence seam - `allocator_state`,
+        `restore_allocator`, `column_for`, `install_column`,
+        `present_component_types`. Engine seam, not game API.
+      - serde derives on engine components are `cfg_attr`-gated on
+        `persist`, and `persist` enables `glam/serde`, so a non-saving game
+        compiles none of it.
+
+      *Deferred to phase 2, deliberately: no file IO. A `Snapshot` is bytes
+      in memory; atomic write, retention and restore-on-boot are next.*
 
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the

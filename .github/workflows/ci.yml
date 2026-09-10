@@ -47,6 +47,13 @@ jobs:
       - name: Clippy (headless)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
+      # `persist` is a third feature axis: it turns on serde derives across
+      # `components`, the component registry and snapshot/restore. None of
+      # that is compiled by the other three, so without this step the whole
+      # module is unchecked.
+      - name: Clippy (persist)
+        run: cargo clippy --all-targets --no-default-features --features persist -- -D warnings
+
       - name: Test (default features)
         run: cargo test --all-targets
 
@@ -55,6 +62,22 @@ jobs:
 
       - name: Test (headless)
         run: cargo test --all-targets --no-default-features
+
+      - name: Test (persist)
+        run: cargo test --all-targets --no-default-features --features persist
+
+      # The snapshot round-trip is phase 1's exit criterion, and it only
+      # exists on this axis — `tests/snapshot_round_trip.rs` compiles to an
+      # empty binary without the feature. Asserting the count stops it
+      # silently becoming a no-op if the cfg gate or the feature is broken.
+      - name: Snapshot round-trip actually ran
+        run: |
+          out=$(cargo test --test snapshot_round_trip --no-default-features --features persist 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "10 passed" || {
+            echo "expected 10 snapshot round-trip tests; the cfg gate may be wrong"
+            exit 1
+          }
 
       # R1's central claim, asserted rather than assumed: a headless build
       # links no GPU stack. `-e normal` excludes dev-dependencies, so the

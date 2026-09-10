@@ -5,12 +5,19 @@
 
 use glam::DVec2;
 
+// Serde derives are gated on `persist` so a single-player game that never
+// saves does not compile them. `DVec2` carries serde support via glam's
+// feature, enabled alongside ours.
+#[cfg(feature = "persist")]
+use serde::{Deserialize, Serialize};
+
 /// World-space pose. Position is `f64` so the world can span light-hours
 /// without losing precision; rotation is `f32` in radians.
 ///
 /// The game/engine convention is that render code casts to `f32` *only
 /// after* subtracting the camera position — see `void_engine::renderer`
 /// notes — so `Transform2D` itself never needs to be `f32`.
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
 #[derive(Clone)]
 pub struct Transform2D {
     pub pos: DVec2,
@@ -18,6 +25,7 @@ pub struct Transform2D {
 }
 
 /// Linear + angular velocity, integrated by `void_engine::physics::integrate`.
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
 #[derive(Clone)]
 pub struct Velocity {
     pub linear: DVec2,
@@ -30,6 +38,7 @@ pub struct Velocity {
 /// bounding-circle for the spatial grid). The collision pair loop picks
 /// circle-vs-circle, circle-vs-OBB, or OBB-vs-OBB math per pair from the
 /// two shape flags.
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
 #[derive(Clone)]
 pub struct Collider {
     /// Bounding-circle radius. Always populated so the spatial-grid
@@ -68,6 +77,7 @@ impl Collider {
 /// comes from the sibling `Velocity` component (integrated separately).
 /// `tag` lets a compact network snapshot pick a palette without shipping
 /// full RGBA (0 = default spark, 1 = shield flash — extend per game).
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
 #[derive(Clone)]
 pub struct Particle {
     pub lifetime: f32,
@@ -83,6 +93,7 @@ pub struct Particle {
 /// asteroid, salvage wreck, breakable prop, etc. Embed in a game component
 /// to get common size / mass / health tracking. Mass is caller-supplied so
 /// each game picks its own density model.
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
 #[derive(Clone)]
 pub struct Destructible2D {
     pub radius: f32,
@@ -110,9 +121,13 @@ impl Destructible2D {
 
 /// Marker tag: this entity is the local player. Camera-follow, HUD, and
 /// input systems key off it. Zero-sized.
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
+#[derive(Clone)]
 pub struct PlayerTag;
 
 /// Marker tag: the camera should follow this entity. Usually attached to
 /// the same entity as `PlayerTag`, but the split lets you swap the
 /// follow-target (spectate, cinematic) without moving the player marker.
+#[cfg_attr(feature = "persist", derive(Serialize, Deserialize))]
+#[derive(Clone)]
 pub struct CameraTarget;

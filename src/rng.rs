@@ -90,6 +90,34 @@ impl Pcg32 {
         Pcg32::seed(self.next_u64(), stream)
     }
 
+    /// This generator's exact position in its stream: `(state, inc)`.
+    ///
+    /// Exists for checkpointing. A saved *seed* is not enough to resume a
+    /// simulation: re-seeding replays the stream from the beginning, so
+    /// anything RNG-driven diverges from where the sim actually was. The
+    /// pair returned here is the whole of the generator's state, so
+    /// `from_state(rng.state())` resumes exactly.
+    ///
+    /// `inc` is the stream selector (always odd, by construction) and
+    /// `state` is the position within it.
+    pub fn state(&self) -> (u64, u64) { (self.state, self.inc) }
+
+    /// Rebuild a generator at an exact position, from [`state`].
+    ///
+    /// Round-trips: `Pcg32::from_state(r.state())` produces a generator
+    /// yielding the identical remaining sequence.
+    ///
+    /// `inc` is forced odd because the PCG step requires it and a restored
+    /// even value would silently halve the period. A checkpoint written by
+    /// this engine always carries an odd `inc`; forcing it here means a
+    /// corrupted or hand-edited one degrades predictably instead of
+    /// producing a subtly broken stream.
+    ///
+    /// [`state`]: Pcg32::state
+    pub fn from_state((state, inc): (u64, u64)) -> Self {
+        Self { state, inc: inc | 1 }
+    }
+
     pub fn next_u32(&mut self) -> u32 {
         let old = self.state;
         self.state = old.wrapping_mul(PCG_MUL).wrapping_add(self.inc);
@@ -203,5 +231,64 @@ mod pcg_tests {
         let mut r = Pcg32::seed(11, 4);
         assert!((0..100).all(|_| r.chance(1.0)));
         assert!((0..100).all(|_| !r.chance(0.0)));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    /// The property a checkpoint depends on: restoring from captured state
+    /// resumes the *same* sequence, not a fresh one from the seed.
+    #[test]
+    fn from_state_resumes_the_identical_sequence() {
+        let mut a = Pcg32::seed(0xDEADBEEF, 7);
+        // Advance an arbitrary distance so we are mid-stream, not at the start.
+        for _ in 0..1000 { a.next_u32(); }
+
+        let mut b = Pcg32::from_state(a.state());
+        let from_a: Vec<u32> = (0..32).map(|_| a.next_u32()).collect();
+        let from_b: Vec<u32> = (0..32).map(|_| b.next_u32()).collect();
+        assert_eq!(from_a, from_b, "restored generator diverged from the original");
+    }
+
+    /// The bug this exists to prevent: seeding again replays from the start.
+    #[test]
+    fn re_seeding_does_not_resume_mid_stream() {
+        let mut a = Pcg32::seed(0xDEADBEEF, 7);
+        for _ in 0..1000 { a.next_u32(); }
+        let next = a.next_u32();
+
+        let mut fresh = Pcg32::seed(0xDEADBEEF, 7);
+        assert_ne!(fresh.next_u32(), next,
+            "a re-seeded generator must not coincidentally match mid-stream");
+    }
+
+    #[test]
+    fn state_round_trips_through_a_tuple() {
+        let mut r = Pcg32::seed(42, 3);
+        r.next_u64();
+        let (s, i) = r.state();
+        assert_eq!(Pcg32::from_state((s, i)).state(), (s, i));
+    }
+
+    /// `inc` must stay odd — the PCG step requires it, and an even value
+    /// halves the period. A hand-edited checkpoint must not be able to
+    /// smuggle one in.
+    #[test]
+    fn from_state_forces_inc_odd() {
+        let (_, inc) = Pcg32::from_state((123, 8)).state();
+        assert_eq!(inc & 1, 1, "inc must be odd after restore");
+    }
+
+    /// `Lcg` needs no accessor: its state is a public field. Pinning that
+    /// here so a future refactor making it private is caught by a test
+    /// rather than by a broken checkpoint.
+    #[test]
+    fn lcg_state_is_directly_accessible() {
+        let mut a = Lcg::new(99);
+        for _ in 0..10 { a.next(); }
+        let mut b = Lcg(a.0);
+        assert_eq!(a.next(), b.next(), "Lcg restored from its public field diverged");
     }
 }

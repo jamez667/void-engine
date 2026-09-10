@@ -29,6 +29,12 @@ chrono = "0.4"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 rodio = { version = "0.19", default-features = false, features = ["symphonia-mp3"], optional = true }
 serde = { version = "1", features = ["derive"] }
+# Checkpoint encoding (feature `persist`). A binary format, not JSON: a
+# checkpoint is machine-read on a hot restart path and never hand-edited,
+# so size and decode speed beat readability. bincode rather than postcard
+# only because it is already vendored in this checkout, and the format is
+# an implementation detail behind `Snapshot` either way.
+bincode = { version = "1", optional = true }
 
 # ── netcode (feature `net`, off by default) ──────────────────────────────────
 # All optional for the same reason `rodio` is: a single-player game must not
@@ -71,6 +77,14 @@ audio = ["dep:rodio"]
 # winit event loop, and `ClientApp`/`run`. Off means a headless build —
 # `App` + `run_headless` over a `Timestep`, with no GPU and no window.
 client = ["dep:wgpu"]
+
+# Saving and loading a `World`: the component name registry, snapshot and
+# restore, and RNG state capture. Off by default because a game that never
+# saves should not carry an encoder or the registry's startup audit.
+#
+# This is tier 2 of three (see TODO.md R2): tier 1 is no persistence, tier
+# 3 adds the append-only ledger and Postgres for MMO-scale value tracking.
+persist = ["dep:bincode", "glam/serde"]
 
 # Networking is opt-in for the same reason audio is: a game that has no
 # netcode should not carry the code, the threads, or the attack surface of a

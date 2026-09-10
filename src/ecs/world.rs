@@ -15,6 +15,21 @@ trait AnyStorage: Any + Send + Sync {
     fn clear_slot(&mut self, index: usize);
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// The `Vec<Option<T>>` column itself, for a persistence codec.
+    ///
+    /// Distinct from `as_any`, which yields the `ComponentStorage<T>`
+    /// wrapper. A codec is monomorphised over `T` and downcasts to the
+    /// column, because that — holes included — is what has to survive a
+    /// save so slot indices are reproduced rather than compacted.
+    fn column_any(&self) -> &dyn Any;
+    /// Replace the column wholesale from a decoded `Vec<Option<T>>`.
+    ///
+    /// Returns false if the box is not this storage's column type, which
+    /// means a snapshot named a component whose type has since changed
+    /// shape — a load error, not a panic.
+    fn install_column(&mut self, decoded: Box<dyn Any + Send + Sync>) -> bool;
+    /// Diagnostic name for audit failures. Never written to a file.
+    fn type_name(&self) -> &'static str;
 }
 
 struct ComponentStorage<T> {
@@ -56,6 +71,25 @@ impl<T: Send + Sync + 'static> AnyStorage for ComponentStorage<T> {
     }
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn column_any(&self) -> &dyn Any { &self.data }
+    fn install_column(&mut self, decoded: Box<dyn Any + Send + Sync>) -> bool {
+        match decoded.downcast::<Vec<Option<T>>>() {
+            Ok(col) => { self.data = *col; true }
+            Err(_) => false,
+        }
+    }
+    fn type_name(&self) -> &'static str { std::any::type_name::<T>() }
+}
+
+/// Build an empty `ComponentStorage<T>`, boxed twice: once as the trait
+/// object the ECS stores, once as `dyn Any` so the registry can hold a
+/// non-generic fn pointer to it.
+///
+/// Public only so `persist::registry` can name it; it is an engine seam,
+/// not a game-facing API.
+#[doc(hidden)]
+pub fn empty_storage_of<T: Send + Sync + 'static>() -> Box<dyn Any + Send + Sync> {
+    Box::new(Box::new(ComponentStorage::<T>::new()) as Box<dyn AnyStorage>)
 }
 
 pub struct World {
@@ -165,6 +199,89 @@ impl World {
 
     pub fn remove<T: Send + Sync + 'static>(&mut self, id: EntityId) {
         self.storage_mut::<T>().remove(id.index as usize);
+    }
+
+    /// Entity-allocator state: `(generations, alive, free_list)`.
+    ///
+    /// A snapshot must reproduce all three exactly. Restoring by replaying
+    /// `spawn()` would renumber every entity and invalidate saved
+    /// cross-references, so the allocator is captured verbatim instead.
+    #[doc(hidden)]
+    pub fn allocator_state(&self) -> (&[u32], &[bool], &[u32]) {
+        (&self.generations, &self.alive, &self.free_list)
+    }
+
+    /// Rebuild the entity allocator from a snapshot.
+    ///
+    /// Errors rather than panics on inconsistent input: a truncated or
+    /// hand-edited save must fail to load, not produce a world where
+    /// `alive` and `generations` disagree about how many slots exist.
+    #[doc(hidden)]
+    pub fn restore_allocator(
+        &mut self,
+        generations: Vec<u32>,
+        alive: Vec<bool>,
+        free_list: Vec<u32>,
+    ) -> Result<(), String> {
+        if generations.len() != alive.len() {
+            return Err(format!(
+                "allocator mismatch: {} generations vs {} alive flags",
+                generations.len(), alive.len()));
+        }
+        if let Some(bad) = free_list.iter().find(|&&i| i as usize >= generations.len()) {
+            return Err(format!("free_list entry {bad} is out of range"));
+        }
+        if let Some(bad) = free_list.iter().find(|&&i| alive[i as usize]) {
+            return Err(format!("free_list entry {bad} is marked alive"));
+        }
+        self.generations = generations;
+        self.alive = alive;
+        self.free_list = free_list;
+        Ok(())
+    }
+
+    /// Every registered component type currently holding storage, as
+    /// `(TypeId, type_name)`. Feeds `Registry::audit`; `type_name` is
+    /// diagnostic only, which is the one job it is fit for.
+    #[doc(hidden)]
+    pub fn present_component_types(&self) -> Vec<(TypeId, &'static str)> {
+        self.components
+            .iter()
+            .map(|(tid, s)| (*tid, s.type_name()))
+            .collect()
+    }
+
+    /// The raw column for `type_id`, for a codec to encode.
+    #[doc(hidden)]
+    pub fn column_for(&self, type_id: TypeId) -> Option<&dyn Any> {
+        Some(self.components.get(&type_id)?.column_any())
+    }
+
+    /// Install a decoded column, creating the storage if absent.
+    ///
+    /// `make_empty` builds an empty storage for the type when the world
+    /// has none yet — unavoidable, because `World` cannot name `T` here.
+    #[doc(hidden)]
+    pub fn install_column(
+        &mut self,
+        type_id: TypeId,
+        decoded: Box<dyn Any + Send + Sync>,
+        make_empty: fn() -> Box<dyn Any + Send + Sync>,
+    ) -> Result<(), String> {
+        let slot = match self.components.entry(type_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let storage = make_empty()
+                    .downcast::<Box<dyn AnyStorage>>()
+                    .map_err(|_| "make_empty returned the wrong type".to_string())?;
+                e.insert(*storage)
+            }
+        };
+        if slot.install_column(decoded) {
+            Ok(())
+        } else {
+            Err("decoded column does not match the storage type".to_string())
+        }
     }
 
     pub fn entities(&self) -> impl Iterator<Item = EntityId> + '_ {
