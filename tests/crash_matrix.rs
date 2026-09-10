@@ -72,6 +72,7 @@ fn transfer(from: Account, to: Account, amount: i64, key: &str, tick: u64) -> Tr
         reason: "matrix".to_string(),
         actor: "system".to_string(),
         tick,
+        spends: None,
     }
 }
 

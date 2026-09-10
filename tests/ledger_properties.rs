@@ -65,6 +65,7 @@ fn run_sequence(seed: u64, steps: usize) {
                 reason: "seed".to_string(),
                 actor: "system".to_string(),
                 tick: 0,
+                spends: None,
             })
             .expect("seeding from Mint must succeed");
         }
@@ -101,6 +102,7 @@ fn run_sequence(seed: u64, steps: usize) {
             reason: "fuzz".to_string(),
             actor: "test".to_string(),
             tick: step as u64,
+            spends: None,
         });
 
         // Occasionally hold and release funds, so reservations interleave
@@ -108,7 +110,11 @@ fn run_sequence(seed: u64, steps: usize) {
         if rng.next().is_multiple_of(8) {
             let who = accts[pick(&mut rng, accts.len())].clone();
             let amt = (rng.next() % 400) as i64 + 1;
-            if let Ok(r) = l.reserve(&who, asset, amt) {
+            // Deadlines spread across the run so some holds lapse naturally
+            // and some are released explicitly — both paths must keep the
+            // books balanced.
+            let expiry = step as u64 + (rng.next() % 50);
+            if let Ok(r) = l.reserve(&who, asset, amt, expiry) {
                 if rng.next().is_multiple_of(2) {
                     l.release(r).expect("a held reservation must release");
                 }
@@ -152,6 +158,7 @@ fn heavy_retry_pressure_moves_each_transfer_exactly_once() {
         reason: "seed".to_string(),
         actor: "system".to_string(),
         tick: 0,
+        spends: None,
     })
     .unwrap();
 
@@ -167,6 +174,7 @@ fn heavy_retry_pressure_moves_each_transfer_exactly_once() {
                 reason: "buy".to_string(),
                 actor: "alice".to_string(),
                 tick: i,
+                spends: None,
             });
         }
     }
@@ -194,6 +202,7 @@ fn a_unique_item_is_never_duplicated() {
         reason: "quest_reward".to_string(),
         actor: "system".to_string(),
         tick: 0,
+        spends: None,
     })
     .unwrap();
 
@@ -209,6 +218,7 @@ fn a_unique_item_is_never_duplicated() {
             reason: "trade".to_string(),
             actor: "test".to_string(),
             tick: step,
+            spends: None,
         });
 
         // Exactly one sword exists, and it is in exactly one place.

@@ -471,6 +471,43 @@ unblocks the most downstream work.
       having nowhere to page is closed - see the promtail config in
       `docs/`.
 
+      **Reservation lifecycle (2026-09-10).** 9 more tests, 302 total. The
+      last open item from the review, and a real funds-lock bug rather
+      than a doc mismatch.
+
+      `transfer` never consulted a reservation, so a hold taken and not
+      explicitly released depressed `available` for the life of the
+      process: the balance moved, the hold stayed. The doc claimed release
+      happened "when the transfer commits or is abandoned", which was
+      never true.
+
+      - `TransferRequest.spends: Option<ReservationId>` names the hold a
+        transfer consumes. Explicit rather than matched by amount: two
+        holds on one account for the same sum are indistinguishable, and
+        picking the wrong one is a silent error on money. A mismatched
+        account/asset, a too-small hold, or an unknown id are all refused.
+      - Released on success **only**. A refused transfer leaves the hold
+        standing so the caller can retry against it; releasing on entry
+        would turn one failed attempt into lost protection.
+      - `reserve` takes `expires_after_tick`. Ticks not wall-clock: a
+        replay must reproduce exactly, and a stalled server should not
+        have holds lapse early because real time kept moving. This is the
+        backstop for a caller that panics or disconnects - the one case
+        spend-and-release cannot cover.
+      - **Expiry bites on read, not on a sweep.** `available_at` ignores
+        elapsed holds immediately, so a server that never calls
+        `expire_reservations` leaks a little memory but never a player's
+        money. The sweep only reclaims space.
+      - A hold guarantees its own spend: the reserved transfer checks
+        against availability *plus* its own hold, so other traffic cannot
+        consume the funds underneath it.
+      - The property test now staggers deadlines so some holds lapse
+        naturally and some are released explicitly, with the zero-sum
+        invariant asserted after every step either way.
+
+      *Mutation-tested: removing the release line makes
+      `a_spent_reservation_is_released` fail with the hold still counted.*
+
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the
       registry, not the type, so refactoring is free and `rename` recovers a

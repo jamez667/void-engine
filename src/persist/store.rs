@@ -75,11 +75,16 @@ pub trait LedgerStore {
     fn available(&self, account: &Account, asset: &str) -> Amount;
 
     /// Hold funds so an in-flight commit cannot be double-spent.
+    ///
+    /// `expires_after_tick` bounds the damage of an abandoned hold: a
+    /// caller that reserves and then panics or disconnects used to lock
+    /// those funds for the life of the process.
     fn reserve(
         &mut self,
         account: &Account,
         asset: &str,
         amount: Amount,
+        expires_after_tick: u64,
     ) -> Result<ReservationId, LedgerError>;
 
     /// Release a hold without spending it.

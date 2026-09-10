@@ -381,6 +381,7 @@ fn replay_into(core: &mut Ledger, rows: &[tokio_postgres::Row]) -> Result<(), St
             reason,
             actor,
             tick: tick.max(0) as u64,
+            spends: None,
         }) {
             return Err(format!(
                 "replaying entry {idem_key:?} (seq order {i}): {e}"
@@ -728,8 +729,9 @@ impl LedgerStore for PgLedger {
         account: &Account,
         asset: &str,
         amount: Amount,
+        expires_after_tick: u64,
     ) -> Result<ReservationId, LedgerError> {
-        self.core.reserve(account, asset, amount)
+        self.core.reserve(account, asset, amount, expires_after_tick)
     }
 
     fn release(&mut self, id: ReservationId) -> Result<(), LedgerError> {

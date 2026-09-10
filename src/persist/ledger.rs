@@ -190,6 +190,15 @@ pub struct TransferRequest {
     pub reason: String,
     pub actor: String,
     pub tick: u64,
+    /// The hold this transfer consumes, if any.
+    ///
+    /// Named explicitly rather than matched by amount: two holds on the
+    /// same account for the same sum are indistinguishable, and picking
+    /// the wrong one is a silent error on money. A mismatched or expired
+    /// id is refused outright.
+    ///
+    /// `None` for an ordinary transfer that reserved nothing.
+    pub spends: Option<ReservationId>,
 }
 
 /// Why a transfer was refused.
@@ -205,8 +214,20 @@ pub enum LedgerError {
     SelfTransfer(Account),
     /// The arithmetic would overflow `i64`.
     Overflow,
-    /// A reservation was released that was never taken.
+    /// A reservation was released or spent that was never taken, or has
+    /// already lapsed.
     UnknownReservation,
+    /// A transfer named a hold belonging to a different account or asset.
+    ///
+    /// Refused rather than ignored: spending someone else's hold, or a
+    /// hold on a different asset, is either a bug or an attempt.
+    ReservationMismatch {
+        id: ReservationId,
+        expected_account: Account,
+        expected_asset: Asset,
+    },
+    /// The named hold does not cover the amount being spent.
+    ReservationTooSmall { id: ReservationId, held: Amount, needed: Amount },
     /// The durable writer has fallen too far behind and the journal has
     /// hit its cap.
     ///
@@ -242,7 +263,12 @@ impl std::fmt::Display for LedgerError {
             LedgerError::Overflow =>
                 write!(f, "transfer would overflow the amount type"),
             LedgerError::UnknownReservation =>
-                write!(f, "released a reservation that was never taken"),
+                write!(f, "no such reservation, or it has expired"),
+            LedgerError::ReservationMismatch { id, expected_account, expected_asset } =>
+                write!(f, "reservation {id:?} is held by {expected_account:?} for \
+                          {expected_asset}, not this transfer"),
+            LedgerError::ReservationTooSmall { id, held, needed } =>
+                write!(f, "reservation {id:?} holds {held}, needs {needed}"),
             LedgerError::WriterBehind { depth, limit } =>
                 write!(f, "durable writer is behind: {depth} queued, limit {limit}"),
             LedgerError::WriterDegraded(why) =>
@@ -264,23 +290,49 @@ pub struct Discrepancy {
     pub imbalance: i128,
 }
 
-/// Handle to an in-flight reservation.
+/// Handle to a hold on funds.
 ///
-/// **Release is the caller's job.** `transfer` never consults, decrements
-/// or removes a reservation, so one taken and not explicitly released
-/// holds those funds down forever: the balance moves, the hold stays, and
-/// `available` stays depressed for the life of the process. There is no
-/// timeout and no link from a reservation to the transfer it was taken
-/// for.
+/// A hold is released three ways, and between them they close every path
+/// by which funds used to get stuck:
 ///
-/// This doc used to claim release happened "when the transfer commits or
-/// is abandoned", which was never true in the code. Coupling the two is
-/// the better design and is deliberately not done here: it would change
-/// semantics the phase-3 property tests were written against, so it wants
-/// its own change and its own tests rather than being smuggled into a
-/// documentation fix.
+/// - **Spent.** A [`TransferRequest`] naming this id in `spends` consumes
+///   the hold on success. Only on success: a refused transfer leaves it
+///   standing so the caller can retry against it.
+/// - **Released.** [`Ledger::release`] gives it back unspent.
+/// - **Expired.** The deadline passed. This is the backstop for a caller
+///   that panics, disconnects, or simply forgets — the one case the other
+///   two cannot cover, and the reason funds can no longer be locked for
+///   the life of the process.
+///
+/// Expiry bites on *read*, not on a sweep: an elapsed hold stops counting
+/// against [`Ledger::available`] immediately, so a server that never calls
+/// [`Ledger::expire_reservations`] leaks a little memory but never a
+/// player's money.
+///
+/// The id is named explicitly rather than matched by amount, because two
+/// holds on one account for the same sum are indistinguishable and
+/// picking the wrong one would be a silent error on money.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReservationId(u64);
+
+/// A hold on funds, with a deadline.
+///
+/// The deadline is what stops an abandoned hold locking money forever.
+/// A caller that reserves and then panics, disconnects, or simply forgets
+/// used to depress `available` for the life of the process; now the hold
+/// lapses and the funds come back on their own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    pub account: Account,
+    pub asset: Asset,
+    pub amount: Amount,
+    /// Simulation tick after which this hold no longer counts.
+    ///
+    /// Ticks rather than wall-clock: the ledger is driven by the sim, a
+    /// replay must reproduce exactly, and a server that stalls should not
+    /// have its holds expire early because real time kept moving.
+    pub expires_after_tick: u64,
+}
 
 /// The in-memory ledger.
 ///
@@ -297,9 +349,15 @@ pub struct Ledger {
     /// Committed transfers, so a retry returns the original receipt.
     seen: HashMap<IdemKey, Receipt>,
     /// Funds committed to in-flight transfers but not yet written.
-    reservations: HashMap<ReservationId, (Account, Asset, Amount)>,
+    reservations: HashMap<ReservationId, Reservation>,
     next_seq: u64,
     next_reservation: u64,
+    /// Highest tick any transfer has carried.
+    ///
+    /// Lets `available` judge expiry without every caller threading a
+    /// tick through. Monotonic: a late-arriving lower tick does not wind
+    /// it back, because that would resurrect holds that had lapsed.
+    now_tick: u64,
 }
 
 impl Ledger {
@@ -333,10 +391,50 @@ impl Ledger {
             return Err(LedgerError::SelfTransfer(req.from));
         }
 
+        // Monotonic: a late-arriving lower tick must not wind the clock
+        // back, or holds that had already lapsed would come back to life
+        // and depress `available` again.
+        self.now_tick = self.now_tick.max(req.tick);
+
+        // A named hold must exist, be unexpired, match this account and
+        // asset, and cover the amount. Checked before anything is
+        // written, so a bad id refuses cleanly.
+        if let Some(id) = req.spends {
+            let held = self
+                .reservations
+                .get(&id)
+                .filter(|r| r.expires_after_tick >= req.tick)
+                .ok_or(LedgerError::UnknownReservation)?;
+            if held.account != req.from || held.asset != req.asset {
+                return Err(LedgerError::ReservationMismatch {
+                    id,
+                    expected_account: held.account.clone(),
+                    expected_asset: held.asset.clone(),
+                });
+            }
+            if held.amount < req.amount {
+                return Err(LedgerError::ReservationTooSmall {
+                    id,
+                    held: held.amount,
+                    needed: req.amount,
+                });
+            }
+        }
+
         // Mint has no balance to check — it is where value comes from.
-        // Everything else must cover the amount, reservations included.
+        // Everything else must cover the amount.
+        //
+        // A transfer spending its own hold checks against availability
+        // *plus* that hold: the funds were set aside for exactly this, so
+        // counting them as unavailable would refuse the spend the
+        // reservation existed to guarantee.
         if !matches!(req.from, Account::Mint) {
-            let available = self.available(&req.from, &req.asset);
+            let own_hold = req
+                .spends
+                .and_then(|id| self.reservations.get(&id))
+                .map(|r| r.amount)
+                .unwrap_or(0);
+            let available = self.available_at(&req.from, &req.asset, req.tick) + own_hold;
             if available < req.amount {
                 return Err(LedgerError::InsufficientFunds {
                     account: req.from.clone(),
@@ -394,6 +492,13 @@ impl Ledger {
             amount: req.amount,
             deduplicated: false,
         };
+        // Only now: a refused transfer must leave the hold standing so the
+        // caller can retry against it. Releasing on entry would turn one
+        // failed attempt into lost protection.
+        if let Some(id) = req.spends {
+            self.reservations.remove(&id);
+        }
+
         self.seen.insert(req.idem_key, receipt.clone());
         Ok(receipt)
     }
@@ -412,11 +517,21 @@ impl Ledger {
     /// instead would let a player spend the same funds twice while a
     /// commit is in flight — the exact race the reservation exists for.
     pub fn available(&self, account: &Account, asset: &str) -> Amount {
+        self.available_at(account, asset, self.now_tick)
+    }
+
+    /// `available` as of a given tick, so an expired hold stops counting
+    /// the instant its deadline passes rather than when a sweep happens
+    /// to run. Without this, forgetting `expire_reservations` would still
+    /// lock funds — the deadline has to bite on read, not on sweep.
+    pub fn available_at(&self, account: &Account, asset: &str, now_tick: u64) -> Amount {
         let reserved: Amount = self
             .reservations
             .values()
-            .filter(|(a, s, _)| a == account && s == asset)
-            .map(|(_, _, amt)| *amt)
+            .filter(|r| {
+                &r.account == account && r.asset == asset && r.expires_after_tick >= now_tick
+            })
+            .map(|r| r.amount)
             .sum();
         self.balance(account, asset) - reserved
     }
@@ -431,6 +546,7 @@ impl Ledger {
         account: &Account,
         asset: &str,
         amount: Amount,
+        expires_after_tick: u64,
     ) -> Result<ReservationId, LedgerError> {
         if amount <= 0 {
             return Err(LedgerError::NonPositiveAmount(amount));
@@ -446,9 +562,41 @@ impl Ledger {
         }
         let id = ReservationId(self.next_reservation);
         self.next_reservation += 1;
-        self.reservations
-            .insert(id, (account.clone(), asset.to_string(), amount));
+        self.reservations.insert(
+            id,
+            Reservation {
+                account: account.clone(),
+                asset: asset.to_string(),
+                amount,
+                expires_after_tick,
+            },
+        );
         Ok(id)
+    }
+
+    /// Drop every hold whose deadline has passed.
+    ///
+    /// Call once per tick. Returns how many lapsed, which is worth
+    /// logging: a number that climbs means callers are reserving and then
+    /// abandoning, and the funds were only recovered because of this
+    /// sweep rather than because the code was correct.
+    ///
+    /// Expired holds already stop counting against `available` the moment
+    /// their tick passes — this only reclaims the memory — so a server
+    /// that forgets to call it leaks a little space but never locks a
+    /// player's money.
+    pub fn expire_reservations(&mut self, now_tick: u64) -> usize {
+        let before = self.reservations.len();
+        self.reservations
+            .retain(|_, r| r.expires_after_tick >= now_tick);
+        before - self.reservations.len()
+    }
+
+    /// Look up a hold, if it exists and has not lapsed.
+    pub fn reservation(&self, id: ReservationId, now_tick: u64) -> Option<&Reservation> {
+        self.reservations
+            .get(&id)
+            .filter(|r| r.expires_after_tick >= now_tick)
     }
 
     /// Release a reservation without spending it.
@@ -585,8 +733,9 @@ impl crate::persist::store::LedgerStore for Ledger {
         account: &Account,
         asset: &str,
         amount: Amount,
+        expires_after_tick: u64,
     ) -> Result<ReservationId, LedgerError> {
-        Ledger::reserve(self, account, asset, amount)
+        Ledger::reserve(self, account, asset, amount, expires_after_tick)
     }
 
     fn release(&mut self, id: ReservationId) -> Result<(), LedgerError> {
@@ -624,6 +773,10 @@ impl crate::persist::store::LedgerStore for Ledger {
 mod tests {
     use super::*;
 
+    /// Far enough out that expiry never fires. Tests that care about
+    /// expiry set their own deadline.
+    const NEVER: u64 = u64::MAX;
+
     fn req(from: Account, to: Account, amount: Amount, key: &str) -> TransferRequest {
         TransferRequest {
             idem_key: IdemKey::server(key),
@@ -634,6 +787,7 @@ mod tests {
             reason: "test".to_string(),
             actor: "system".to_string(),
             tick: 1,
+            spends: None,
         }
     }
 
@@ -818,7 +972,7 @@ mod tests {
     #[test]
     fn a_reservation_reduces_available_but_not_balance() {
         let (mut l, alice) = funded("alice", 1000);
-        let _r = l.reserve(&alice, "credits", 400).unwrap();
+        let _r = l.reserve(&alice, "credits", 400, NEVER).unwrap();
 
         assert_eq!(l.balance(&alice, "credits"), 1000, "balance is unchanged");
         assert_eq!(l.available(&alice, "credits"), 600, "available is reduced");
@@ -829,7 +983,7 @@ mod tests {
     #[test]
     fn reserved_funds_cannot_be_spent_twice() {
         let (mut l, alice) = funded("alice", 1000);
-        l.reserve(&alice, "credits", 800).unwrap();
+        l.reserve(&alice, "credits", 800, NEVER).unwrap();
 
         let err = l.transfer(req(alice, Account::player("bob"), 300, "t")).unwrap_err();
         assert!(matches!(err, LedgerError::InsufficientFunds { available: 200, .. }));
@@ -838,7 +992,7 @@ mod tests {
     #[test]
     fn releasing_a_reservation_restores_availability() {
         let (mut l, alice) = funded("alice", 1000);
-        let r = l.reserve(&alice, "credits", 800).unwrap();
+        let r = l.reserve(&alice, "credits", 800, NEVER).unwrap();
         l.release(r).unwrap();
         assert_eq!(l.available(&alice, "credits"), 1000);
     }
@@ -846,8 +1000,145 @@ mod tests {
     #[test]
     fn over_reserving_is_refused() {
         let (mut l, alice) = funded("alice", 100);
-        l.reserve(&alice, "credits", 60).unwrap();
-        assert!(l.reserve(&alice, "credits", 50).is_err(), "only 40 remains");
+        l.reserve(&alice, "credits", 60, NEVER).unwrap();
+        assert!(l.reserve(&alice, "credits", 50, NEVER).is_err(), "only 40 remains");
+    }
+
+    /// The bug this change exists to fix: a hold used to survive the
+    /// transfer it was taken for, depressing `available` forever.
+    #[test]
+    fn a_spent_reservation_is_released() {
+        let (mut l, alice) = funded("alice", 1000);
+        let bob = Account::player("bob");
+        let hold = l.reserve(&alice, "credits", 300, NEVER).unwrap();
+        assert_eq!(l.available(&alice, "credits"), 700, "the hold is counted");
+
+        let mut r = req(alice.clone(), bob.clone(), 300, "spend");
+        r.spends = Some(hold);
+        l.transfer(r).unwrap();
+
+        assert_eq!(l.balance(&alice, "credits"), 700);
+        assert_eq!(
+            l.available(&alice, "credits"),
+            700,
+            "the hold must be gone, not still counted against a balance it already left",
+        );
+        assert_eq!(l.release(hold), Err(LedgerError::UnknownReservation));
+    }
+
+    /// A refused transfer must leave the hold standing, or one failed
+    /// attempt would silently drop the protection it was taken for.
+    #[test]
+    fn a_refused_transfer_keeps_its_reservation() {
+        let (mut l, alice) = funded("alice", 1000);
+        let hold = l.reserve(&alice, "credits", 300, NEVER).unwrap();
+
+        // Self-transfer is refused after the hold is validated.
+        let mut r = req(alice.clone(), alice.clone(), 300, "bad");
+        r.spends = Some(hold);
+        assert!(l.transfer(r).is_err());
+
+        assert_eq!(l.available(&alice, "credits"), 700, "the hold must survive a refusal");
+        l.release(hold).expect("and still be releasable");
+    }
+
+    /// Spending a hold belonging to someone else, or on another asset, is
+    /// refused rather than quietly ignored.
+    #[test]
+    fn a_mismatched_reservation_is_refused() {
+        let (mut l, alice) = funded("alice", 1000);
+        let bob = Account::player("bob");
+        l.transfer(req(Account::Mint, bob.clone(), 500, "seed-bob")).unwrap();
+
+        let bobs_hold = l.reserve(&bob, "credits", 200, NEVER).unwrap();
+        let mut r = req(alice.clone(), bob.clone(), 100, "steal");
+        r.spends = Some(bobs_hold);
+
+        assert!(matches!(
+            l.transfer(r),
+            Err(LedgerError::ReservationMismatch { .. }),
+        ));
+        assert_eq!(l.available(&bob, "credits"), 300, "bob's hold is untouched");
+    }
+
+    #[test]
+    fn a_reservation_smaller_than_the_spend_is_refused() {
+        let (mut l, alice) = funded("alice", 1000);
+        let hold = l.reserve(&alice, "credits", 100, NEVER).unwrap();
+        let mut r = req(alice.clone(), Account::player("bob"), 500, "too-big");
+        r.spends = Some(hold);
+
+        assert!(matches!(
+            l.transfer(r),
+            Err(LedgerError::ReservationTooSmall { held: 100, needed: 500, .. }),
+        ));
+    }
+
+    #[test]
+    fn an_unknown_reservation_id_is_refused() {
+        let (mut l, alice) = funded("alice", 1000);
+        let mut r = req(alice, Account::player("bob"), 10, "ghost");
+        r.spends = Some(ReservationId(9999));
+        assert_eq!(l.transfer(r), Err(LedgerError::UnknownReservation));
+    }
+
+    /// The deadline has to bite on *read*, not on a sweep — otherwise a
+    /// server that forgets to call `expire_reservations` still locks
+    /// funds, which is the very failure the deadline exists to prevent.
+    #[test]
+    fn an_expired_hold_stops_counting_without_a_sweep() {
+        let (mut l, alice) = funded("alice", 1000);
+        l.reserve(&alice, "credits", 400, 10).unwrap();
+
+        assert_eq!(l.available_at(&alice, "credits", 10), 600, "still held at its deadline");
+        assert_eq!(
+            l.available_at(&alice, "credits", 11),
+            1000,
+            "lapsed the tick after, with no sweep having run",
+        );
+    }
+
+    #[test]
+    fn expire_reservations_reclaims_lapsed_holds() {
+        let (mut l, alice) = funded("alice", 1000);
+        l.reserve(&alice, "credits", 100, 5).unwrap();
+        l.reserve(&alice, "credits", 100, 50).unwrap();
+
+        assert_eq!(l.expire_reservations(6), 1, "only the lapsed one goes");
+        assert_eq!(l.expire_reservations(6), 0, "and it is gone for good");
+        assert_eq!(l.available_at(&alice, "credits", 6), 900, "the live hold still counts");
+    }
+
+    /// An expired hold cannot be spent: the funds are no longer set aside,
+    /// so honouring it would let a stale request jump the queue.
+    #[test]
+    fn an_expired_reservation_cannot_be_spent() {
+        let (mut l, alice) = funded("alice", 1000);
+        let hold = l.reserve(&alice, "credits", 300, 5).unwrap();
+
+        let mut r = req(alice.clone(), Account::player("bob"), 300, "late");
+        r.spends = Some(hold);
+        r.tick = 6;
+
+        assert_eq!(l.transfer(r), Err(LedgerError::UnknownReservation));
+    }
+
+    /// A hold guarantees the spend it was taken for. Other traffic must
+    /// not be able to consume the funds underneath it.
+    #[test]
+    fn a_hold_guarantees_its_own_spend() {
+        let (mut l, alice) = funded("alice", 1000);
+        let bob = Account::player("bob");
+        let hold = l.reserve(&alice, "credits", 900, NEVER).unwrap();
+
+        // Everything else sees only the unreserved remainder.
+        assert!(l.transfer(req(alice.clone(), bob.clone(), 200, "other")).is_err());
+
+        // But the reserved spend itself goes through.
+        let mut r = req(alice.clone(), bob.clone(), 900, "reserved");
+        r.spends = Some(hold);
+        l.transfer(r).expect("a hold must guarantee the spend it was taken for");
+        assert_eq!(l.balance(&alice, "credits"), 100);
     }
 
     #[test]
@@ -931,6 +1222,7 @@ mod tests {
             reason: "gm_grant".to_string(),
             actor: "gm:kate".to_string(),
             tick: 77,
+            spends: None,
         })
         .unwrap();
 
@@ -959,6 +1251,7 @@ mod tests {
             reason: "quest_reward".to_string(),
             actor: "system".to_string(),
             tick: 1,
+            spends: None,
         };
         l.transfer(mint).unwrap();
 

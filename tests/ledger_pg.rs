@@ -65,6 +65,7 @@ fn transfer(from: Account, to: Account, amount: i64, key: &str, tick: u64) -> Tr
         reason: "test".to_string(),
         actor: "system".to_string(),
         tick,
+        spends: None,
     }
 }
 
@@ -232,6 +233,7 @@ fn the_audit_trail_survives_a_round_trip() {
                 reason: "gm_grant".to_string(),
                 actor: "gm:kate".to_string(),
                 tick: 42,
+                spends: None,
             })
             .unwrap();
         ledger.flush(Duration::from_secs(10)).unwrap();
