@@ -1,0 +1,112 @@
+# Promtail scrape config for a void_engine server.
+#
+# Assumes `LogConfig::format = LogFormat::Logfmt`, which writes one
+# key=value line per event:
+#
+#   ts=2026-09-10T19:31:24.512Z level=error target=void_engine::persist::ledger_pg msg="..."
+#
+# The engine deliberately does not push to Loki itself. It has a
+# boot-time pusher for pre-connect panics, but that path drops messages
+# when its channel fills — correct for catching a crash before the log
+# file exists, wrong as a transport. Tailing files is promtail's job and
+# it does it better: no backpressure into the game loop, no lost events
+# when Loki is briefly unreachable, and the file survives a crash that
+# takes the process with it.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /var/lib/promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: void_engine
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: void_engine
+          # Set these per deployment so a query can narrow to one shard.
+          service: void-server
+          shard: "1"
+          # The glob covers the rotated set: the engine rotates
+          # `server.log` -> `server.log.1` .. `server.log.5`, so a bare
+          # `server.log` would miss everything already rotated when
+          # promtail restarts.
+          __path__: /var/log/void/server.log*
+
+    pipeline_stages:
+      # Parse the logfmt line into extracted fields.
+      - logfmt:
+          mapping:
+            ts:
+            level:
+            target:
+            msg:
+            event:
+
+      # Use the engine's own timestamp, not ingestion time. Without this
+      # a backlog replayed after an outage all lands at the same instant
+      # and the ordering is lost.
+      - timestamp:
+          source: ts
+          format: RFC3339Nano
+
+      # Labels must stay low-cardinality: `level` and `event` are bounded
+      # sets, `target` is bounded by the module list. `msg` is NOT a
+      # label — it is unbounded and would explode the index.
+      - labels:
+          level:
+          target:
+          event:
+
+      # Keep the human-readable body as the log line.
+      - output:
+          source: msg
+
+# ── Alerting ────────────────────────────────────────────────────────────
+#
+# The events worth paging on carry an `event=` key, so a rule matches a
+# label rather than regexing free text:
+#
+#   ledger_reconciliation_failed  the books disagree with the durable log.
+#                                 This is the dupe signal. Page immediately.
+#   ledger_writer_failed          terminal; writes are refused until the
+#                                 process is restarted. Page.
+#   ledger_writer_degraded        transient, self-healing. Alert only if it
+#                                 persists — a failover trips this briefly
+#                                 and recovers on its own.
+#
+# A Loki ruler example:
+#
+#   groups:
+#     - name: void_engine_ledger
+#       rules:
+#         - alert: LedgerReconciliationFailed
+#           expr: |
+#             sum by (service, shard) (
+#               count_over_time(
+#                 {job="void_engine", event="ledger_reconciliation_failed"}[5m]
+#               )
+#             ) > 0
+#           for: 0m
+#           labels:
+#             severity: critical
+#           annotations:
+#             summary: "Ledger books disagree with the durable log on {{ $labels.service }}"
+#
+#         - alert: LedgerWriterDegraded
+#           expr: |
+#             sum by (service, shard) (
+#               count_over_time(
+#                 {job="void_engine", event="ledger_writer_degraded"}[10m]
+#               )
+#             ) > 0
+#           # A failover trips this and clears itself, so only page if it
+#           # is still happening ten minutes later.
+#           for: 10m
+#           labels:
+#             severity: warning

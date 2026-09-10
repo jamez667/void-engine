@@ -101,6 +101,62 @@ pub struct LogConfig {
     pub boot_loki_url: Option<String>,
     /// Loki `service` label for events shipped through the boot pusher.
     pub boot_service: &'static str,
+    /// On-disk line format. Defaults to [`LogFormat::Human`], so nothing
+    /// that already reads these files changes.
+    ///
+    /// A server behind promtail wants [`LogFormat::Logfmt`]: it carries
+    /// the record's target and an RFC3339 timestamp, neither of which
+    /// survives the human format, and promtail parses it natively.
+    pub format: LogFormat,
+}
+
+/// How each record is written to the log file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    /// `[2026-09-10 19:31:24] [ERROR] the message`
+    ///
+    /// Readable over someone's shoulder, lossy for a log pipeline: no
+    /// target, no timezone, no sub-second precision, so events inside one
+    /// second sort arbitrarily.
+    #[default]
+    Human,
+    /// `ts=2026-09-10T19:31:24.512Z level=error target=… msg="…"`
+    ///
+    /// Logfmt rather than JSON on purpose: promtail parses both, but this
+    /// needs no serialisation dependency and stays greppable when you
+    /// tail the file by hand.
+    Logfmt,
+}
+
+/// Quote a logfmt value if it needs it.
+///
+/// Bare values are fine until they contain a space, a quote or a newline
+/// — a message body contains all three sooner or later, and an unquoted
+/// one silently truncates at the first space when parsed.
+fn logfmt_value(v: &str) -> String {
+    if v.is_empty() {
+        return "\"\"".to_string();
+    }
+    let needs_quoting = v
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '=' || c == '\\');
+    if !needs_quoting {
+        return v.to_string();
+    }
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 pub struct RotatingLogger {
@@ -152,10 +208,30 @@ impl log::Log for RotatingLogger {
         let body  = format!("{}", record.args());
         if self.cfg.noise.iter().any(|n| body.contains(n)) { return; }
 
-        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+        let line = match self.cfg.format {
+            LogFormat::Human => {
+                let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+                format!("[{}] [{}] {}", ts, level, body)
+            }
+            LogFormat::Logfmt => {
+                // RFC3339 with milliseconds: promtail orders by this, and
+                // whole-second precision loses the ordering of everything
+                // that happens inside one tick.
+                let ts = chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                    .to_string();
+                format!(
+                    "ts={} level={} target={} msg={}",
+                    ts,
+                    level.as_str().to_ascii_lowercase(),
+                    logfmt_value(record.target()),
+                    logfmt_value(&body),
+                )
+            }
+        };
         if let Ok(mut guard) = self.file.lock() {
             if let Some(file) = guard.as_mut() {
-                let _ = writeln!(file, "[{}] [{}] {}", timestamp, level, body);
+                let _ = writeln!(file, "{}", line);
             }
         }
 
@@ -349,6 +425,7 @@ mod filter_tests {
             quiet_targets: quiet.to_vec(),
             boot_loki_url: None,
             boot_service:  "test",
+            format:        LogFormat::Human,
         })
     }
 
@@ -360,6 +437,66 @@ mod filter_tests {
     /// per frame. One session produced 43,942 of 45,144 lines from it,
     /// each formatted, written to disk and queued for the relay on the
     /// render thread.
+    // -- logfmt escaping ------------------------------------------
+    //
+    // A mis-escaped value does not fail loudly: promtail parses the line
+    // and silently gets the wrong fields, so a message truncating at its
+    // first space looks like a short message rather than a bug.
+
+    #[test]
+    fn a_bare_word_needs_no_quoting() {
+        assert_eq!(logfmt_value("ledger"), "ledger");
+        assert_eq!(logfmt_value("void_engine::persist"), "void_engine::persist");
+    }
+
+    #[test]
+    fn anything_with_a_space_is_quoted() {
+        assert_eq!(logfmt_value("two words"), "\"two words\"");
+    }
+
+    #[test]
+    fn embedded_quotes_are_escaped_not_dropped() {
+        // Unescaped, this would close the value early and the rest of the
+        // message would parse as stray keys.
+        assert_eq!(logfmt_value("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn a_backslash_is_escaped() {
+        assert_eq!(logfmt_value("C:\\path"), "\"C:\\\\path\"");
+    }
+
+    #[test]
+    fn newlines_become_escapes_so_one_event_stays_one_line() {
+        // A panic message spans lines. Written raw it would split into
+        // several log records, and the tail of the panic would parse as
+        // an event with no timestamp.
+        assert_eq!(logfmt_value("a\nb"), "\"a\\nb\"");
+        assert_eq!(logfmt_value("a\r\nb"), "\"a\\r\\nb\"");
+        assert_eq!(logfmt_value("a\tb"), "\"a\\tb\"");
+    }
+
+    #[test]
+    fn an_equals_sign_is_quoted() {
+        // Otherwise `msg=k=v` parses as two keys.
+        assert_eq!(logfmt_value("k=v"), "\"k=v\"");
+    }
+
+    #[test]
+    fn an_empty_value_is_an_explicit_empty_string() {
+        // A bare `msg=` with nothing after it is ambiguous.
+        assert_eq!(logfmt_value(""), "\"\"");
+    }
+
+    /// The alert rules match on `event=`, so it has to survive into the
+    /// line rather than being mangled by the quoting.
+    #[test]
+    fn an_event_key_survives_into_the_value() {
+        let v = logfmt_value("event=ledger_reconciliation_failed books disagree");
+        assert!(v.starts_with('"'), "a value with spaces must be quoted: {v}");
+        assert!(v.contains("event=ledger_reconciliation_failed"), "{v}");
+    }
+
     #[test]
     fn quiet_targets_drop_their_info_chatter() {
         let l = logger(&["wgpu_core"]);

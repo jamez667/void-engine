@@ -457,7 +457,9 @@ async fn writer_loop(mut client: tokio_postgres::Client, shared: Arc<Shared>, cf
                             // Not retryable: the books disagree with the
                             // log, so refusing writes permanently is the
                             // only safe answer.
-                            let msg = format!("reconciliation failed after recovery: {why}");
+                            let msg = format!(
+                                "event=ledger_reconciliation_failed books disagree with the log after recovery: {why}"
+                            );
                             log::error!("[ledger] {msg}");
                             *shared.writer_failed.lock().unwrap() = Some(msg);
                             return;
@@ -482,7 +484,7 @@ async fn writer_loop(mut client: tokio_postgres::Client, shared: Arc<Shared>, cf
                 }
 
                 if !is_transient(&e) {
-                    let msg = format!("ledger writer failed (fatal): {e}");
+                    let msg = format!("event=ledger_writer_failed fatal: {e}");
                     log::error!("[ledger] {msg}");
                     *shared.writer_failed.lock().unwrap() = Some(msg);
                     return;
@@ -491,7 +493,7 @@ async fn writer_loop(mut client: tokio_postgres::Client, shared: Arc<Shared>, cf
                 consecutive_failures += 1;
                 if consecutive_failures > cfg.max_retries {
                     let msg = format!(
-                        "ledger writer failed after {} consecutive attempts: {e}",
+                        "event=ledger_writer_failed exhausted {} attempts: {e}",
                         cfg.max_retries
                     );
                     log::error!("[ledger] {msg}");
@@ -499,7 +501,9 @@ async fn writer_loop(mut client: tokio_postgres::Client, shared: Arc<Shared>, cf
                     return;
                 }
 
-                let msg = format!("transient fault (attempt {consecutive_failures}): {e}");
+                let msg = format!(
+                    "event=ledger_writer_degraded transient fault, attempt {consecutive_failures}: {e}"
+                );
                 log::warn!("[ledger] {msg}; retrying");
                 *shared.degraded.lock().unwrap() = Some(msg);
 
