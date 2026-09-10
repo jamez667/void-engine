@@ -112,13 +112,67 @@ unblocks the most downstream work.
       `HeadlessConfig::uncapped` runs an exact tick count with a synthetic
       clock so replays and CI are reproducible.
 
-- [ ] **R2 — Make entities serializable, then persistent.** Component registry
-      with stable ids, versioned schema, world snapshot/restore, then a store.
-      Today exactly one `Serialize` derive exists in 13.5k lines, for
-      keybinds; no component derives it.
+- [ ] **R2 - Make entities serializable, then persistent.** Designed
+      2026-09-10, not yet built. Full design published as an artifact; the
+      decisions it fixes are recorded here so they outlive the link.
 
-      *Open decision: is the authority a database of record, or a
-      periodically-checkpointed sim? This changes the whole design.*
+      **Decision: Postgres is the source of truth; checkpoints are a
+      disposable cache.** Every durable fact lives in the DB. Checkpoints are
+      a periodic binary dump of the live `World` that makes restart fast.
+      Deleting every checkpoint costs startup time and nothing else. That
+      invariant is what stops the two mechanisms becoming two half-truths.
+
+      **Decision: three persistence classes**, declared per component.
+      Durable (DB + checkpoint) - inventory, currency, health. Volatile
+      (checkpoint only) - position, velocity, AI state. Transient (neither) -
+      particles, client markers. Keeps DB write volume proportional to
+      player-meaningful change rather than to world size.
+
+      **Four constraints verified against the tree, not assumed:**
+      - `TypeId` cannot key a save file - opaque 128-bit hash, no cross-build
+        stability guarantee. Every component needs a hand-assigned stable id.
+        Engine reserves ids below 1000.
+      - RNG position is not capturable: `Pcg32 { state, inc }` are private
+        and `Lcg` is a bare tuple struct. A seed-only checkpoint replays the
+        stream from the beginning and diverges. Needs accessors.
+      - `World` has no restore path - all four fields private, and `spawn()`
+        assigns the next id rather than a requested one, so restoring through
+        the public API would renumber every entity. `EntityId`'s fields are
+        public, so exact reconstruction is possible with a deliberate ctor.
+      - The engine creates no async runtime (zero `Runtime::new`/`block_on`),
+        and `fixed_update` is sync. Making it async would infect every game's
+        sim code and defeat R1's headless split.
+
+      **Decision: the tick never awaits.** `fixed_update` appends durable
+      changes to an in-memory journal; a writer thread owns the tokio runtime
+      and the Postgres pool and commits them. A checkpoint may only claim
+      tick N once every durable change up to N has committed, so DB and
+      checkpoint can be stale relative to each other but never disagree.
+      Journal needs backpressure - unbounded is a memory leak with extra
+      steps.
+
+      **Decision: binary serde format** (postcard or bincode) shared with
+      R3. `net/chunk.rs` is explicitly format-agnostic, so choosing here
+      settles it for both rather than growing two encodings.
+
+      **Decision: JSONB component payloads** in Postgres, not a table per
+      component - the component set is defined by the game, so a fixed
+      relational schema would force an engine migration per game component.
+      `shard_id` in the schema from day one so sharding is not a migration
+      later, though cross-shard movement is explicitly out of scope.
+
+      **Build order:** (1) registry + snapshot/restore, no DB; (2) on-disk
+      checkpoints, atomic write, restore-on-boot; (3) storage trait + journal
+      + writer thread against an in-memory store; (4) Postgres behind the
+      trait, feature-gated; (5) crash matrix at every kill boundary.
+
+      *Open risk to review before phase 1 ships: component ids are frozen by
+      the first save file ever written.*
+
+      *Sizing: `Transform2D + Velocity + Collider` is 60 B/entity, so 100k
+      entities is ~5.7 MB and 1M is ~57 MB of raw component data - fine for a
+      local checkpoint every few seconds, not fine through Postgres at tick
+      rate.*
 
 - [ ] **R3 — Replication with interest management.** Per-client AoI query →
       relevancy set → baseline+delta snapshot → quantized, bit-packed encode →
