@@ -112,67 +112,107 @@ unblocks the most downstream work.
       `HeadlessConfig::uncapped` runs an exact tick count with a synthetic
       clock so replays and CI are reproducible.
 
-- [ ] **R2 - Make entities serializable, then persistent.** Designed
-      2026-09-10, not yet built. Full design published as an artifact; the
-      decisions it fixes are recorded here so they outlive the link.
+- [ ] **R2 - Persistence and ledger.** Designed 2026-09-10 (rev 2), not
+      built. Full design published as an artifact; decisions recorded here so
+      they outlive the link.
 
-      **Decision: Postgres is the source of truth; checkpoints are a
-      disposable cache.** Every durable fact lives in the DB. Checkpoints are
-      a periodic binary dump of the live `World` that makes restart fast.
-      Deleting every checkpoint costs startup time and nothing else. That
-      invariant is what stops the two mechanisms becoming two half-truths.
+      **Rev 2 supersedes rev 1.** Rev 1 stored balances as mutable values
+      written transactionally and logged changes beside them. That cannot
+      detect duping: recording *that* a value changed says nothing about why
+      or from what. Anything of value is now derived from an append-only
+      ledger - a balance is SUM(entries), never a float anything can write.
 
-      **Decision: three persistence classes**, declared per component.
-      Durable (DB + checkpoint) - inventory, currency, health. Volatile
-      (checkpoint only) - position, velocity, AI state. Transient (neither) -
-      particles, client markers. Keeps DB write volume proportional to
-      player-meaningful change rather than to world size.
+      **Evidence this is the right correction, from void-claim (shipped):**
+      - Its `credit_ledger` write is fire-and-forget - `log::warn!` on
+        failure, bounded `mpsc::channel(10_000)`. A minute of Scylla downtime
+        means those credit movements never existed.
+      - `Wallet { credits: f64 }` is mutated directly at ~8 sites, several
+        emitting no event at all: deaths.rs:153 (respawn fee), deaths.rs:388
+        (NPC reward), missions.rs:61 (payout), on_foot_actions.rs:43,
+        ingress.rs:111.
+      - The code documents its own gap: "On-foot purchases skip the
+        CreditEvent pipeline", plus three `let mut throwaway:
+        Vec<CreditEvent>` sites that exist to discard events.
+      - `PlayerRecord` carries a comment that SurrealDB rejected
+        `#[serde(flatten)]` "which silently broke every save" - inventory not
+        persisting, no error. Exactly the failure class to design out.
+      - Worth keeping from it: the `reason` taxonomy (buy_kind, sell_kind,
+        debt_garnish, station_repair, weapon_upgrade_cannon ...), per-player
+        time-bucketed partitioning, and a worker thread for genuinely
+        non-critical streams. Positions and chat *should* be fire-and-forget.
 
-      **Four constraints verified against the tree, not assumed:**
-      - `TypeId` cannot key a save file - opaque 128-bit hash, no cross-build
-        stability guarantee. Every component needs a hand-assigned stable id.
-        Engine reserves ids below 1000.
-      - RNG position is not capturable: `Pcg32 { state, inc }` are private
-        and `Lcg` is a bare tuple struct. A seed-only checkpoint replays the
-        stream from the beginning and diverges. Needs accessors.
-      - `World` has no restore path - all four fields private, and `spawn()`
-        assigns the next id rather than a requested one, so restoring through
-        the public API would renumber every entity. `EntityId`'s fields are
-        public, so exact reconstruction is possible with a deliberate ctor.
-      - The engine creates no async runtime (zero `Runtime::new`/`block_on`),
-        and `fixed_update` is sync. Making it async would infect every game's
-        sim code and defeat R1's headless split.
+      **Decision: three tiers, by Cargo feature** (structural, not runtime,
+      following the existing audio/client/net pattern). Default = no
+      persistence, as today. `persist` = registry + snapshot/restore +
+      on-disk checkpoints, no DB. `ledger` = the above plus append-only value
+      tracking, double-entry, idempotency, reconciliation, Postgres; implies
+      `persist`. Most games never need tier 3.
 
-      **Decision: the tick never awaits.** `fixed_update` appends durable
-      changes to an in-memory journal; a writer thread owns the tokio runtime
-      and the Postgres pool and commits them. A checkpoint may only claim
-      tick N once every durable change up to N has committed, so DB and
-      checkpoint can be stale relative to each other but never disagree.
-      Journal needs backpressure - unbounded is a memory leak with extra
-      steps.
+      **Decision: classification is Ledgered / Volatile / Transient.** Rev
+      1's "Durable" class - a mutable value written transactionally - is
+      deleted; it was the duping surface. Ledgered = currency, items,
+      structures, claims. Volatile = position, velocity, health (checkpoint
+      only). Transient = particles, client markers (never serialised).
 
-      **Decision: binary serde format** (postcard or bincode) shared with
-      R3. `net/chunk.rs` is explicitly format-agnostic, so choosing here
-      settles it for both rather than growing two encodings.
+      **Decision: every entry has a counterparty.** Value moves, never
+      appears - from a player, a shop, a loot table, or an explicit
+      mint/burn account. A transfer is two rows in one transaction summing to
+      zero. Duping becomes *detectable*: if the ledger does not sum to zero
+      per asset, something created value outside the API.
 
-      **Decision: JSONB component payloads** in Postgres, not a table per
-      component - the component set is defined by the game, so a fixed
-      relational schema would force an engine migration per game component.
-      `shard_id` in the schema from day one so sharding is not a migration
-      later, though cross-shard movement is explicitly out of scope.
+      **Decision: idempotency key is UNIQUE in the DB**, derived from
+      (session, client_seq, action). A retried packet - the classic dupe
+      vector - inserts nothing the second time, enforced by the database
+      rather than by game logic.
+
+      **Decision: fixed-point, not f64.** void-claim uses `credits: f64`;
+      float rounding makes exact reconciliation impossible. Currency is an
+      integer of minor units.
+
+      **Decision: the API is unbypassable.** No `pub credits` field exists.
+      `ledger.transfer(..) -> Result<Receipt, LedgerError>` is the only way
+      to move value; `Wallet` keeps a private cached balance with no setter,
+      updated only by applying a committed receipt. Contrast void-claim's
+      `try_spend -> bool`, which reads then mutates in two steps - a
+      time-of-check/time-of-use shape.
+
+      **Decision: the tick never awaits, and pending debits are reserved.**
+      `fixed_update` is sync and stays so. A transfer returns a pending
+      receipt; the reservation prevents spending the same credits twice
+      while a commit is in flight. A checkpoint may never claim a tick ahead
+      of the ledger's committed watermark - restoring a checkpoint showing a
+      purchase the ledger never recorded *is* a dupe.
+
+      **Decision: entity-level JSONB, not per-component rows.** Rev 1 had one
+      row per (entity, component), so a player with 40 inventory slots was 40
+      rows on login. One row per entity matches how it is read.
+      `ledger_entries` is append-only, enforced by grants, not convention -
+      corrections are compensating entries.
+
+      **Reconciliation is the part that catches cheating:** zero-sum per
+      asset; cached balance vs SUM(entries) per account; rate/shape anomalies
+      by reason; item conservation (a unique item has exactly one holder).
+      An audit trail nobody checks is a log file.
+
+      **Four constraints still hold from rev 1, verified against the tree:**
+      `TypeId` cannot key a save file (opaque, no cross-build guarantee - ids
+      hand-assigned, engine reserves <1000); RNG position is not capturable
+      (`Pcg32 { state, inc }` private, `Lcg` a bare tuple struct - seed-only
+      checkpoints replay from the start and diverge); `World` has no restore
+      path (all fields private, `spawn()` cannot be told which id to assign);
+      the engine creates no async runtime and `fixed_update` is sync.
 
       **Build order:** (1) registry + snapshot/restore, no DB; (2) on-disk
-      checkpoints, atomic write, restore-on-boot; (3) storage trait + journal
-      + writer thread against an in-memory store; (4) Postgres behind the
-      trait, feature-gated; (5) crash matrix at every kill boundary.
+      checkpoints - `persist` tier ships, useful alone; (3) ledger core
+      in-memory, semantics proven without IO; (4) Postgres behind the ledger
+      trait, feature-gated; (5) reconciliation + crash matrix, exit criterion
+      being that an injected synthetic dupe is caught by reconciliation
+      rather than by a player noticing.
 
-      *Open risk to review before phase 1 ships: component ids are frozen by
-      the first save file ever written.*
-
-      *Sizing: `Transform2D + Velocity + Collider` is 60 B/entity, so 100k
-      entities is ~5.7 MB and 1M is ~57 MB of raw component data - fine for a
-      local checkpoint every few seconds, not fine through Postgres at tick
-      rate.*
+      *Open risks: component ids are frozen by the first save file ever
+      written; ledger volume needs partitioning and an archive-not-delete
+      retention policy; a reconciliation mismatch must page a human, not
+      append to a log nobody reads.*
 
 - [ ] **R3 — Replication with interest management.** Per-client AoI query →
       relevancy set → baseline+delta snapshot → quantized, bit-packed encode →
