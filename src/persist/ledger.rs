@@ -481,6 +481,69 @@ impl Ledger {
     }
 }
 
+impl crate::persist::store::LedgerStore for Ledger {
+    fn transfer(
+        &mut self,
+        req: TransferRequest,
+    ) -> Result<crate::persist::store::StoredReceipt, LedgerError> {
+        let receipt = Ledger::transfer(self, req)?;
+        Ok(crate::persist::store::StoredReceipt {
+            receipt,
+            // Nothing durable is behind this backend, and saying otherwise
+            // would let a caller believe a value movement had survived a
+            // crash when it had not.
+            durability: crate::persist::store::Durability::Memory,
+        })
+    }
+
+    fn balance(&self, account: &Account, asset: &str) -> Amount {
+        Ledger::balance(self, account, asset)
+    }
+
+    fn available(&self, account: &Account, asset: &str) -> Amount {
+        Ledger::available(self, account, asset)
+    }
+
+    fn reserve(
+        &mut self,
+        account: &Account,
+        asset: &str,
+        amount: Amount,
+    ) -> Result<ReservationId, LedgerError> {
+        Ledger::reserve(self, account, asset, amount)
+    }
+
+    fn release(&mut self, id: ReservationId) -> Result<(), LedgerError> {
+        Ledger::release(self, id)
+    }
+
+    fn history(&self, account: &Account) -> Vec<Entry> {
+        Ledger::history(self, account).cloned().collect()
+    }
+
+    fn audit_zero_sum(&self) -> Vec<Discrepancy> {
+        Ledger::audit_zero_sum(self)
+    }
+
+    fn total_minted(&self, asset: &str) -> i128 {
+        Ledger::total_minted(self, asset)
+    }
+
+    fn acked_tick(&self) -> u64 {
+        // No durable store, so nothing can outlive this process and there
+        // is nothing to be behind: the highest tick seen is acked by
+        // definition.
+        self.entries.iter().map(|e| e.tick).max().unwrap_or(0)
+    }
+
+    fn receipt_for(&self, key: &IdemKey) -> Option<crate::persist::store::StoredReceipt> {
+        self.seen.get(key).map(|r| crate::persist::store::StoredReceipt {
+            receipt: r.clone(),
+            durability: crate::persist::store::Durability::Memory,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

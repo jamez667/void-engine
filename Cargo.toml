@@ -64,6 +64,19 @@ rcgen  = { version = "0.13", optional = true }
 # same on every OS the engine targets.
 webpki-roots = { version = "0.26", optional = true }
 
+# ── Postgres-backed ledger (feature `ledger-pg`) ────────────────────────────
+# Optional for the same reason the rest is: a single-player game, and even
+# an in-memory tier-3 build, must not link a database driver.
+#
+# tokio here needs a real runtime, unlike the `net` pin which takes
+# `io-util` only. Cargo unifies the union of both feature sets, so the two
+# coexist; the runtime is owned by the ledger writer thread, never by the
+# simulation, because `fixed_update` is sync and must stay that way.
+tokio-postgres = { version = "0.7", optional = true }
+# Migrations as numbered SQL embedded in the binary — a server must be able
+# to migrate itself on boot without shipping a CLI alongside it.
+refinery = { version = "0.9", default-features = false, features = ["tokio-postgres"], optional = true }
+
 [features]
 # Audio is client-only. Headless consumers (servers, simulation) link this
 # crate purely for its ECS + math, so they take it with
@@ -95,6 +108,20 @@ persist = ["dep:bincode", "glam/serde"]
 # Implies `persist`: a ledger without checkpoints would replay its
 # whole history on every boot.
 ledger = ["persist"]
+
+# Tier 3 with durability: the same ledger semantics, written through to
+# Postgres by a background writer thread. Implies `ledger`, since the
+# in-memory core is what the store is a backend for.
+ledger-pg = [
+    "ledger",
+    "dep:tokio-postgres",
+    "dep:refinery",
+    "dep:tokio",
+    "tokio/rt-multi-thread",
+    "tokio/net",
+    "tokio/time",
+    "tokio/sync",
+]
 
 # Networking is opt-in for the same reason audio is: a game that has no
 # netcode should not carry the code, the threads, or the attack surface of a

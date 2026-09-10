@@ -30,6 +30,9 @@ pub mod checkpoint;
 pub mod ledger;
 pub mod registry;
 pub mod snapshot;
+/// The contract every ledger backend satisfies — in-memory and Postgres.
+#[cfg(feature = "ledger")]
+pub mod store;
 
 pub use checkpoint::{
     clear, load, save, CheckpointConfig, CheckpointError, DEFAULT_KEEP,
