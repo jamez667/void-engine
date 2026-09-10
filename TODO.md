@@ -3,9 +3,10 @@
 Sorted by severity. Derived from the full-repo audit of `a1dbc30`; every
 number below was measured in release on a dev box, not estimated.
 
-**Status (2026-09-09):** every S1-S3 item is done. Tests 146 -> 167, clippy
-clean on all three feature axes, CI and hot-path budget guards in place. The
-R-items below are untouched and remain multi-week projects.
+**Status (2026-09-10):** every S1-S3 item is done, plus the ECS query-cost
+fix and **R1 (headless split)**. Tests 146 -> 187 across three feature axes,
+clippy clean on all of them, CI and hot-path budget guards in place.
+R2-R5 remain multi-week projects.
 
 Severity key:
 - **S1** — correctness bug or missing safety net. Silent failure or no
@@ -67,20 +68,49 @@ Severity key:
 Each of these is a project with design decisions attached. Ordered by what
 unblocks the most downstream work.
 
-- [ ] **R1 — Split the client out of the loop.** Feature-gate `winit`/`wgpu`
-      behind a `client` feature; add a `SimCtx` without a renderer and a
-      `run_headless` driver over the existing `Timestep`.
+- [x] **R1 — Split the client out of the loop.** Done 2026-09-10.
 
-      *Blocked on nothing; breaks the `App`/`EngineCtx`/`run` API.*
+      `client` feature (default on) gates `wgpu` and every module that needs
+      it: `renderer`, `ui`, `fx`, `text`, plus `ClientApp`/`EngineCtx`/`run`.
+      A headless build links **no wgpu at all** — verified with
+      `cargo tree -e normal --no-default-features`, which now reports zero
+      wgpu/naga edges. The README's headless claim is finally true.
 
-      **Decision made (2026-09-09): tick rate becomes a parameter,
-      server default 30Hz.** This resolves the contradiction already in the
-      tree — `time.rs` hardcodes `FIXED_DT = 1.0/60.0` while
-      `net/interp.rs` defaults `tick_hz: 30.0`. Client render stays free.
+      `winit` stays unconditional by choice: `input`/`keybinds` use
+      `KeyCode`/`MouseButton` as plain data (a field-less enum used as a
+      bitset index), and a replay harness or keybind loader on a server still
+      needs to name keys. It is pure Rust and opens no OS windowing libraries
+      unless a window is created.
 
-      Note: `cargo tree --no-default-features` currently still pulls
-      `wgpu v22.1.0` and `winit v0.30.13` — the README's headless claim is
-      not accurate until this lands.
+      **Trait split.** `App` = `init`/`fixed_update`/`can_advance` over
+      `SimCtx` (world + input + dt, no renderer) and exists in every build.
+      `ClientApp: App` adds `render`/`on_resize`/`window_title`. One game type
+      implements both; a server implements only `App`. Simulation is written
+      once and runs in both.
+
+      **Tick rate is now per-`Timestep`**, server default 30Hz
+      (`SERVER_HZ`), resolving the contradiction where `FIXED_DT` hardcoded
+      60 while `net/interp.rs` assumed 30. Read `dt` from `SimCtx`, not the
+      constant. `FIXED_DT` remains as the 60Hz client value.
+
+      **Migration** (clean break, as agreed):
+      - `fn fixed_update(&mut self, ctx: &mut EngineCtx)` →
+        `ctx: &mut SimCtx`; same for `init`.
+      - Move `render`/`on_resize`/`window_title` into
+        `impl ClientApp for Game`.
+      - Replace `FIXED_DT` in game logic with `ctx.dt`.
+      - Servers: `default-features = false`, drive with
+        `run_headless(app, || keep_going)`.
+
+      `EngineCtx` still exists for clients (now `SimCtx` + renderer, with
+      `Deref`, so `ctx.world`/`ctx.dt` keep working), but `fixed_update` no
+      longer receives one — reach the renderer from `render`.
+
+      Six integration tests in `tests/headless_server.rs` prove a server
+      ticks with no window, `init` populates the world, `can_advance` defers,
+      `should_run` stops the loop, and `dt` tracks the configured rate.
+      `HeadlessConfig::uncapped` runs an exact tick count with a synthetic
+      clock so replays and CI are reproducible.
 
 - [ ] **R2 — Make entities serializable, then persistent.** Component registry
       with stable ids, versioned schema, world snapshot/restore, then a store.

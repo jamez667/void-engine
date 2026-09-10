@@ -303,7 +303,7 @@ impl Renderer {
             shake_offset: Vec2::ZERO,
             screenshot_pending: false,
             screenshot_data:    None,
-            last_perf: crate::app::PerfSnapshot::default(),
+            last_perf: crate::perf::PerfSnapshot::default(),
             window,
             postprocess,
             offscreen_batch: Batch::new(),

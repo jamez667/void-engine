@@ -56,6 +56,19 @@ jobs:
       - name: Test (headless)
         run: cargo test --all-targets --no-default-features
 
+      # R1's central claim, asserted rather than assumed: a headless build
+      # links no GPU stack. `-e normal` excludes dev-dependencies, so the
+      # `naga` used by the shader test does not count — a downstream server
+      # never builds those.
+      - name: Headless build links no wgpu
+        run: |
+          if cargo tree -e normal --no-default-features | grep -qiE '(^|[^-])wgpu'; then
+            echo "wgpu present in a headless build; the client feature is leaking"
+            cargo tree -e normal --no-default-features | grep -iE 'wgpu|naga'
+            exit 1
+          fi
+          echo "confirmed: no wgpu in the headless dependency graph"
+
   perf:
     name: hot-path budgets
     runs-on: ubuntu-latest

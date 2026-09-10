@@ -55,6 +55,10 @@ pub fn spawn_tagged(world: &mut World, pos: DVec2, vel: DVec2, color: [f32; 4], 
 /// Full-control spawn with explicit start/end sizes. Used for explosion
 /// "chunks" that want big fat pixels flying instead of the standard 3px
 /// sparks.
+// Every argument is an independent particle property with no meaningful
+// grouping — bundling them into a struct would just move the same list
+// behind a constructor and force a temporary at every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_sized(
     world: &mut World,
     pos: DVec2,

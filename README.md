@@ -15,12 +15,42 @@ The `terrain` module came the same way out of
 void_engine = { git = "ssh://git@github.com/jamez667/void-engine.git" }
 ```
 
-Headless consumers (dedicated servers, simulation) should turn off the default
-`audio` feature, which pulls in `rodio` and therefore `alsa-sys`:
+Headless consumers (dedicated servers, simulation) turn off the default
+features, which drops both `rodio`/`alsa-sys` and the whole GPU stack:
 
 ```toml
 void_engine = { git = "ssh://git@github.com/jamez667/void-engine.git", default-features = false }
 ```
+
+That build contains no `wgpu` at all (`cargo tree -e normal` confirms it), so
+it compiles in a headless Linux container with no graphics libraries present.
+What survives is the entire simulation surface: `World`, `collision`,
+`pathfind`, `terrain`, `physics`, `time`, `rng`, `sector`, `tilegrid`, and —
+with `features = ["net"]` — `net`.
+
+### Client and server
+
+Game logic implements `App`, which is renderer-free and compiles into both
+builds. A client additionally implements `ClientApp` on the same type, so the
+simulation is written exactly once:
+
+```rust
+impl App for Game {
+    fn init(&mut self, ctx: &mut SimCtx) { /* spawn the world */ }
+    fn fixed_update(&mut self, ctx: &mut SimCtx) { /* ctx.world, ctx.dt */ }
+}
+
+// Client build only:
+impl ClientApp for Game {
+    fn render(&mut self, r: &mut Renderer, w: &World, i: &InputState, alpha: f32) { }
+}
+
+void_engine::run(game);                    // window + GPU, 60 Hz
+void_engine::run_headless(game, || true);  // no window, 30 Hz
+```
+
+`SimCtx::dt` is the loop's own step, so the same `fixed_update` is correct at
+both rates.
 
 ## What's in it
 

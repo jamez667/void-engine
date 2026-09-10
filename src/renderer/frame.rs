@@ -17,6 +17,12 @@ use super::*;
 /// `batch.indices` (doubling on overflow), then upload the batch's
 /// contents. Shared by the main + offscreen batch upload paths so a bug
 /// fix or perf tweak lands in one place.
+// Takes the vertex and index buffer/capacity/label triples as separate
+// `&mut` arguments precisely so one function can serve the main, offscreen
+// and mask paths. Grouping them would need a struct holding three `&mut`
+// borrows into `Renderer`, which the borrow checker rejects at the call
+// sites this exists to share.
+#[allow(clippy::too_many_arguments)]
 fn upload_batch(
     device: &wgpu::Device,
     queue:  &wgpu::Queue,

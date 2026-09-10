@@ -1,46 +1,107 @@
+//! The game-facing entry points.
+//!
+//! [`App`] is the simulation half and exists in every build. [`ClientApp`],
+//! [`EngineCtx`] and [`run`] are the windowed half and need the `client`
+//! feature; a dedicated server drives [`App`] with
+//! [`crate::app_headless::run_headless`] instead.
+
+#[cfg(feature = "client")]
 use winit::application::ApplicationHandler;
+#[cfg(feature = "client")]
 use winit::event::{WindowEvent, DeviceEvent, DeviceId, MouseScrollDelta};
+#[cfg(feature = "client")]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+#[cfg(feature = "client")]
 use winit::window::{Window, WindowId, WindowAttributes};
+#[cfg(feature = "client")]
 use winit::keyboard::PhysicalKey;
+#[cfg(feature = "client")]
 use glam::Vec2;
+#[cfg(feature = "client")]
 use std::sync::Arc;
+#[cfg(feature = "client")]
 use std::sync::mpsc;
+#[cfg(feature = "client")]
 use std::time::Instant;
 
+#[cfg(feature = "client")]
 use crate::renderer::Renderer;
 use crate::input::InputState;
 use crate::ecs::World;
-use crate::time::{Timestep, FIXED_DT};
+#[cfg(feature = "client")]
+use crate::time::Timestep;
 
-/// Per-second rollup of render-loop timings + vertex count. Published by
-/// the engine on `Renderer::last_perf` after each rollup tick (~1 Hz) so
-/// `App::render` can surface the same numbers the `[perf]` log line shows.
-/// Defaults to zero on the first frame.
-#[derive(Default, Clone, Copy, Debug)]
-pub struct PerfSnapshot {
-    pub fps:           f32,
-    pub avg_frame_ms:  f32,
-    pub p50_frame_ms:  f32,
-    pub p95_frame_ms:  f32,
-    pub p99_frame_ms:  f32,
-    pub worst_frame_ms: f32,
-    pub avg_update_ms:  f32,
-    pub avg_batch_ms:   f32,
-    pub avg_present_ms: f32,
-    pub vertex_count:   u32,
-}
+// `PerfSnapshot` moved to `crate::perf` so `renderer` can store one without
+// depending on `app`. Re-exported here because that is where consumers have
+// always found it.
+pub use crate::perf::PerfSnapshot;
 
-pub struct EngineCtx<'a> {
+/// What a fixed step gets. No renderer: this is the context a dedicated
+/// server has, and therefore the context simulation code must be written
+/// against if it is to run on one.
+///
+/// `dt` is this loop's step duration, read from its [`Timestep`] rather
+/// than a global constant — a client passes 1/60 and a server 1/30, and
+/// the same `fixed_update` body is correct under both.
+pub struct SimCtx<'a> {
     pub world: &'a mut World,
     pub input: &'a InputState,
-    pub renderer: &'a mut Renderer,
     pub dt: f32,
 }
 
+/// The simulation half of a game. Everything here runs identically on a
+/// client and on a headless server, and none of it can touch the GPU.
+///
+/// A dedicated server implements only this and never links `wgpu`/`winit`
+/// (see the `client` feature). A game that also draws implements
+/// [`ClientApp`] on the same type, so the sim is written exactly once.
 pub trait App: 'static {
-    fn init(&mut self, ctx: &mut EngineCtx);
-    fn fixed_update(&mut self, ctx: &mut EngineCtx);
+    fn init(&mut self, ctx: &mut SimCtx);
+    fn fixed_update(&mut self, ctx: &mut SimCtx);
+    /// Checked before every fixed step. Return `false` to defer the tick
+    /// instead of running it.
+    ///
+    /// Exists for deterministic lockstep, where a tick may not run until
+    /// both peers' inputs for it are in hand — the game cannot simply
+    /// advance with input it does not have. Returning `false` stops the
+    /// catch-up loop and refunds the un-run steps to the timestep
+    /// accumulator, so they are deferred to a later frame rather than lost.
+    ///
+    /// Defaulted to `true`, so single-player games never implement it and
+    /// behave exactly as before.
+    fn can_advance(&self) -> bool { true }
+}
+
+/// What a client fixed step gets: a [`SimCtx`] plus the renderer.
+///
+/// Exists so a client can reach the renderer from `init` (uploading static
+/// geometry, sizing buffers) without that possibility leaking into [`App`],
+/// which must stay compilable with no GPU. Deref to the sim context so the
+/// familiar `ctx.world` / `ctx.input` / `ctx.dt` still work.
+#[cfg(feature = "client")]
+pub struct EngineCtx<'a, 'b> {
+    pub sim: SimCtx<'a>,
+    pub renderer: &'b mut Renderer,
+}
+
+#[cfg(feature = "client")]
+impl<'a> std::ops::Deref for EngineCtx<'a, '_> {
+    type Target = SimCtx<'a>;
+    fn deref(&self) -> &Self::Target { &self.sim }
+}
+
+#[cfg(feature = "client")]
+impl std::ops::DerefMut for EngineCtx<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.sim }
+}
+
+/// The drawing half of a game: everything that needs a window and a GPU.
+///
+/// Split from [`App`] rather than defaulted on it so that a server build
+/// cannot accidentally depend on rendering, and so `render`'s signature can
+/// name `Renderer` without that type having to exist in a headless build.
+#[cfg(feature = "client")]
+pub trait ClientApp: App {
     fn render(
         &mut self,
         renderer: &mut Renderer,
@@ -49,29 +110,19 @@ pub trait App: 'static {
         alpha: f32,
     );
     fn on_resize(&mut self, _width: u32, _height: u32) {}
-    /// Checked before every fixed step. Return `false` to defer the tick
-    /// instead of running it.
-    ///
-    /// Exists for deterministic lockstep (`net::lockstep`), where a tick may
-    /// not run until both peers' inputs for it are in hand — the game cannot
-    /// simply advance with input it does not have. Returning `false` stops
-    /// the catch-up loop and refunds the un-run steps to the timestep
-    /// accumulator, so they are deferred to a later frame rather than lost.
-    ///
-    /// Defaulted to `true`, so single-player games never implement it and
-    /// behave exactly as before.
-    fn can_advance(&self) -> bool { true }
     /// Window title. Override to name your window; default keeps the
     /// engine generic. Called once at `resumed`, so a static string is
     /// enough — no need to react to state changes here.
     fn window_title(&self) -> &'static str { "void_engine app" }
 }
 
+#[cfg(feature = "client")]
 struct PerfLogger {
     tx: mpsc::SyncSender<String>,
     _thread: std::thread::JoinHandle<()>,
 }
 
+#[cfg(feature = "client")]
 impl PerfLogger {
     fn new() -> Self {
         let (tx, rx) = mpsc::sync_channel::<String>(4);
@@ -92,6 +143,7 @@ impl PerfLogger {
     }
 }
 
+#[cfg(feature = "client")]
 struct PerfStats {
     frame_times: Vec<f64>,
     accum_update_ms: f64,
@@ -102,6 +154,7 @@ struct PerfStats {
     logger: PerfLogger,
 }
 
+#[cfg(feature = "client")]
 impl PerfStats {
     fn new() -> Self {
         Self {
@@ -176,7 +229,8 @@ impl PerfStats {
     }
 }
 
-struct Handler<A: App> {
+#[cfg(feature = "client")]
+struct Handler<A: ClientApp> {
     app: A,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -187,7 +241,8 @@ struct Handler<A: App> {
     perf: PerfStats,
 }
 
-impl<A: App> Handler<A> {
+#[cfg(feature = "client")]
+impl<A: ClientApp> Handler<A> {
     fn new(app: A) -> Self {
         Self {
             app,
@@ -202,7 +257,8 @@ impl<A: App> Handler<A> {
     }
 }
 
-impl<A: App> ApplicationHandler for Handler<A> {
+#[cfg(feature = "client")]
+impl<A: ClientApp> ApplicationHandler for Handler<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = WindowAttributes::default()
             .with_title(self.app.window_title())
@@ -212,12 +268,11 @@ impl<A: App> ApplicationHandler for Handler<A> {
         self.renderer = Some(renderer);
         self.window = Some(window);
 
-        let renderer = self.renderer.as_mut().unwrap();
-        let mut ctx = EngineCtx {
+        let dt = self.timestep.dt();
+        let mut ctx = SimCtx {
             world: &mut self.world,
             input: &self.input,
-            renderer,
-            dt: FIXED_DT,
+            dt,
         };
         self.app.init(&mut ctx);
         self.last_frame = Instant::now();
@@ -312,6 +367,7 @@ impl<A: App> ApplicationHandler for Handler<A> {
         self.last_frame = frame_start;
 
         let (steps, alpha) = self.timestep.advance(frame_dt);
+        let dt = self.timestep.dt();
 
         let update_start = Instant::now();
         for step in 0..steps {
@@ -330,12 +386,10 @@ impl<A: App> ApplicationHandler for Handler<A> {
                 self.timestep.refund(steps - step);
                 break;
             }
-            let renderer = self.renderer.as_mut().unwrap();
-            let mut ctx = EngineCtx {
+            let mut ctx = SimCtx {
                 world: &mut self.world,
                 input: &self.input,
-                renderer,
-                dt: FIXED_DT,
+                dt,
             };
             self.app.fixed_update(&mut ctx);
             // Clear the pressed/released edge flags after the FIRST step,
@@ -373,7 +427,10 @@ impl<A: App> ApplicationHandler for Handler<A> {
     }
 }
 
-pub fn run<A: App>(app: A) {
+/// Open a window and run the game loop at the client rate (60 Hz fixed
+/// step, ~62 Hz render). Blocks until the window closes.
+#[cfg(feature = "client")]
+pub fn run<A: ClientApp>(app: A) {
     let _ = env_logger::try_init();
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);

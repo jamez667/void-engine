@@ -4,8 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# `wgpu` is client-only (feature `client`, on by default). A dedicated
+# server links this crate for its ECS, math, collision and netcode and has
+# no business carrying a GPU stack: it is a large dependency tree, and on a
+# headless Linux box the system libraries it expects are absent. Gating it
+# is what makes the README's "headless consumers" claim actually true —
+# before this, `default-features = false` still built wgpu.
+wgpu = { version = "22", optional = true }
+# `winit` stays unconditional, deliberately. It supplies `KeyCode` and
+# `MouseButton`, which `input`/`keybinds` use as plain data — a `KeyCode` is
+# a field-less enum used as a bitset index, with no window attached — and a
+# server that replays recorded input, or reloads a player's keybinds, still
+# needs to name keys. Gating it would mean either duplicating that enum or
+# making `input` client-only, and a headless replay harness genuinely wants
+# it. It is pure Rust and opens nothing on its own: the OS windowing
+# libraries are loaded by creating a window, which a server never does.
 winit = "0.30"
-wgpu = "22"
 glam = { version = "0.29", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
@@ -50,8 +64,13 @@ webpki-roots = { version = "0.26", optional = true }
 # `default-features = false`; that keeps `rodio` (and thus `alsa-sys`, which
 # needs pkg-config and libasound2-dev) out of headless Docker images
 # entirely. Clients opt back in with `features = ["audio"]`.
-default = ["audio"]
+default = ["audio", "client"]
 audio = ["dep:rodio"]
+
+# The windowed client: renderer, immediate-mode UI, fx, bitmap text, the
+# winit event loop, and `ClientApp`/`run`. Off means a headless build —
+# `App` + `run_headless` over a `Timestep`, with no GPU and no window.
+client = ["dep:wgpu"]
 
 # Networking is opt-in for the same reason audio is: a game that has no
 # netcode should not carry the code, the threads, or the attack surface of a
@@ -85,3 +104,25 @@ bytemuck = "1"
 [[bench]]
 name = "hot_paths"
 harness = false
+
+# Both examples drive the renderer directly (Batch, and in material_preview a
+# raw wgpu device), so they only exist in a client build.
+[[example]]
+name = "bubble_preview"
+required-features = ["client"]
+
+[[example]]
+name = "material_preview"
+required-features = ["client"]
+
+# Both of these drive the renderer directly — one stands up a headless wgpu
+# device and reads pixels back, the other parses shader.wgsl through naga.
+# Neither can exist in a build without the GPU stack, so they are pinned to
+# `client` rather than made to compile against a renderer that is not there.
+[[test]]
+name = "materials_render"
+required-features = ["client"]
+
+[[test]]
+name = "shader_compiles"
+required-features = ["client"]

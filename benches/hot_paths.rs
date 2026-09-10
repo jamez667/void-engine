@@ -113,6 +113,17 @@ fn report(label: &str, ms: f64, budget_ms: f64) -> bool {
 }
 
 fn main() {
+    // `cargo test --all-targets` builds and runs this binary in debug, where
+    // the same code is several times slower — the 50k x 20 case measures
+    // ~1.4ms in release and blows the 4ms budget unoptimized. The budgets
+    // describe optimized code, so enforcing them in a debug run reports a
+    // regression that does not exist. Skip instead: `cargo bench` (release)
+    // is where these are enforced, and CI runs it as its own step.
+    if cfg!(debug_assertions) {
+        println!("hot-path guards skipped: debug build (run `cargo bench` to enforce)");
+        return;
+    }
+
     println!("void_engine hot-path guards (release)\n");
     let mut all_ok = true;
     all_ok &= report("ecs iter2: 50k entities x 20 systems", ecs_many_systems(), BUDGET_MANY_SYSTEMS);

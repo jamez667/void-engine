@@ -28,4 +28,19 @@ Positions `[f32; 2]` at batch site (GPU req). World pos `DVec2`, cast to `Vec2` 
 
 ## Fixed timestep
 
-`App::fixed_update` runs fixed rate. `App::render` every frame with `alpha` interp factor. Both driven by `void_engine::run()`.
+`App::fixed_update` runs at a fixed rate over `SimCtx` (world + input + dt, no
+renderer). `ClientApp::render` runs every frame with an `alpha` interp factor.
+
+Two drivers: `run()` (winit window, 60 Hz, needs `client`) and
+`run_headless()` (no window, 30 Hz default). Both share the accumulator,
+`can_advance` deferral/refund, and input-edge rules.
+
+Tick rate is per-`Timestep` (`Timestep::with_hz`), not a global — read `dt`
+from `SimCtx`, never from the `FIXED_DT` constant, or logic breaks at 30 Hz.
+
+## Features
+
+`client` (default) gates `wgpu` and every module needing it: `renderer`,
+`ui`, `fx`, `text`, plus `ClientApp`/`EngineCtx`/`run`. `winit` stays
+unconditional — `input`/`keybinds` use `KeyCode` as plain data. Headless
+builds link no GPU stack.

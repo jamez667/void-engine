@@ -89,6 +89,11 @@ pub fn draw_stat_panel(
 ///
 /// `title` reads across the top; `subtitle_fmt` is called with the
 /// remaining seconds to fill the row below the bar.
+// An immediate-mode widget: the caller passes the full appearance every
+// frame because nothing is retained between them. A style struct is the
+// usual answer, but this is the only widget with a list this long, so it
+// would exist solely to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_hold_confirm_popup(
     batch:        &mut Batch,
     held_secs:    f32,

@@ -61,7 +61,7 @@ pub struct Renderer {
     /// to zero on the first frame. Surfaced to `App::render` so the F3
     /// debug overlay can show the same numbers as the `[perf]` log line
     /// without duplicating the rolling-average bookkeeping.
-    pub last_perf: crate::app::PerfSnapshot,
+    pub last_perf: crate::perf::PerfSnapshot,
     window: Arc<Window>,
 
     // Post-process pipeline. `postprocess` is `None` on hardware where
