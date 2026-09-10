@@ -254,8 +254,21 @@ pub struct Discrepancy {
     pub imbalance: i128,
 }
 
-/// Handle to an in-flight reservation, released when the transfer
-/// commits or is abandoned.
+/// Handle to an in-flight reservation.
+///
+/// **Release is the caller's job.** `transfer` never consults, decrements
+/// or removes a reservation, so one taken and not explicitly released
+/// holds those funds down forever: the balance moves, the hold stays, and
+/// `available` stays depressed for the life of the process. There is no
+/// timeout and no link from a reservation to the transfer it was taken
+/// for.
+///
+/// This doc used to claim release happened "when the transfer commits or
+/// is abandoned", which was never true in the code. Coupling the two is
+/// the better design and is deliberately not done here: it would change
+/// semantics the phase-3 property tests were written against, so it wants
+/// its own change and its own tests rather than being smuggled into a
+/// documentation fix.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReservationId(u64);
 
@@ -509,8 +522,18 @@ impl Ledger {
     /// to ask; this exists so a durable backend can attach its own
     /// durability rather than inheriting the in-memory answer.
     #[cfg(feature = "ledger-pg")]
-    pub(crate) fn receipt_for_inner(&self, key: &IdemKey) -> Option<Receipt> {
-        self.seen.get(key).cloned()
+    pub(crate) fn receipt_for_inner(&self, key: &IdemKey) -> Option<(Receipt, u64)> {
+        let receipt = self.seen.get(key)?.clone();
+        // The tick is not on `Receipt`, so recover it from the entry the
+        // receipt points at. A durable backend needs it to answer "is this
+        // committed yet" against the watermark; without it the only honest
+        // answer is "don't know".
+        let tick = self
+            .entries
+            .get(receipt.debit_seq as usize)
+            .map(|e| e.tick)
+            .unwrap_or(0);
+        Some((receipt, tick))
     }
 
     /// Total ever created, as a positive number.

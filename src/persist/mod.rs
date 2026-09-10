@@ -5,20 +5,23 @@
 //! adds an append-only ledger and Postgres for MMO-scale value tracking,
 //! where "who created this item" has to be answerable months later.
 //!
-//! What is here in phase 1:
+//! What is here:
 //!
-//! - [`registry`] — the component name registry. Decides what a save file
+//! - `registry` — the component name registry. Decides what a save file
 //!   calls each component type, and classifies each one as ledgered,
 //!   volatile or transient.
-//!
-//! Still to come in this tier: `World::snapshot`/`restore`, the on-disk
-//! checkpoint with its atomic write, and the schema-migration chain.
+//! - `snapshot` — `capture`/`restore` for a whole `World`, reproducing
+//!   entity ids, generations and the free list exactly.
+//! - `checkpoint` — the same, on disk, written atomically so a file is
+//!   wholly the old one or wholly the new one however the process dies.
+//! - `ledger` / `ledger_pg` (the `ledger` and `ledger-pg` features) —
+//!   append-only value tracking, optionally durable in Postgres.
 //!
 //! # The one rule worth repeating
 //!
 //! A save file commits to a component's *name*, never to its Rust type
 //! path or a hand-assigned integer. Renaming a type or moving a module
-//! must not change what a save file says. See [`registry`] for why the
+//! must not change what a save file says. See `registry` for why the
 //! alternatives all fail.
 
 pub mod checkpoint;

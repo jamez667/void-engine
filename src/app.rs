@@ -1,9 +1,12 @@
 //! The game-facing entry points.
 //!
-//! [`App`] is the simulation half and exists in every build. [`ClientApp`],
-//! [`EngineCtx`] and [`run`] are the windowed half and need the `client`
-//! feature; a dedicated server drives [`App`] with
-//! [`crate::app_headless::run_headless`] instead.
+//! `App` is the simulation half and exists in every build. `ClientApp` and
+//! `run` are the windowed half and need the `client` feature; a dedicated
+//! server drives `App` with `app_headless::run_headless` instead.
+//!
+//! (Plain code spans, not intra-doc links: these items are `cfg`-gated, so
+//! linking them breaks the docs in exactly the headless configuration this
+//! paragraph exists to explain.)
 
 #[cfg(feature = "client")]
 use winit::application::ApplicationHandler;
@@ -40,7 +43,7 @@ pub use crate::perf::PerfSnapshot;
 /// server has, and therefore the context simulation code must be written
 /// against if it is to run on one.
 ///
-/// `dt` is this loop's step duration, read from its [`Timestep`] rather
+/// `dt` is this loop's step duration, read from its `Timestep` rather
 /// than a global constant — a client passes 1/60 and a server 1/30, and
 /// the same `fixed_update` body is correct under both.
 pub struct SimCtx<'a> {
@@ -54,7 +57,7 @@ pub struct SimCtx<'a> {
 ///
 /// A dedicated server implements only this and never links `wgpu`/`winit`
 /// (see the `client` feature). A game that also draws implements
-/// [`ClientApp`] on the same type, so the sim is written exactly once.
+/// `ClientApp` on the same type, so the sim is written exactly once.
 pub trait App: 'static {
     fn init(&mut self, ctx: &mut SimCtx);
     fn fixed_update(&mut self, ctx: &mut SimCtx);
@@ -70,29 +73,6 @@ pub trait App: 'static {
     /// Defaulted to `true`, so single-player games never implement it and
     /// behave exactly as before.
     fn can_advance(&self) -> bool { true }
-}
-
-/// What a client fixed step gets: a [`SimCtx`] plus the renderer.
-///
-/// Exists so a client can reach the renderer from `init` (uploading static
-/// geometry, sizing buffers) without that possibility leaking into [`App`],
-/// which must stay compilable with no GPU. Deref to the sim context so the
-/// familiar `ctx.world` / `ctx.input` / `ctx.dt` still work.
-#[cfg(feature = "client")]
-pub struct EngineCtx<'a, 'b> {
-    pub sim: SimCtx<'a>,
-    pub renderer: &'b mut Renderer,
-}
-
-#[cfg(feature = "client")]
-impl<'a> std::ops::Deref for EngineCtx<'a, '_> {
-    type Target = SimCtx<'a>;
-    fn deref(&self) -> &Self::Target { &self.sim }
-}
-
-#[cfg(feature = "client")]
-impl std::ops::DerefMut for EngineCtx<'_, '_> {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.sim }
 }
 
 /// The drawing half of a game: everything that needs a window and a GPU.

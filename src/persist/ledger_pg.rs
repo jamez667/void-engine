@@ -35,7 +35,7 @@
 //! # Backpressure
 //!
 //! An unbounded journal is a memory leak with extra steps. Past
-//! [`PgConfig::max_journal`] the ledger refuses new transfers with
+//! `PgConfig::max_journal` the ledger refuses new transfers with
 //! [`LedgerError::WriterBehind`] rather than growing until the box dies.
 //! Refusing a purchase is recoverable; running out of memory is not.
 
@@ -501,8 +501,17 @@ impl LedgerStore for PgLedger {
     }
 
     fn receipt_for(&self, key: &IdemKey) -> Option<StoredReceipt> {
-        self.core.receipt_for_inner(key).map(|receipt| {
-            let durability = if receipt.deduplicated {
+        self.core.receipt_for_inner(key).map(|(receipt, tick)| {
+            // Not keyed off `deduplicated`: that flag is set on the clone
+            // returned by a retry, never on the copy stored in `seen`, so
+            // the old check was dead code that reported Pending for
+            // everything — including transfers durable across a restart.
+            // A caller gating a "sold!" confirmation on Committed would
+            // have waited forever.
+            //
+            // Durability is a fact about the writer, so ask the watermark,
+            // exactly as `transfer` does.
+            let durability = if self.acked_tick() >= tick {
                 Durability::Committed
             } else {
                 Durability::Pending

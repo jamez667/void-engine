@@ -41,6 +41,6 @@ from `SimCtx`, never from the `FIXED_DT` constant, or logic breaks at 30 Hz.
 ## Features
 
 `client` (default) gates `wgpu` and every module needing it: `renderer`,
-`ui`, `fx`, `text`, plus `ClientApp`/`EngineCtx`/`run`. `winit` stays
+`ui`, `fx`, `text`, plus `ClientApp`/`run`. `winit` stays
 unconditional — `input`/`keybinds` use `KeyCode` as plain data. Headless
 builds link no GPU stack.

@@ -2,9 +2,12 @@
 //! `resize`, and the small queue/accessor surface; the two bulky halves
 //! live in sibling child modules:
 //!
-//! - [`init`] — `Renderer::new`: GPU bring-up, pipelines, bind-group
+//! - `init` — `Renderer::new`: GPU bring-up, pipelines, bind-group
 //!   layouts, offscreen pass allocation.
-//! - [`frame`] — `begin_frame` / `end_frame`: the per-frame encoder pass.
+//! - `frame` — `begin_frame` / `end_frame`: the per-frame encoder pass.
+//!
+//! (Plain code spans: both are private child modules, so rustdoc has
+//! nothing to link them to.)
 //!
 //! Both are children of this module, so they reach `Renderer`'s private
 //! fields without any visibility widening.

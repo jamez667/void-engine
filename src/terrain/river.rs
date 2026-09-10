@@ -147,7 +147,7 @@ impl River {
     }
 }
 
-/// Catmull-Rom interpolation of `p1`→`p2` (`t` in [0,1]) using neighbours `p0`,
+/// Catmull-Rom interpolation of `p1`→`p2` (`t` in `[0,1]`) using neighbours `p0`,
 /// `p3` for the tangents. Passes exactly through `p1` and `p2`.
 #[inline]
 pub fn catmull_rom(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {

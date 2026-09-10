@@ -5,17 +5,17 @@
 //!
 //! The `client` feature (on by default) carries everything that needs a
 //! window or a GPU: the renderer, the immediate-mode UI, `fx`, bitmap text,
-//! and the winit event loop behind [`run`]. A dedicated server turns it off:
+//! and the winit event loop behind `run`. A dedicated server turns it off:
 //!
 //! ```toml
 //! void_engine = { version = "0.1", default-features = false }
 //! ```
 //!
-//! and drives the simulation with [`run_headless`] instead. What survives is
+//! and drives the simulation with `run_headless` instead. What survives is
 //! the whole simulation surface — [`World`], `collision`, `pathfind`,
 //! `terrain`, `physics`, `time`, `rng`, `sector`, `tilegrid` and (with the
 //! `net` feature) `net`. Game logic written against [`App`] compiles into
-//! both; only [`ClientApp`] needs the GPU.
+//! both; only `ClientApp` needs the GPU.
 
 pub mod app;
 /// The headless fixed-tick driver. Available in every build.
@@ -63,7 +63,7 @@ pub mod world;
 pub use app::{App, SimCtx};
 pub use app_headless::{Exit, HeadlessConfig, run_headless, run_headless_with};
 #[cfg(feature = "client")]
-pub use app::{ClientApp, EngineCtx, run};
+pub use app::{ClientApp, run};
 pub use ecs::{EntityId, World};
 pub use input::InputState;
 pub use perf::PerfSnapshot;

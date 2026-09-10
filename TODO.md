@@ -71,7 +71,7 @@ unblocks the most downstream work.
 - [x] **R1 — Split the client out of the loop.** Done 2026-09-10.
 
       `client` feature (default on) gates `wgpu` and every module that needs
-      it: `renderer`, `ui`, `fx`, `text`, plus `ClientApp`/`EngineCtx`/`run`.
+      it: `renderer`, `ui`, `fx`, `text`, plus `ClientApp`/`run`.
       A headless build links **no wgpu at all** — verified with
       `cargo tree -e normal --no-default-features`, which now reports zero
       wgpu/naga edges. The README's headless claim is finally true.
@@ -102,9 +102,11 @@ unblocks the most downstream work.
       - Servers: `default-features = false`, drive with
         `run_headless(app, || keep_going)`.
 
-      `EngineCtx` still exists for clients (now `SimCtx` + renderer, with
-      `Deref`, so `ctx.world`/`ctx.dt` keep working), but `fixed_update` no
-      longer receives one — reach the renderer from `render`.
+      `EngineCtx` was introduced here as `SimCtx` + renderer with a `Deref`,
+      but **it was never constructed** — `resumed` built a plain `SimCtx` and
+      the renderer was unreachable from `init`, so the type was dead API that
+      the docs described as live. A review caught it and it has since been
+      removed. Reach the renderer from `render`.
 
       Six integration tests in `tests/headless_server.rs` prove a server
       ticks with no window, `init` populates the world, `can_advance` defers,

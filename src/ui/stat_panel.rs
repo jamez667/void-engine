@@ -1,7 +1,7 @@
 //! Debug-panel primitives: a labelled-rows overlay and a
 //! hold-to-confirm popup.
 //!
-//! [`StatPanel`] renders a sized backdrop and a stack of monospace text
+//! [`draw_stat_panel`] renders a sized backdrop and a stack of monospace text
 //! rows anchored at a fixed origin — the shape used by every "F3
 //! diagnostics" overlay. The caller supplies the row list (one string
 //! per line, optional colour override, optional section-heading blank
@@ -19,7 +19,7 @@ use crate::renderer::batch::Batch;
 use crate::text::{draw_text, draw_text_centered};
 use crate::ui::{style, widgets, UiRect};
 
-/// One row of a [`StatPanel`]. `text` is drawn as-is; `color` overrides
+/// One row of a [`draw_stat_panel`]. `text` is drawn as-is; `color` overrides
 /// the default text colour when `Some`; `blank_before` inserts a
 /// vertical gap above this row (used for section headings).
 pub struct StatRow<'a> {

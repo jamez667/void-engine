@@ -49,7 +49,7 @@ impl Default for HeadlessConfig {
 
 /// Run `app` at [`crate::time::SERVER_HZ`] until it stops itself.
 ///
-/// The loop is the same shape as the windowed one in [`crate::app::run`] —
+/// The loop is the same shape as the windowed one in `app::run` —
 /// same accumulator, same `can_advance` deferral and refund, same
 /// input-edge consumption rule — minus everything that needs a screen.
 /// Simulation written against [`App`] therefore behaves identically on a

@@ -12,8 +12,7 @@
 //! infect every game's simulation code and undo the headless split. A
 //! Postgres write is not sync, so the durable backend does not implement
 //! this trait by blocking on the database — it enqueues, returns a
-//! *pending* receipt, and a writer thread commits. See
-//! [`super::ledger_pg`].
+//! *pending* receipt, and a writer thread commits. See `ledger_pg`.
 //!
 //! # What a backend must guarantee
 //!

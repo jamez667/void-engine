@@ -24,6 +24,12 @@ void_engine = { git = "ssh://git@github.com/jamez667/void-engine.git", default-f
 
 That build contains no `wgpu` at all (`cargo tree -e normal` confirms it), so
 it compiles in a headless Linux container with no graphics libraries present.
+
+`winit` is the one exception and stays linked unconditionally: `input` and
+`keybinds` use its `KeyCode`/`MouseButton` as plain data, and a server
+replaying recorded input or loading a player's keybinds still needs to name
+keys. It is pure Rust and opens no OS windowing libraries unless a window is
+actually created, so it costs a compiled dependency and nothing at runtime.
 What survives is the entire simulation surface: `World`, `collision`,
 `pathfind`, `terrain`, `physics`, `time`, `rng`, `sector`, `tilegrid`, and —
 with `features = ["net"]` — `net`.
@@ -65,7 +71,7 @@ both rates.
 | `math`, `render_math`, `physics`, `collision`, `pathfind` | Simulation primitives |
 | `terrain` | Procedural worldgen building blocks: seeded noise/fBm, heightfield ramps and erosion operators, rivers |
 | `tilegrid`, `tile_collide`, `walk`, `sector`, `world` | World representation |
-| `net` | Snapshot interpolation |
+| `net` | QUIC endpoints, length-prefixed framing, MTU-aware datagram chunking, snapshot interpolation |
 | `audio` | MP3 playback (feature-gated) |
 | `text`, `time`, `rng`, `log`, `util` | Support |
 
