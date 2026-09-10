@@ -15,7 +15,10 @@ world.iter2::<A, B>()              // entities with both A and B
 world.despawn(id)
 ```
 
-`iter`/`iter2` use raw-pointer collect to dodge borrow rules — intentional, not bug.
+`iter`/`iter2`/`iter_mut` are lazy and allocation-free. They used to collect
+into a raw-pointer `Vec` to dodge borrow rules; splitting the `alive`/
+`generations` borrow from the storage borrow removed the need, along with all
+`unsafe` in the ECS. Keep them lazy — the collect cost ~83% of query time.
 
 ## Renderer
 

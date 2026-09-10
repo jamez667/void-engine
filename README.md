@@ -53,8 +53,11 @@ world.iter2::<Position, Velocity>();
 world.despawn(id);
 ```
 
-`iter`/`iter2` use a raw-pointer collect to sidestep borrow rules. That is
-intentional, not a bug.
+`iter`/`iter2`/`iter_mut` are lazy: they borrow the liveness arrays and the
+component storage separately, so they need neither an intermediate `Vec` nor
+any `unsafe`. Query cost therefore scales with what you actually consume, not
+with (entities × systems) — which is what it did when each call collected a
+fresh raw-pointer `Vec`. `benches/hot_paths.rs` guards the numbers.
 
 ## Renderer
 

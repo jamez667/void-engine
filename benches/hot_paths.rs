@@ -11,12 +11,16 @@
 //!
 //! Baselines recorded on the audit machine, release build:
 //!
-//! | Path                                    | Measured   |
-//! | --------------------------------------- | ---------- |
-//! | `iter2`, 50k entities x 20 systems      | 11.32 ms   |
-//! | same workload over contiguous arrays    |  0.39 ms   |
-//! | `iter2`, 250k entities, 1 system        |  2.73 ms   |
-//! | collision rebuild+query, 10k colliders  |  4.4 ms    |
+//! | Path                                    | Measured   | Was       |
+//! | --------------------------------------- | ---------- | --------- |
+//! | `iter2`, 50k entities x 20 systems      |  1.17 ms   | 11.32 ms  |
+//! | same workload over contiguous arrays    |  0.39 ms   |  0.39 ms  |
+//! | `iter2`, 250k entities, 1 system        |  0.43 ms   |  2.73 ms  |
+//! | collision rebuild+query, 10k colliders  |  5.10 ms   |  4.40 ms  |
+//!
+//! The "Was" column is what the audit measured, when `iter`/`iter2` still
+//! collected each query into a heap-allocated `Vec` of raw pointers. Making
+//! them lazy closed the gap to contiguous arrays from 28.7x to 2.8x.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -121,8 +125,13 @@ fn main() {
     }
 }
 
-// Budgets: ~3x the audit-machine measurement. Wide enough for a slower CI
-// runner, narrow enough to catch a real algorithmic regression.
-const BUDGET_MANY_SYSTEMS: f64 = 35.0; // measured 11.32
-const BUDGET_WIDE_QUERY: f64 = 9.0; // measured  2.73
-const BUDGET_COLLISION_10K: f64 = 15.0; // measured  4.40
+// Budgets: ~3x the current measurement. Wide enough for a slower CI runner,
+// narrow enough to catch a real algorithmic regression.
+//
+// The ECS budgets were 35.0 / 9.0 when the iterators still collected into a
+// heap-allocated Vec per query. Making them lazy took the first from 11.32ms
+// to ~1.17ms, so the budgets are retightened here — left at the old values
+// they would have happily accepted a full regression back to collecting.
+const BUDGET_MANY_SYSTEMS: f64 = 4.0; // measured 1.17 (was 11.32 when collecting)
+const BUDGET_WIDE_QUERY: f64 = 1.5; // measured 0.43 (was  2.73 when collecting)
+const BUDGET_COLLISION_10K: f64 = 15.0; // measured 5.10

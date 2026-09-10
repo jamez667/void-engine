@@ -120,15 +120,28 @@ unblocks the most downstream work.
 
 ## Measured baselines
 
-Release build, dev box. These are what the benchmarks should defend.
+Release build, dev box. These are what the benchmarks should defend. The
+"At audit" column is the original `a1dbc30` measurement, kept so a
+regression is recognisable as one.
 
-| Measurement | Value |
-| --- | --- |
-| ECS `iter2`, 50k entities × 20 systems | 11.32 ms/tick |
-| Same workload over contiguous arrays | 0.39 ms/tick |
-| ECS query overhead factor | **28.7×** |
-| ECS `iter2`, 250k entities, 1 system | 2.73 ms/tick |
-| Collision rebuild+query, 10k colliders | 4.4 ms/tick |
+**ECS query cost (done, 2026-09-09).** Not an R-item, but flagged in the
+audit as structural and cheapest to fix before R3 builds per-client
+snapshot queries on the same iterator. `iter`/`iter2`/`iter_mut` each
+collected into a heap-allocated `Vec` of raw pointers per call — the
+pointers existed only to escape a borrow-checker conflict, and profiling
+put ~83% of query time in the collect versus ~7% in the actual iteration.
+Making them lazy (splitting the `alive`/`generations` borrow from the
+storage borrow) removed both the allocation and the pointers: **9.7×
+faster, no call-site changes, no storage rewrite, `unsafe` count in the
+ECS drops to zero.**
+
+| Measurement | Value | At audit |
+| --- | --- | --- |
+| ECS `iter2`, 50k entities × 20 systems | **1.17 ms/tick** | 11.32 ms |
+| Same workload over contiguous arrays | 0.39 ms/tick | 0.39 ms |
+| ECS query overhead factor | **2.8×** | 28.7× |
+| ECS `iter2`, 250k entities, 1 system | **0.43 ms/tick** | 2.73 ms |
+| Collision rebuild+query, 10k colliders | 5.1 ms/tick | 4.4 ms |
 | Collision rebuild+query, 50k colliders | 26.4 ms/tick |
 | A*, 256×256 open grid, corner-to-corner | 14.5 ms |
 | `size_of::<Vertex>()` | 84 bytes |
