@@ -28,6 +28,10 @@ pub mod checkpoint;
 /// (`persist`) and carries none of this.
 #[cfg(feature = "ledger")]
 pub mod ledger;
+/// The durable ledger, written through to Postgres by a writer thread —
+/// the `ledger-pg` feature.
+#[cfg(feature = "ledger-pg")]
+pub mod ledger_pg;
 pub mod registry;
 pub mod snapshot;
 /// The contract every ledger backend satisfies — in-memory and Postgres.

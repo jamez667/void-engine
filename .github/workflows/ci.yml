@@ -60,6 +60,11 @@ jobs:
       - name: Clippy (ledger)
         run: cargo clippy --all-targets --no-default-features --features ledger -- -D warnings
 
+      # Tier 3 with Postgres. Compiles the writer thread and the driver,
+      # which no other axis does.
+      - name: Clippy (ledger-pg)
+        run: cargo clippy --all-targets --no-default-features --features ledger-pg -- -D warnings
+
       - name: Test (default features)
         run: cargo test --all-targets
 
@@ -74,6 +79,12 @@ jobs:
 
       - name: Test (ledger)
         run: cargo test --all-targets --no-default-features --features ledger
+
+      # Without VOID_ENGINE_PG_URL the durable tests skip themselves, so
+      # this still proves the axis compiles and its in-memory tests pass.
+      # The database-backed run is the `ledger-pg` job below.
+      - name: Test (ledger-pg, no database)
+        run: cargo test --all-targets --no-default-features --features ledger-pg
 
       # Phase 1 and 2's exit criteria both live only on this axis: without
       # `persist` these files compile to empty binaries. Asserting the
@@ -118,6 +129,48 @@ jobs:
             exit 1
           fi
           echo "confirmed: no wgpu in the headless dependency graph"
+
+  ledger-pg:
+    name: durable ledger vs postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: devpw
+          POSTGRES_DB: void_engine
+        ports:
+          - 5432:5432
+        # Without this the job races the container's startup and fails
+        # intermittently, which is worse than failing consistently.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test against a real database
+        env:
+          VOID_ENGINE_PG_URL: "host=127.0.0.1 port=5432 user=postgres password=devpw dbname=void_engine"
+        run: cargo test --test ledger_pg --no-default-features --features ledger-pg
+
+      # The tests skip themselves when the URL is unset, so a
+      # misconfigured environment would look like a pass. Assert they
+      # actually ran.
+      - name: The durable tests actually ran
+        env:
+          VOID_ENGINE_PG_URL: "host=127.0.0.1 port=5432 user=postgres password=devpw dbname=void_engine"
+        run: |
+          out=$(cargo test --test ledger_pg --no-default-features --features ledger-pg 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "8 passed" || {
+            echo "expected 8 durable ledger tests; they may have skipped"
+            exit 1
+          }
 
   perf:
     name: hot-path budgets

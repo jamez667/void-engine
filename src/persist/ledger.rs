@@ -191,6 +191,19 @@ pub enum LedgerError {
     Overflow,
     /// A reservation was released that was never taken.
     UnknownReservation,
+    /// The durable writer has fallen too far behind and the journal has
+    /// hit its cap.
+    ///
+    /// Refusing a purchase is recoverable; growing an unbounded queue
+    /// until the process is swapped to death is not. A caller should
+    /// treat this as "try again shortly", and an operator should treat a
+    /// sustained one as an outage.
+    WriterBehind { depth: usize, limit: usize },
+    /// The durable writer died. Every subsequent transfer is refused.
+    ///
+    /// Continuing to accept value movements with no way to persist them
+    /// would be silent data loss wearing the costume of a working ledger.
+    WriterFailed(String),
 }
 
 impl std::fmt::Display for LedgerError {
@@ -206,6 +219,10 @@ impl std::fmt::Display for LedgerError {
                 write!(f, "transfer would overflow the amount type"),
             LedgerError::UnknownReservation =>
                 write!(f, "released a reservation that was never taken"),
+            LedgerError::WriterBehind { depth, limit } =>
+                write!(f, "durable writer is behind: {depth} queued, limit {limit}"),
+            LedgerError::WriterFailed(why) =>
+                write!(f, "durable writer has failed: {why}"),
         }
     }
 }
@@ -468,6 +485,16 @@ impl Ledger {
             }
         }
         out
+    }
+
+    /// The raw receipt for a key, if this ledger has seen it.
+    ///
+    /// `pub(crate)` because the trait's `receipt_for` is the public way
+    /// to ask; this exists so a durable backend can attach its own
+    /// durability rather than inheriting the in-memory answer.
+    #[cfg(feature = "ledger-pg")]
+    pub(crate) fn receipt_for_inner(&self, key: &IdemKey) -> Option<Receipt> {
+        self.seen.get(key).cloned()
     }
 
     /// Total ever created, as a positive number.

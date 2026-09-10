@@ -232,7 +232,7 @@ unblocks the most downstream work.
       2026-09-10**; (2) on-disk checkpoints - **DONE 2026-09-10**, the
       `persist` tier now ships and is useful alone; (3) ledger core in-memory, semantics proven without IO -
       **DONE 2026-09-10**; (4)
-      Postgres behind the ledger trait, feature-gated; (5) reconciliation +
+      Postgres behind the ledger trait, feature-gated - **DONE 2026-09-10**; (5) reconciliation +
       crash matrix, exit criterion being that an injected synthetic dupe is
       caught by reconciliation rather than by a player noticing.
 
@@ -346,6 +346,51 @@ unblocks the most downstream work.
       *Deferred to phase 4: the ledger is in memory. Durability, the
       writer thread, the acked-tick watermark and Postgres come next; the
       invariants proven here are what that has to preserve.*
+
+      **Phase 4 shipped (2026-09-10).** `persist::ledger_pg` behind a
+      `ledger-pg` feature (implies `ledger`). 8 more tests, 272 total
+      across six axes.
+
+      - `LedgerStore` is the contract both backends satisfy, and it is
+        deliberately *sync*: `fixed_update` is sync and making it async
+        would infect every game's simulation code. The durable backend
+        therefore validates against the in-memory core, applies to
+        balances, returns a **pending** receipt, and journals the write.
+      - Postgres is durability, not a second implementation of the rules.
+        Two implementations of "can this player afford it" would
+        eventually disagree, and the disagreement would be a dupe.
+      - Schema proven against real Postgres 17.9 before any Rust depended
+        on it: `UNIQUE (idem_key, side)` rejected a replayed insert
+        (SQLSTATE 23505), the `side` CHECK rejected a bad value, and
+        rollback left zero rows. The store detects a retry by SQLSTATE
+        code, never by matching message text.
+      - Replay on open rebuilds the core from `ledger_entries` through the
+        normal `transfer` path, so the balance cache is rebuilt by exactly
+        the code that maintains it. A separate rebuild path would be a
+        second implementation that can disagree.
+      - **Bug found and fixed by the tests:** `flush` originally waited
+        for the *journal* to empty, but the writer drains work into a
+        local batch before committing, so there was a window where the
+        queue was empty and nothing was durable. `flush` returned success
+        during it and every restart test reopened onto zero rows. Now an
+        `accepted`/`committed` counter pair makes that window
+        unobservable. This is precisely the class of bug the phase existed
+        to surface.
+      - Backpressure: past `max_journal` transfers are refused with
+        `WriterBehind` rather than growing an unbounded queue. A dead
+        writer sets `WriterFailed` and every subsequent transfer is
+        refused - continuing to accept value movements with no way to
+        persist them is silent data loss wearing the costume of a working
+        ledger.
+      - `tests/ledger_pg.rs` runs against a real database, each test in
+        its own schema via `search_path`. It skips (not fails) without
+        `VOID_ENGINE_PG_URL`, so a machine with no database still passes
+        `cargo test`; CI runs it against a Postgres service container and
+        asserts the count so a misconfigured env cannot look like a pass.
+
+      *Deferred to phase 5: reconciliation jobs and the crash matrix -
+      kills at each boundary, and an injected synthetic dupe that must be
+      caught by a job rather than by a player noticing.*
 
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the
