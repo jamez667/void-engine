@@ -22,11 +22,22 @@
 //! alternatives all fail.
 
 pub mod checkpoint;
+/// Append-only value tracking — the `ledger` feature (tier 3).
+///
+/// Only exists in an MMO-scale build. A single-player game takes tier 2
+/// (`persist`) and carries none of this.
+#[cfg(feature = "ledger")]
+pub mod ledger;
 pub mod registry;
 pub mod snapshot;
 
 pub use checkpoint::{
     clear, load, save, CheckpointConfig, CheckpointError, DEFAULT_KEEP,
+};
+#[cfg(feature = "ledger")]
+pub use ledger::{
+    Account, Amount, Asset, Discrepancy, Entry as LedgerEntry, IdemKey, Ledger, LedgerError,
+    Receipt, ReservationId, TransferRequest,
 };
 pub use registry::{Codec, DecodedColumn, NameId, Persist, Registry, RegistryError};
 pub use snapshot::{

@@ -86,6 +86,16 @@ client = ["dep:wgpu"]
 # 3 adds the append-only ledger and Postgres for MMO-scale value tracking.
 persist = ["dep:bincode", "glam/serde"]
 
+# Tier 3: append-only value tracking. Every movement of currency or
+# items is a double-entry ledger record, and a balance is derived from
+# the log rather than stored as a mutable number. This is what makes
+# duping *detectable* rather than merely discouraged, and it is the
+# tier an MMO needs and a single-player game does not.
+#
+# Implies `persist`: a ledger without checkpoints would replay its
+# whole history on every boot.
+ledger = ["persist"]
+
 # Networking is opt-in for the same reason audio is: a game that has no
 # netcode should not carry the code, the threads, or the attack surface of a
 # transport it never opens. Single-player games (mini-miner-2) and headless

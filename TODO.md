@@ -230,7 +230,8 @@ unblocks the most downstream work.
 
       **Build order:** (1) registry + snapshot/restore, no DB - **DONE
       2026-09-10**; (2) on-disk checkpoints - **DONE 2026-09-10**, the
-      `persist` tier now ships and is useful alone; (3) ledger core in-memory, semantics proven without IO; (4)
+      `persist` tier now ships and is useful alone; (3) ledger core in-memory, semantics proven without IO -
+      **DONE 2026-09-10**; (4)
       Postgres behind the ledger trait, feature-gated; (5) reconciliation +
       crash matrix, exit criterion being that an injected synthetic dupe is
       caught by reconciliation rather than by a player noticing.
@@ -302,6 +303,49 @@ unblocks the most downstream work.
       call `save`, because how much loss is acceptable is a game question,
       not an engine one. `tests/crash_recovery.rs` shows the every-N-ticks
       shape.*
+
+      **Phase 3 shipped (2026-09-10).** `persist::ledger` behind a new
+      `ledger` feature (tier 3, implies `persist`). 27 more tests, 264
+      total across five axes.
+
+      - A balance is *derived*, never stored: `Ledger::balance` sums the
+        log, and there is no setter, so no path changes value without
+        leaving a record. This is the structural answer to void-claim's
+        advisory `CreditEvent` pipeline that eight sites simply skipped.
+      - Every entry has a counterparty. `Account::Mint`/`Burn` are where
+        value enters and leaves, so loot and repair costs still balance.
+        `audit_zero_sum` is the dupe detector: a non-zero sum per asset
+        means value was created outside the API.
+      - `IdemKey` from (session, client_seq, action). A retried packet
+        returns the *original* receipt and moves nothing - and succeeds
+        even if the player has since spent the money, because the original
+        transfer already happened. Checked before balances for that reason.
+      - `Amount` is `i64` minor units. Verified the ceiling: 10M accounts
+        at 100bn display units each fits with orders of magnitude spare,
+        and audits accumulate in `i128` so reconciliation cannot itself
+        overflow. Confirmed f64 is exact at 100bn but *not* at 2^53+1 -
+        precisely why void-claim's `credits: f64` cannot reconcile exactly.
+      - Direction lives in `from`/`to`, never the sign, so a negative
+        amount cannot quietly reverse a transfer. Zero and negative are
+        refused outright.
+      - Reservations hold funds against in-flight commits, so the same
+        credits cannot be spent twice while a phase-4 write is in the air.
+        `available` = balance - reserved, and that is what a spend checks.
+      - Items reuse the same machinery: a unique item is an asset with a
+        total supply of one, and `total_minted` proves it.
+      - Both audits are proven non-vacuous: one test forges an entry the
+        way an exploit would and asserts it is caught; another drifts the
+        balance cache and asserts the same.
+      - `tests/ledger_properties.rs` is the exit criterion - random
+        sequences of transfers, retries and reservations over a seeded LCG
+        (no proptest dependency; a failure prints its seed to replay),
+        asserting after *every* step that the books balance and the cache
+        matches. Plus 3000-step depth, heavy retry pressure, and a unique
+        item traded 500 times that is never duplicated or lost.
+
+      *Deferred to phase 4: the ledger is in memory. Durability, the
+      writer thread, the acked-tick watermark and Postgres come next; the
+      invariants proven here are what that has to preserve.*
 
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the
