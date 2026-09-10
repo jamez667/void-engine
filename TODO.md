@@ -229,8 +229,8 @@ unblocks the most downstream work.
       and `fixed_update` is sync.
 
       **Build order:** (1) registry + snapshot/restore, no DB - **DONE
-      2026-09-10**; (2) on-disk checkpoints - `persist` tier ships, useful
-      alone; (3) ledger core in-memory, semantics proven without IO; (4)
+      2026-09-10**; (2) on-disk checkpoints - **DONE 2026-09-10**, the
+      `persist` tier now ships and is useful alone; (3) ledger core in-memory, semantics proven without IO; (4)
       Postgres behind the ledger trait, feature-gated; (5) reconciliation +
       crash matrix, exit criterion being that an injected synthetic dupe is
       caught by reconciliation rather than by a player noticing.
@@ -266,8 +266,42 @@ unblocks the most downstream work.
         `persist`, and `persist` enables `glam/serde`, so a non-saving game
         compiles none of it.
 
-      *Deferred to phase 2, deliberately: no file IO. A `Snapshot` is bytes
-      in memory; atomic write, retention and restore-on-boot are next.*
+      **Phase 2 shipped (2026-09-10).** `persist::checkpoint` - 16 more
+      tests, 237 total across four axes.
+
+      - Atomic write: encode, write `<name>.<pid>.tmp`, `sync_all` so the
+        bytes reach the device rather than the page cache, rotate, then
+        rename over the target. A checkpoint file is wholly the old one or
+        wholly the new one, however the process dies.
+      - Two platform facts verified rather than assumed: `fs::rename` does
+        replace an existing file on Windows, and fsync-ing the parent
+        directory (the POSIX durability step for the directory entry)
+        fails `EACCES` on Windows - so it is attempted and tolerated, never
+        fatal.
+      - Retention keeps `DEFAULT_KEEP = 3` predecessors as `.1`/`.2`/`.3`,
+        matching `log.rs`'s existing rotation convention. The newest file
+        is the one a crash was most likely to damage, so a fallback turns
+        "the save is corrupt" into "we lost one interval".
+      - `load` tries current, then each predecessor; a corrupt or empty
+        file is skipped with a warning. If *nothing* is usable that is an
+        error carrying every path tried - never `Ok(None)`, which would
+        look like a fresh install and start a new world over a broken one.
+      - `Ok(None)` is reserved for a genuinely empty directory: first boot
+        must not be an error.
+      - Temp files carry the pid, so two processes sharing a directory
+        cannot scribble over each other's in-progress write; a stray
+        `.tmp` left by a crash is never mistaken for a checkpoint.
+      - `tests/crash_recovery.rs` is the exit criterion, driven through
+        the public API: a world survives a restart, a headless server
+        resumes at tick 30 rather than restarting at 10, a torn write
+        costs one interval, and a first boot with no checkpoint starts
+        fresh. CI asserts both this and the phase 1 count so a broken cfg
+        gate cannot turn either into a silent no-op.
+
+      *Deferred: no cadence policy in the engine - a game decides when to
+      call `save`, because how much loss is acceptable is a game question,
+      not an engine one. `tests/crash_recovery.rs` shows the every-N-ticks
+      shape.*
 
       *Open risks: a component's registry name is fixed once written to a
       save file (downgraded from rev 2's "frozen forever" - it lives in the

@@ -21,9 +21,13 @@
 //! must not change what a save file says. See [`registry`] for why the
 //! alternatives all fail.
 
+pub mod checkpoint;
 pub mod registry;
 pub mod snapshot;
 
+pub use checkpoint::{
+    clear, load, save, CheckpointConfig, CheckpointError, DEFAULT_KEEP,
+};
 pub use registry::{Codec, DecodedColumn, NameId, Persist, Registry, RegistryError};
 pub use snapshot::{
     capture, from_bytes, register_engine_components, restore, restore_rng, to_bytes,

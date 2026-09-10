@@ -66,16 +66,25 @@ jobs:
       - name: Test (persist)
         run: cargo test --all-targets --no-default-features --features persist
 
-      # The snapshot round-trip is phase 1's exit criterion, and it only
-      # exists on this axis — `tests/snapshot_round_trip.rs` compiles to an
-      # empty binary without the feature. Asserting the count stops it
-      # silently becoming a no-op if the cfg gate or the feature is broken.
+      # Phase 1 and 2's exit criteria both live only on this axis: without
+      # `persist` these files compile to empty binaries. Asserting the
+      # counts stops a broken cfg gate silently turning either into a no-op
+      # that reports success while testing nothing.
       - name: Snapshot round-trip actually ran
         run: |
           out=$(cargo test --test snapshot_round_trip --no-default-features --features persist 2>&1)
           echo "$out"
           echo "$out" | grep -q "10 passed" || {
             echo "expected 10 snapshot round-trip tests; the cfg gate may be wrong"
+            exit 1
+          }
+
+      - name: Crash recovery actually ran
+        run: |
+          out=$(cargo test --test crash_recovery --no-default-features --features persist 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "4 passed" || {
+            echo "expected 4 crash-recovery tests; the cfg gate may be wrong"
             exit 1
           }
 
