@@ -686,17 +686,31 @@ unblocks the most downstream work.
       *The terrain noise is already pure `f(position, seed)` and streams
       perfectly. It is held back by the container, not its own design.*
 
-- [ ] **R5 — Rebuild the client draw path.** Instancing (every draw is
-      currently `0..1`), texture atlas or `D2Array` (one 1×1 white pixel
-      exists today), SDF glyph atlas, depth buffer or explicit layer sort,
-      and a single clustered light pass (`MAX_LIGHTS_PER_FRAME = 384`).
+- [ ] **R5 — Rebuild the client draw path.** ~~Glyph atlas~~ (done), and a
+      sprite texture atlas or `D2Array` — the only item still standing.
+      ~~Instancing~~, ~~clustered lights~~ and the depth buffer are each
+      addressed below: clustering was measured and dropped, instancing was
+      inspected and dropped (no timing was ever taken — the draw-site
+      count settles it), and the depth buffer is real but has a
+      14-pipeline blast radius.
 
-      *A rewrite of the draw path, not an optimization pass. Independent of
-      the server work and safely deferrable.*
+      *Was framed as a rewrite of the draw path. Measurement cut it down to
+      one item — the entry below records what survived and why.*
 
-      **Measured, 2026-09-11, RTX 3080 Ti at 1080p.** All five claims hold;
-      one was cited at the wrong line. Treat every number as a best case —
-      pass submission is driver-bound and a weaker GPU punishes it harder.
+      **Measured, 2026-09-11, RTX 3080 Ti at 1080p.** All five claims are
+      *true as stated*, but only two are worth acting on. The glyph atlas
+      was real and is now done; the sprite atlas is real and remains open.
+      Clustered lights and instancing are true and not worth doing — the
+      first only bites at a cap neither game approaches, the second
+      describes work `Batch` already performs. The depth buffer is real
+      and deferred on blast radius, not on value.
+
+      *An earlier revision of this line read "all five claims hold", which
+      was accurate about the claims and misleading about the work. A claim
+      being true is not the same as a claim being worth acting on.*
+
+      Treat every number as a best case — pass submission is driver-bound
+      and a weaker GPU punishes it harder.
 
       **Text was the biggest win, and it is done.** The entry under-sold
       it: "72 KB per nameplate" is a memory figure, and the real cost was
@@ -747,19 +761,82 @@ unblocks the most downstream work.
       | 64 | 1200 px | 4.0 ms | 24% |
 
       Cost is area-proportional, so the 25 ms case needs 384 large
-      overlapping lights. A plausible interior at 64 lights stays under
-      4 ms, which matches the note at `mod.rs:275` that the on-foot
-      lattice fits comfortably. *Measured first with a constant-colour
-      fragment, which gave 5.3 ms at 384 and made the claim look weak —
-      that measured submission overhead alone. The march is the cost.*
+      overlapping lights. *Measured first with a constant-colour fragment,
+      which gave 5.3 ms at 384 and made the claim look weak — that
+      measured submission overhead alone. The march is the cost.*
 
-      **Instancing and the missing depth buffer are confirmed but
-      unquantified.** All 14 draw calls are `0..1`; every
+      **But do not cluster the lights.** The cap is not where either game
+      lives, and the curve at radii they actually use never approaches a
+      budget:
+
+      | radius | 8 | 16 | 32 | 64 | 128 lights |
+      | --- | --- | --- | --- | --- | --- |
+      | 80 px | 0.20 | 0.35 | 0.65 | 1.26 | 2.46 ms |
+      | 160 px | 0.21 | 0.38 | 0.71 | 1.39 | 2.73 ms |
+      | 320 px | 0.31 | 0.53 | 0.99 | 1.94 | 3.36 ms |
+      | 640 px | 0.38 | 0.72 | 1.40 | 2.77 | 5.53 ms |
+
+      void-claim lights ceilings at 4.5 tiles and floods at 12
+      (`lights.rs:34`, `:42`), mini-miner-2 candles at 3.2 m, halos at 7
+      and portal beams reaching 9 (`lamp.rs`) — all inside that bracket.
+      Neither caps its count: void-claim pushes one light per visible tile
+      of a kind, mini-miner-2 two per crew member plus one per portal, so
+      counts scale with the scene. Even so, reaching 8 ms needs 128 lights
+      *and* a 640 px radius, and 25 ms needs 384 at 1200.
+
+      *The same shape as R4: a dramatic figure at the ceiling, and a
+      measurement showing nobody stands near it. If this is revisited, the
+      trigger is a game that logs light counts above ~128 at large radii —
+      void-claim already instruments exactly that
+      (`[lights] ceiling_candidates=N`), so the number can be read rather
+      than guessed.*
+
+      **Instancing has little to save, and the entry's framing misleads.**
+      "Every draw is `0..1`" is literally true and practically empty.
+      There are **22** draw sites, not the 14 this entry claimed, and all
+      22 are in `frame.rs`. Eighteen are fullscreen triangles
+      (`draw(0..3, 0..1)`) — ten of them composites, the rest effect and
+      light passes — and a single fullscreen triangle cannot be
+      instanced. Only **four** are `draw_indexed`: the offscreen batch
+      (`:287`), the wall mask (`:369`), and the main batch split into
+      ranges (`:611`, `:659`). `Batch` already merges every primitive into
+      one vertex buffer, which is the thing instancing exists to achieve.
+
+      Geometry draws are what instancing could touch, and there are four
+      of them regardless of how many sprites the scene holds. The other
+      eighteen sites are passes, not batched geometry, and they break down
+      as: ten composites inside the main-pass range loop (`:618`–`:644`
+      and `:670`–`:694`, five after each `draw_indexed`); two in the
+      per-light loop (`:430`/`:451`, submitted once per light, which is
+      what makes the light table above the real cost); and six standalone
+      fullscreen passes, named here by the pipeline each binds — two blur
+      taps (`:308`, `:330`, both `blur_pipeline`), shadow raycast
+      (`:397`, `raycast_pipeline` — this is the pass the audit reached for
+      when it cited 382 for the light loop; 382 is this pass's `label:`
+      line), sun (`:478`), and the godray pair `seed`/`march`
+      (`:508`, `:528`).
+
+      *The light-loop citations above and these reconcile once the
+      distinction is pass-open versus draw-call: 411/435 open the light
+      passes, 430/451 are the draws inside them. Both are right; they name
+      different things.*
+
+      So a busy frame submits four indexed draws *plus* up to ten range
+      composites, plus the six standalone passes that are active, plus one
+      triangle per light. Four is the geometry floor, not the frame's draw
+      count — and none of the eighteen is something instancing addresses.
+
+      *If instancing is revisited, it needs a workload where per-draw
+      state actually changes — many distinct textures, say — which the
+      single-atlas design has just made less likely rather than more.*
+
+      **The depth buffer is confirmed and still unmeasured.** Every
       `depth_stencil_attachment` is `None` and no pipeline sets
-      `depth_stencil: Some`, so ordering is painter's-algorithm only. The
-      main pass already splits `draw_indexed` into ranges around composite
-      points (`frame.rs:588`), which is the structure instancing has to
-      preserve.
+      `depth_stencil: Some`, so ordering is painter's-algorithm only.
+      Adding one touches **14 pipelines across 6 files**
+      (`godray`, `init`, `lights`, `postprocess`, `shadow`, `sun`), which
+      is a far wider blast radius than any other R5 item — worth keeping
+      separate from the rest rather than folded in.
 
       *Downstream surface, the same constraint `TileGrid` has: roughly
       2,100 `Batch` primitive call sites across void-claim and
@@ -859,4 +936,7 @@ ECS drops to zero.**
 | Text: 200 nameplates, one quad per glyph | **0.153 ms / 8,800 verts** | 9.8 ms / 208,800 |
 | Text: 1000 nameplates | **1.34 ms / 44,000 verts** | 39.7 ms / 1,044,000 |
 | Lights: 384 × radius 1200 px | **25.1 ms/frame** | 152% of 16.6 ms |
-| Lights: 64 × radius 1200 px | 4.0 ms/frame | 24% |
+| Lights: 128 × radius 640 px | 5.53 ms/frame | — |
+| Lights: 64 × radius 320 px | 1.94 ms/frame | — |
+| Geometry draws per frame | **4 `draw_indexed`** | — |
+| Draw sites in `frame.rs` | 22 (18 fullscreen) | 14 claimed |
