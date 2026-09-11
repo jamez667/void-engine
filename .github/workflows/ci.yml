@@ -326,10 +326,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # `benches/hot_paths.rs` exits non-zero when a measured path blows its
-      # budget, so this step is the regression gate. Headless: the guards
-      # cover ECS and collision, neither of which needs audio.
+      # budget, so this step is the regression gate. Headless plus
+      # `replication`: the guards cover ECS, collision, area-of-interest and
+      # snapshot encoding, none of which needs audio or a GPU — but the
+      # encode guard names `net::snapshot`, so without the feature it would
+      # compile out and silently stop guarding anything.
       #
       # Runner variance is real; the budgets are ~3x the recorded baseline so
       # only an algorithmic regression trips them, not a noisy neighbour.
       - name: Hot-path guards
-        run: cargo bench --no-default-features
+        run: cargo bench --no-default-features --features replication

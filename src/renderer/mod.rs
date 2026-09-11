@@ -248,13 +248,7 @@ impl Renderer {
         self.shadow_split_index = Some(self.batch.indices.len() as u32);
     }
 
-    /// Queue a point light emitter for this frame's light-map. `pos_px` is
-    /// the light centre in surface pixel space with the top-left origin
-    /// (matches wall_mask uv). Silently drops lights past
-    /// `MAX_LIGHTS_PER_FRAME` — the on-foot lattice + windows fits well
-    /// inside this budget in normal play. `color` is linear RGB; `radius_px`
-    /// is the falloff cutoff; `intensity` scales the peak contribution.
-    /// Set what an unlit pixel keeps, overriding [`lights::AMBIENT_CLEAR`].
+    /// Set what an unlit pixel keeps, overriding the default ambient clear.
     ///
     /// The default suits an interior lit by lamps, where darkness is gloom.
     /// Some games want it to mean more than that -- underground, away from a
@@ -275,6 +269,12 @@ impl Renderer {
         [self.ambient.r as f32, self.ambient.g as f32, self.ambient.b as f32]
     }
 
+    /// Queue a point light emitter for this frame's light-map. `pos_px` is
+    /// the light centre in surface pixel space with the top-left origin
+    /// (matches wall_mask uv). Silently drops lights past
+    /// `MAX_LIGHTS_PER_FRAME` — the on-foot lattice + windows fits well
+    /// inside this budget in normal play. `color` is linear RGB; `radius_px`
+    /// is the falloff cutoff; `intensity` scales the peak contribution.
     pub fn push_light(
         &mut self,
         pos_px: Vec2,
