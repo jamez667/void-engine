@@ -160,6 +160,17 @@ jobs:
       - name: Test (admin)
         run: cargo test --all-targets --no-default-features --features admin
 
+      # `--all-targets` does NOT run doctests, so every `cargo test` step
+      # above skips them. The admin module's examples are the only
+      # documentation of how a game calls `expire_reservations` and
+      # `audit_zero_sum` — the page cannot, by design — so an example that
+      # stops compiling takes the guidance with it silently.
+      - name: Doctests (admin)
+        run: cargo test --doc --no-default-features --features admin
+
+      - name: Doctests (default)
+        run: cargo test --doc
+
       # `Replicate` is the axis that says what reaches a client, and its
       # default is "nothing". A regression that silently flipped that
       # default, or dropped the cfg on these tests, would leak component

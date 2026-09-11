@@ -1064,7 +1064,8 @@ where it does not.
       bypassed by the tests that exist to check it.*
 
 - [x] **N8 — the ledger's safety mechanisms had no caller and no seam.**
-      Read-only half done. The audit found `audit_zero_sum`,
+      Done, and the endpoint is read-only permanently rather than
+      pending an auth story. The audit found `audit_zero_sum`,
       `audit_balances_match_entries`, `health`, `journal_depth`,
       `reconcile_now` and `drain_log_events` each correct, tested, and
       unreachable from a running server — `SimCtx` carries `world`,
@@ -1089,13 +1090,24 @@ where it does not.
       8 KiB of headers, 5 s IO timeout, 16 concurrent connections shed
       rather than queued, bodies never read.
 
-      **What it deliberately does not do.** There are no mutating routes,
-      so `reconcile_now` and `expire_reservations` *still have no caller* —
-      the page makes the backlog visible, not swept. Triggering either is a
-      privileged action on a socket and needs an authentication story this
-      does not have. `serve` takes the bind address as a required argument
-      rather than defaulting it; `loopback()` is the documented choice,
-      and a test asserts the bound address is loopback.
+      **It will never mutate anything — decided, not deferred.** An
+      endpoint that can act needs authentication, and the cheap answer (a
+      shared secret in an env var) is the kind of half-measure that invites
+      binding to `0.0.0.0` and calling it secured. A page that cannot act
+      needs no such story: the worst a reachable attacker gets is a read of
+      what the operator already sees. `mutating_methods_are_refused` pins
+      it. `serve` takes the bind address as a required argument rather than
+      defaulting it; `loopback()` is the documented choice, and a test
+      asserts the bound address is loopback.
+
+      **So maintenance lives on the game's tick**, authenticated by being
+      in-process, and the module now carries the worked example:
+      `expire_reservations` every tick, `audit_zero_sum` (and
+      `reconcile_now` on Postgres) on a cadence. That is the *only* route —
+      the page tells you the backlog is growing, `fixed_update` clears it.
+      Which means those two still have no caller **in the engine**, and
+      correctly so: the engine cannot know a game's cadence, and inventing
+      one would be the wrong default in both directions.
 
       *Two escapers, not one: HTML and JSON escape different character
       sets for different grammars, and merging them is how a value safe in

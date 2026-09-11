@@ -26,14 +26,67 @@
 //! # }
 //! ```
 //!
-//! # Read-only, and bound where you say
+//! # The other half: sweeping on the tick
 //!
-//! There are no mutating routes. `GET /` serves the page, `GET
-//! /api/status` serves the same data as JSON, and anything else is a 404;
-//! a `POST` gets a 405 explaining why. Triggering a reconciliation from
-//! here would be genuinely useful and is deliberately absent — that is a
-//! privileged action on a socket, and it needs an authentication story
-//! this does not have.
+//! The page reports the reservation backlog; it cannot clear it, and
+//! nothing else will either. `Ledger::available_at` filters every
+//! resident hold on every spend check — 3.2 µs at 500 holds, 1957 µs at
+//! 180,000 — so a server that never sweeps degrades silently for hours
+//! and then misses its tick budget all at once.
+//!
+//! One line in `fixed_update` is the whole remedy:
+//!
+//! ```no_run
+//! # #[cfg(feature = "admin")] {
+//! # use std::sync::{Arc, Mutex};
+//! # use void_engine::persist::ledger::Ledger;
+//! # use void_engine::{App, SimCtx};
+//! # struct Game { ledger: Arc<Mutex<Ledger>>, tick: u64 }
+//! impl App for Game {
+//!     fn init(&mut self, _ctx: &mut SimCtx) {}
+//!
+//!     fn fixed_update(&mut self, _ctx: &mut SimCtx) {
+//!         self.tick += 1;
+//!
+//!         // Reclaim lapsed holds. Cheap, and the only thing that stops
+//!         // the spend path degrading — `reservation_count()` on the
+//!         // status page is what tells you it is working.
+//!         let mut ledger = self.ledger.lock().unwrap();
+//!         ledger.expire_reservations(self.tick);
+//!
+//!         // The dupe audit is O(log), so run it on a cadence rather than
+//!         // every tick. Once a minute at 30 Hz:
+//!         if self.tick % 1800 == 0 && !ledger.audit_zero_sum().is_empty() {
+//!             log::error!("event=ledger_imbalance the books do not sum to zero");
+//!         }
+//!     }
+//! }
+//! # }
+//! ```
+//!
+//! A `PgLedger` adds `reconcile_now()` on the same cadence, which checks
+//! the *durable* log rather than the in-memory one. Both are engine calls
+//! a game makes; neither is reachable from this socket.
+//!
+//! # Read-only by design, not by omission
+//!
+//! **This endpoint will never mutate anything.** `GET /` serves the page,
+//! `GET /api/status` serves the same data as JSON, anything else is a
+//! 404, and every other method gets a 405 — pinned by
+//! `mutating_methods_are_refused` rather than left to prose.
+//!
+//! Triggering a reconciliation or a reservation sweep from here would be
+//! useful, and is refused on purpose. An admin endpoint that can act
+//! needs authentication, and the plausible cheap answer — a shared secret
+//! in an environment variable — is the kind of half-measure that invites
+//! someone to bind the thing to `0.0.0.0` and consider it secured. A page
+//! that cannot act needs no such story: the worst a reachable attacker
+//! gets is a read of what the operator already sees.
+//!
+//! So **maintenance belongs on the game's own tick**, where it is already
+//! authenticated by being in-process. That is the only route, and the
+//! example below is the shape it takes. The page's job is to tell you the
+//! backlog is growing; clearing it is `fixed_update`'s.
 //!
 //! [`serve`](crate::admin::serve) takes the bind address as a required
 //! argument and does not default it. [`loopback`](crate::admin::loopback)
