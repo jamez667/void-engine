@@ -72,6 +72,54 @@ jobs:
       - name: Clippy (replication)
         run: cargo clippy --all-targets --no-default-features --features replication -- -D warnings
 
+      # Intra-doc links, on every axis, for the same reason clippy runs on
+      # every axis: a link resolves or not depending on which modules the
+      # feature set compiled. One broken link sat in `net/mod.rs` from
+      # 7ac5124 pointing at `replication::`, which exists on the axis that
+      # gates it and nowhere else — a single-axis doc step would have
+      # missed it exactly as no doc step did.
+      #
+      # `RUSTDOCFLAGS: -D warnings` is load-bearing. Plain `cargo doc`
+      # exits 0 on a broken link (measured), so without it these steps
+      # would render HTML and report success while checking nothing.
+      #
+      # Every axis measures zero warnings as of 3413568, so this gate goes
+      # in green rather than needing a cleanup commit first.
+      - name: Doc links (default features)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Doc links (net)
+        run: cargo doc --no-deps --features net
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Doc links (headless)
+        run: cargo doc --no-deps --no-default-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Doc links (persist)
+        run: cargo doc --no-deps --no-default-features --features persist
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Doc links (ledger)
+        run: cargo doc --no-deps --no-default-features --features ledger
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Doc links (ledger-pg)
+        run: cargo doc --no-deps --no-default-features --features ledger-pg
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Doc links (replication)
+        run: cargo doc --no-deps --no-default-features --features replication
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Test (default features)
         run: cargo test --all-targets
 
