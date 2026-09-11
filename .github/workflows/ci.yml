@@ -117,8 +117,8 @@ jobs:
         run: |
           out=$(cargo test --lib --no-default-features --features replication replication 2>&1)
           echo "$out"
-          echo "$out" | grep -q "3 passed" || {
-            echo "expected 3 replication tests; the cfg gate may be wrong"
+          echo "$out" | grep -q "16 passed" || {
+            echo "expected 16 replication tests; the cfg gate may be wrong"
             exit 1
           }
 
