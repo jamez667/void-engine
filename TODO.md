@@ -622,6 +622,19 @@ unblocks the most downstream work.
       generated on demand. Give `SpatialGrid` `update`/`remove` so it stops
       reallocating every tick.
 
+      **`TileGrid` is load-bearing in void-claim, which has no in-tree
+      callers to warn you.** `void_sim::module::Module` and
+      `void_sim::station_interior::Floor` each hold one as a
+      `#[serde(skip)]` field and layer their own overlays on top, and
+      `tilemap_editor` calls `rotate_tiles` so authoring rotation cannot
+      drift from the runtime. A rewrite must preserve: `empty`,
+      `is_empty`, `width`, `height`, `tile_at`, `tile_at_glyphs`,
+      `rebuild_from_glyphs`, `as_slice`, `set`, and the free function
+      `rotate_tiles`. They use it as a value type through that surface
+      rather than reaching into it, so a chunk table behind the same
+      methods is viable; changing the methods is not. mini-miner-2 does
+      not use it at all.
+
       **The premise was wrong, and the real bottleneck is now fixed — but
       neither half of this entry's stated scope has been done.** No chunk
       table, no `update`/`remove`; the checkbox stays open.
@@ -682,6 +695,51 @@ unblocks the most downstream work.
 
       *A rewrite of the draw path, not an optimization pass. Independent of
       the server work and safely deferrable.*
+
+---
+
+## Downstream breakage owed
+
+The engine is kept clean in preference to backward compatibility, so a
+breaking change lands here and the consuming game is fixed after. This
+records what is currently owed, because nothing else does — neither repo
+is in this workspace and `cargo check` here will never notice.
+
+**mini-miner-2 is broken right now.** It depends on this repo by
+`path = "../../../void-engine"` (`crates/miner/Cargo.toml`, replacing a
+commented-out `rev = "2f42af6"`), so it breaks the moment a signature
+changes rather than on a deliberate bump. `eae5e61` gave `send_chunked`
+a fifth parameter and two call sites in `crates/miner/src/net/host.rs`
+still pass four:
+
+- **`host.rs:545`**, production. The call sits in `send_snapshot_datagrams`,
+  a free function invoked from a per-connection async loop (`host.rs:517`)
+  that owns `conn` until it closes. That loop is where a `ChunkHint`
+  should live — declared before it, threaded in — because a fresh hint
+  per snapshot compiles and reproduces the old behaviour while throwing
+  away the whole point of remembering capacity across sends.
+- **`host.rs:863`**, a test helper. A fresh `ChunkHint::new()` inline is
+  right here; the test wants the cold-start policy.
+
+No import change: `host.rs:30` already has
+`use void_engine::net::chunk::{self, QuinnSink}`.
+
+*Its tree had uncommitted `Cargo.toml` and `Cargo.lock` changes when this
+was written — the `path =` switch — so check what is in flight before
+editing.*
+
+**void-claim is not affected.** Worth stating because a substring search
+suggests otherwise: it has five files mentioning `send_chunked`, but that
+is its own `pub(crate) fn send_chunked(conn, msg)` in
+`crates/server/src/net.rs:21`, unrelated to the engine's. It uses no
+`ClientLink`, `KeyframeBudget` or `net::replication`; its `.plan(` hits
+are `drive_flight_plan`. Its only couplings to this engine are `TileGrid`
+(see R4) and one `query_circle` call in `npc.rs:97`, which `fd56689` left
+untouched — that commit changed `query_pairs` alone.
+
+It also tracks `branch = "main"` across four crates with a lockfile at
+`192232c`, 46 commits behind, so engine changes reach it on a
+`cargo update` rather than immediately.
 
 ---
 
