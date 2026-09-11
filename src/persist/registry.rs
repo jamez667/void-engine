@@ -84,12 +84,47 @@ impl Persist {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NameId(pub u16);
 
+/// Whether a component is sent to clients, and to which ones.
+///
+/// Deliberately separate from [`Persist`], which answers a different
+/// question. Durability and visibility look similar and are not: a
+/// particle is [`Persist::Transient`] — never worth saving — yet is
+/// precisely the sort of thing every nearby client must see, while a
+/// ledgered inventory is the most durable thing in the world and must
+/// reach *only* its owner. Deriving one from the other gets both of those
+/// backwards.
+///
+/// The default is [`Replicate::Never`]: a component reaches the network
+/// because someone said so, not because they forgot to say otherwise.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Replicate {
+    /// Server-side only. Never encoded into a snapshot for a client.
+    #[default]
+    Never,
+    /// Sent to every client that can see the entity, subject to
+    /// area-of-interest.
+    ToAll,
+    /// Sent only to the client that owns the entity. Inventory, currency,
+    /// quest state — things whose contents are an advantage if leaked to
+    /// anyone standing nearby.
+    ToOwner,
+}
+
+impl Replicate {
+    /// Whether this component reaches the wire at all.
+    pub fn on_the_wire(self) -> bool {
+        matches!(self, Replicate::ToAll | Replicate::ToOwner)
+    }
+}
+
 /// A component's registration.
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub name: &'static str,
     pub id: NameId,
     pub persist: Persist,
+    /// Who, if anyone, this component is replicated to. See [`Replicate`].
+    pub replicate: Replicate,
     /// Schema version for this component's encoding. Bump when the
     /// component's fields change shape; the load path runs migrations
     /// forward from the version recorded in the snapshot.
@@ -247,7 +282,7 @@ impl Registry {
         &mut self,
         name: &'static str,
     ) -> Result<NameId, RegistryError> {
-        self.insert_entry(name, Persist::Transient, 1, TypeId::of::<T>(), None)
+        self.insert_entry(name, Persist::Transient, Replicate::Never, 1, TypeId::of::<T>(), None)
     }
 
     /// [`register`] with an explicit schema version.
@@ -263,14 +298,76 @@ impl Registry {
             persist != Persist::Transient,
             "use register_transient for {name:?}: a Transient component needs no serde bounds",
         );
-        self.insert_entry(name, persist, version, TypeId::of::<T>(), Some(codec_for::<T>()))
+        self.insert_entry(
+            name, persist, Replicate::Never, version, TypeId::of::<T>(), Some(codec_for::<T>()),
+        )
     }
 
-    /// The shared body of both registration paths.
+    /// Register a component that is also sent to clients.
+    ///
+    /// A separate entry point rather than a parameter on [`register`] for
+    /// the same reason [`register_transient`] is one: the overwhelming
+    /// majority of components are server-side only, and making every call
+    /// site name a `Replicate` to say "no" is noise that obscures the few
+    /// that say yes.
+    ///
+    /// [`register`]: Registry::register
+    /// [`register_transient`]: Registry::register_transient
+    pub fn register_replicated<T: Send + Sync + Serialize + DeserializeOwned + 'static>(
+        &mut self,
+        name: &'static str,
+        persist: Persist,
+        replicate: Replicate,
+    ) -> Result<NameId, RegistryError> {
+        self.register_replicated_versioned::<T>(name, persist, replicate, 1)
+    }
+
+    /// [`register_replicated`] with an explicit schema version.
+    ///
+    /// [`register_replicated`]: Registry::register_replicated
+    pub fn register_replicated_versioned<
+        T: Send + Sync + Serialize + DeserializeOwned + 'static,
+    >(
+        &mut self,
+        name: &'static str,
+        persist: Persist,
+        replicate: Replicate,
+        version: u32,
+    ) -> Result<NameId, RegistryError> {
+        // A replicated component still needs an encoding, and `Transient`
+        // is the one class that has none. The pairing is legitimate —
+        // a particle is Transient and replicated — but it has to go
+        // through `register_replicated_transient`, which does not demand
+        // the serde bounds this path captures.
+        assert!(
+            persist != Persist::Transient,
+            "use register_replicated_transient for {name:?}: a Transient component needs no \
+             serde bounds",
+        );
+        self.insert_entry(
+            name, persist, replicate, version, TypeId::of::<T>(), Some(codec_for::<T>()),
+        )
+    }
+
+    /// Register a component that is replicated but never saved.
+    ///
+    /// The particle case: cosmetic, not worth a byte of disk, and still
+    /// something every nearby client must see. This is the pairing that
+    /// deriving replication from [`Persist`] would get wrong.
+    pub fn register_replicated_transient<T: Send + Sync + 'static>(
+        &mut self,
+        name: &'static str,
+        replicate: Replicate,
+    ) -> Result<NameId, RegistryError> {
+        self.insert_entry(name, Persist::Transient, replicate, 1, TypeId::of::<T>(), None)
+    }
+
+    /// The shared body of every registration path.
     fn insert_entry(
         &mut self,
         name: &'static str,
         persist: Persist,
+        replicate: Replicate,
         version: u32,
         type_id: TypeId,
         codec: Option<Codec>,
@@ -290,7 +387,7 @@ impl Registry {
         }
 
         let id = NameId(self.entries.len() as u16);
-        self.entries.push(Entry { name, id, persist, version, type_id, codec });
+        self.entries.push(Entry { name, id, persist, replicate, version, type_id, codec });
         self.by_name.insert(name, id);
         self.by_type.insert(type_id, id);
         Ok(id)
@@ -386,6 +483,93 @@ fn validate_name(name: &'static str) -> Result<(), RegistryError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod replicate_tests {
+    use super::*;
+
+    #[derive(Clone, Serialize, serde::Deserialize)]
+    struct Pos(f32);
+    #[derive(Clone, Serialize, serde::Deserialize)]
+    struct Purse(u64);
+    struct Spark;
+
+    /// Nothing reaches the network by accident.
+    #[test]
+    fn registration_defaults_to_never_replicated() {
+        let mut r = Registry::new();
+        r.register::<Pos>("pos", Persist::Volatile).unwrap();
+        r.register_transient::<Spark>("spark").unwrap();
+
+        assert_eq!(r.by_name("pos").unwrap().replicate, Replicate::Never);
+        assert_eq!(r.by_name("spark").unwrap().replicate, Replicate::Never);
+        assert!(!Replicate::Never.on_the_wire());
+    }
+
+    /// The pairing that deriving replication from `Persist` would get
+    /// wrong: never saved, always sent.
+    #[test]
+    fn a_transient_component_can_still_be_replicated() {
+        let mut r = Registry::new();
+        r.register_replicated_transient::<Spark>("spark", Replicate::ToAll).unwrap();
+
+        let e = r.by_name("spark").unwrap();
+        assert_eq!(e.persist, Persist::Transient, "a particle is not worth saving");
+        assert_eq!(e.replicate, Replicate::ToAll, "and is still worth sending");
+        assert!(!e.persist.in_checkpoint(), "durability and visibility are independent");
+        assert!(e.replicate.on_the_wire());
+    }
+
+    /// And the mirror case: the most durable thing in the world, visible
+    /// only to its owner.
+    #[test]
+    fn a_durable_component_can_be_owner_only() {
+        let mut r = Registry::new();
+        r.register_replicated::<Purse>("purse", Persist::Ledgered, Replicate::ToOwner).unwrap();
+
+        let e = r.by_name("purse").unwrap();
+        assert!(e.persist.in_checkpoint());
+        assert_eq!(e.replicate, Replicate::ToOwner);
+        assert!(e.replicate.on_the_wire(), "owner-only still reaches the wire");
+    }
+
+    /// A replicated component keeps its codec: replication needs an
+    /// encoding just as much as a checkpoint does.
+    #[test]
+    fn a_replicated_component_carries_a_codec() {
+        let mut r = Registry::new();
+        r.register_replicated::<Pos>("pos", Persist::Volatile, Replicate::ToAll).unwrap();
+        assert!(r.by_name("pos").unwrap().codec.is_some());
+
+        // ...except the transient path, which has none to give.
+        r.register_replicated_transient::<Spark>("spark", Replicate::ToAll).unwrap();
+        assert!(r.by_name("spark").unwrap().codec.is_none());
+    }
+
+    /// Ids stay registration-ordered regardless of which entry point was
+    /// used — replication interning depends on it.
+    #[test]
+    fn replicated_registrations_share_the_id_space() {
+        let mut r = Registry::new();
+        let a = r.register::<Pos>("pos", Persist::Volatile).unwrap();
+        let b = r.register_replicated_transient::<Spark>("spark", Replicate::ToAll).unwrap();
+        let c = r.register_replicated::<Purse>("purse", Persist::Ledgered, Replicate::ToOwner)
+            .unwrap();
+
+        assert_eq!((a, b, c), (NameId(0), NameId(1), NameId(2)));
+    }
+
+    /// Duplicate detection does not care which path registered first.
+    #[test]
+    fn a_replicated_registration_still_rejects_a_duplicate_name() {
+        let mut r = Registry::new();
+        r.register::<Pos>("thing", Persist::Volatile).unwrap();
+        let err = r
+            .register_replicated::<Purse>("thing", Persist::Volatile, Replicate::ToAll)
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::DuplicateName("thing")));
+    }
 }
 
 #[cfg(test)]

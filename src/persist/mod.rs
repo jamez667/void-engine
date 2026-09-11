@@ -51,7 +51,7 @@ pub use ledger::{
     Account, Amount, Asset, Discrepancy, Entry as LedgerEntry, IdemKey, Ledger, LedgerError,
     Receipt, ReservationId, TransferRequest,
 };
-pub use registry::{Codec, DecodedColumn, NameId, Persist, Registry, RegistryError};
+pub use registry::{Codec, DecodedColumn, NameId, Persist, Registry, RegistryError, Replicate};
 pub use snapshot::{
     capture, from_bytes, register_engine_components, restore, restore_rng, to_bytes,
     RngStreams, Snapshot, SnapshotError, FORMAT_VERSION,
