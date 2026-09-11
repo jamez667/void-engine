@@ -620,7 +620,39 @@ unblocks the most downstream work.
 - [ ] **R4 — Chunk the world; incremental broadphase.** Replace the flat
       `TileGrid` (`Vec<T>` of `w*h`) with a chunk table keyed by `Sector2D`,
       generated on demand. Give `SpatialGrid` `update`/`remove` so it stops
-      reallocating every tick (50k colliders = 26.4ms rebuild).
+      reallocating every tick.
+
+      **The premise was wrong, and the real bottleneck is now fixed — but
+      neither half of this entry's stated scope has been done.** No chunk
+      table, no `update`/`remove`; the checkbox stays open.
+
+      What was wrong: the rebuild this entry is built around was never the
+      bottleneck. The 26.4 ms it cites for 50k colliders measures 1.69 ms.
+      `query_pairs` was the cost, for a reason the entry does not mention —
+      it returned every pair sharing a cell with no distance test, and on a
+      mixed-radius world three quarters of those had bounding squares that
+      never touched. Rejecting them before the dedupe set (`fd56689`)
+      halved it: 67.6 ms to 33.0, 42.3 to 20.1, both now inside a 30 Hz
+      tick that neither previously fit.
+
+      So the *performance* case for an incremental broadphase is much
+      weaker than written, and whoever picks this up should re-justify it
+      on streaming and world size rather than on rebuild cost. The
+      `Relevancy` warning below still applies in full.
+
+      *A dense world still costs ~180 ms at 100k, and that one is not a
+      broadphase problem. It carries 9.6 overlaps per entity against a
+      narrow phase costing 1.45 ms — collision resolution has already
+      failed at that density, because no body resolves ten simultaneous
+      penetrations per tick. Realistic densities measure 1.3 and 0.3
+      overlaps per entity.*
+
+      *Measured and rejected on the way: sweep-and-prune (3–4x faster on
+      uniform radii, returns the **wrong pair set** once radii vary, and
+      swings 387x on collider orientation); size tiering (wins only at
+      the densest row, flat expensive cost elsewhere); per-partition or
+      per-cluster grids (84 ms against a 33.3 ms tick, so a caller cannot
+      work around this today).*
 
       **This breaks `net::replication::Relevancy`, by construction.** That
       type maps a grid index back to an `EntityId` by recording entities in
@@ -676,8 +708,10 @@ ECS drops to zero.**
 | Same workload over contiguous arrays | 0.39 ms/tick | 0.39 ms |
 | ECS query overhead factor | **2.8×** | 28.7× |
 | ECS `iter2`, 250k entities, 1 system | **0.43 ms/tick** | 2.73 ms |
-| Collision rebuild+query, 10k colliders | **1.76 ms/tick** | 5.1 ms |
+| Collision rebuild+query, 10k colliders | **3.68 ms/tick** | 5.1 ms |
 | Collision rebuild+query, 50k colliders | **9.33 ms/tick** | 26.4 ms claimed |
+| Collision, 10k on the *old* spacing-30 lattice | **1.76 ms/tick** | 5.07 ms |
+| `query_pairs`, 100k mixed radii over km | **33.0 ms/tick** | 67.6 ms |
 | A*, 256×256 open grid, corner-to-corner | 14.5 ms |
 | `size_of::<Vertex>()` | 84 bytes |
 | Text: 10-char nameplate | 864 verts / 72 KB |

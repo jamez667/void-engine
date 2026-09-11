@@ -159,6 +159,15 @@ impl SpatialGrid {
     /// where the cost sat: hashing 649k pairs measured 21.9 ms against
     /// 0.4 ms to sort them.
     ///
+    /// There is a density past which no cell size and no rejection help.
+    /// 100k colliders packed into 150-metre knots still costs ~180 ms,
+    /// and the shape of that is worth recognising before reaching for a
+    /// faster broad phase: the narrow phase over those pairs costs
+    /// 1.45 ms, and each collider overlaps 9.6 others. A body resolving
+    /// ten simultaneous penetrations every tick has a problem this layer
+    /// cannot fix. Worlds at 1.3 and 0.3 overlaps per collider measure
+    /// 33 ms and 21 ms for the same entity count.
+    ///
     /// The returned pairs are **broad-phase candidates** in the sense
     /// that a bounding square is not a shape: two overlapping squares
     /// may hold a circle and an oriented box that miss each other.
