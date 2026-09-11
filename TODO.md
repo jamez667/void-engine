@@ -1443,7 +1443,26 @@ fields, a different type whose `is_empty` was untouched. Its only
 buys them nothing without first holding the grid across ticks — an
 improvement to offer, not breakage owed.*
 
-**mini-miner-2 is broken right now.** It depends on this repo by
+**mini-miner-2 was broken and is now fixed** (2026-09-11), though the fix
+is *uncommitted in that repo* — its tree carries someone else's in-flight
+`Cargo.toml`/`Cargo.lock` work (the `path =` switch documented below), and
+staging `host.rs` would have swept that into the same commit. It builds
+and its 341 tests pass; committing is the owner's call.
+
+*The two errors turned out to be one break. `ChunkHint` went in as
+parameter 4, so the existing `&format_args!(...)` label slid into its slot
+— hence `expected ChunkHint, found Arguments` at `:553` alongside the
+missing-argument error at `:545`. One call site, two diagnostics.*
+
+*`ChunkHint` now lives in the send loop (`host.rs`, before the `loop` that
+owns `conn`) and is threaded into `send_snapshot_datagrams`, which is what
+the note below prescribed: a fresh hint per snapshot compiles and behaves
+correctly while discarding the capacity memory that is the whole point.
+The test helper takes `&mut ChunkHint::new()` inline, because those tests
+pin cold-start policy and a shared hint would let one test's discovery
+change another's behaviour.*
+
+**What the original breakage was.** It depends on this repo by
 `path = "../../../void-engine"` (`crates/miner/Cargo.toml`, replacing a
 commented-out `rev = "2f42af6"`), so it breaks the moment a signature
 changes rather than on a deliberate bump. `eae5e61` gave `send_chunked`
