@@ -698,28 +698,40 @@ unblocks the most downstream work.
       one was cited at the wrong line. Treat every number as a best case —
       pass submission is driver-bound and a weaker GPU punishes it harder.
 
-      **Text is the biggest win, and the entry under-sold it.** "72 KB per
-      nameplate" is a memory figure; the real cost is CPU. `draw_text`
-      emits one quad per *lit font pixel* (mean 20.8 set bits per glyph,
-      max 37), so 200 nameplates costs **9.8 ms** — 6.8 ms building the
-      batch, 3.0 ms uploading 16.7 MB — before a single draw call. 1000
-      costs 39.7 ms and 83.6 MB, more than two frames on its own.
-      One quad per glyph instead measures **23.7× fewer vertices and
-      22–76× faster batch building**: 200 nameplates drop to 0.150 ms and
-      180 KB.
+      **Text was the biggest win, and it is done.** The entry under-sold
+      it: "72 KB per nameplate" is a memory figure, and the real cost was
+      CPU. `draw_text` emitted one quad per *lit font pixel* (mean 20.8
+      set bits per glyph, max 37), so 200 nameplates cost **9.8 ms** —
+      6.8 building the batch, 3.0 uploading 16.7 MB — before a single draw
+      call, and 1000 cost 39.7 ms, more than two frames on their own.
 
-      The rewrite is unusually safe. `Vertex` already carries `uv`
-      (offset 8, location 1) and `shader.wgsl:505` already does
-      `textureSample(t_diffuse, s_diffuse, in.uv) * in.color`, with the
-      white 1×1 bound at group 1 in four places — so an atlas glyph is the
-      existing path with different UVs. No shader change, no vertex-layout
-      change. `text.rs` has no atlas or cache today and exposes five
-      functions; downstream calls only `draw_text` (177 + 22) and
-      `draw_text_centered` (142 + 6), and *never* the metric functions. The
-      contract to preserve is the geometry: 8 px glyph + 1 px spacing
-      (`(chars * 9 - 1) * scale`), `pos.y` as the row-0 baseline with
-      glyphs spanning `[pos.y - 7s, pos.y + s]`, and the `+3s` centring
-      offset. Change any of those and 347 call sites shift silently.
+      Each glyph is now one quad UV-mapped into a 128×128 atlas: 200
+      nameplates build in **0.153 ms** and 1000 in **1.34 ms**, with
+      vertex volume down from 208,800 to 8,800 at 200 plates. Measured
+      against the real implementation, which came in fractionally ahead of
+      the prototype that justified it.
+
+      It needed no shader or vertex-layout change. `Vertex` already
+      carried `uv` (offset 8, location 1) and `shader.wgsl:505` already
+      did `textureSample(t_diffuse, s_diffuse, in.uv) * in.color`, so a
+      glyph is that path with real UVs instead of all-`0.5`.
+
+      The atlas carries the white texel too, at its centre, which is why
+      nothing downstream moved. Every `Batch` primitive writes
+      `uv = [0.5, 0.5]`, the renderer binds one texture for the whole main
+      pass, and under `FilterMode::Nearest` a sample at 0.5 selects texel
+      `floor(0.5 × size)` — measured the same at every size tried, even
+      and odd alike, which killed an earlier plan to pad the atlas to an
+      odd dimension against a boundary ambiguity that does not exist.
+      Ninety-six glyphs fit exactly six rows of sixteen, filling `y < 48`
+      and leaving (64, 64) clear.
+
+      The metrics contract is preserved to the float and now has tests:
+      8 px glyph + 1 px spacing (`(chars * 9 - 1) * scale`), `pos.y` as
+      the row-0 baseline with glyphs spanning `[pos.y - 7s, pos.y + s]`,
+      and the `+3s` centring offset. Downstream calls only `draw_text`
+      (177 + 22) and `draw_text_centered` (142 + 6) and *never* the metric
+      functions, so all 347 sites are untouched.
 
       **The light cap is reachable and catastrophic at the cap.** The real
       site is `frame.rs:411`/`435`, not 382 — 382 is `shadow_raycast_pass`.
@@ -834,7 +846,7 @@ ECS drops to zero.**
 | A*, 256×256 open grid, corner-to-corner | 14.5 ms |
 | `size_of::<Vertex>()` | 84 bytes |
 | Text: 10-char nameplate | 864 verts / 72 KB |
-| Text: 200 nameplates, build + upload | **9.8 ms / 16.7 MB** | — |
-| Text: same, one quad per glyph | **0.15 ms / 180 KB** | 23.7× fewer verts |
+| Text: 200 nameplates, one quad per glyph | **0.153 ms / 8,800 verts** | 9.8 ms / 208,800 |
+| Text: 1000 nameplates | **1.34 ms / 44,000 verts** | 39.7 ms / 1,044,000 |
 | Lights: 384 × radius 1200 px | **25.1 ms/frame** | 152% of 16.6 ms |
 | Lights: 64 × radius 1200 px | 4.0 ms/frame | 24% |

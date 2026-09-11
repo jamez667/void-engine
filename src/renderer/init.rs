@@ -13,7 +13,6 @@
 use super::*;
 use super::lights::AMBIENT_CLEAR;
 
-const WHITE_PIXEL: &[u8] = &[255, 255, 255, 255];
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Self {
@@ -58,14 +57,24 @@ impl Renderer {
             }],
         });
 
-        // White 1x1 texture for colored primitives
+        // Glyph atlas, with a white texel reserved at its centre.
+        //
+        // This was a 1×1 white texture, and flat-coloured geometry still
+        // treats it as one: every `Batch` primitive writes `uv = [0.5,
+        // 0.5]`, which under nearest sampling selects the centre texel,
+        // which is white. Text draws from the same texture with real UVs
+        // instead of one quad per lit pixel. One bind serves both, so the
+        // main pass never switches bind groups and no call site changed.
+        //
+        // See `text::atlas_rgba` for the layout and why the glyphs leave
+        // the centre clear.
         let white_tex = gpu.device.create_texture_with_data(
             &gpu.queue,
             &wgpu::TextureDescriptor {
-                label: Some("white"),
+                label: Some("glyph_atlas"),
                 size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
+                    width: crate::text::ATLAS_SIZE,
+                    height: crate::text::ATLAS_SIZE,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -76,7 +85,7 @@ impl Renderer {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            WHITE_PIXEL,
+            &crate::text::atlas_rgba(),
         );
         let white_view = white_tex.create_view(&Default::default());
         let white_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
