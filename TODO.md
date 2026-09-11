@@ -688,13 +688,74 @@ unblocks the most downstream work.
 
 - [ ] **R5 — Rebuild the client draw path.** Instancing (every draw is
       currently `0..1`), texture atlas or `D2Array` (one 1×1 white pixel
-      exists today), SDF glyph atlas (text is one quad per lit font pixel —
-      72KB per 10-char nameplate), depth buffer or explicit layer sort, and a
-      single clustered light pass (`frame.rs:382` opens a fullscreen pass
-      *per light*, `MAX_LIGHTS_PER_FRAME = 384`).
+      exists today), SDF glyph atlas, depth buffer or explicit layer sort,
+      and a single clustered light pass (`MAX_LIGHTS_PER_FRAME = 384`).
 
       *A rewrite of the draw path, not an optimization pass. Independent of
       the server work and safely deferrable.*
+
+      **Measured, 2026-09-11, RTX 3080 Ti at 1080p.** All five claims hold;
+      one was cited at the wrong line. Treat every number as a best case —
+      pass submission is driver-bound and a weaker GPU punishes it harder.
+
+      **Text is the biggest win, and the entry under-sold it.** "72 KB per
+      nameplate" is a memory figure; the real cost is CPU. `draw_text`
+      emits one quad per *lit font pixel* (mean 20.8 set bits per glyph,
+      max 37), so 200 nameplates costs **9.8 ms** — 6.8 ms building the
+      batch, 3.0 ms uploading 16.7 MB — before a single draw call. 1000
+      costs 39.7 ms and 83.6 MB, more than two frames on its own.
+      One quad per glyph instead measures **23.7× fewer vertices and
+      22–76× faster batch building**: 200 nameplates drop to 0.150 ms and
+      180 KB.
+
+      The rewrite is unusually safe. `Vertex` already carries `uv`
+      (offset 8, location 1) and `shader.wgsl:505` already does
+      `textureSample(t_diffuse, s_diffuse, in.uv) * in.color`, with the
+      white 1×1 bound at group 1 in four places — so an atlas glyph is the
+      existing path with different UVs. No shader change, no vertex-layout
+      change. `text.rs` has no atlas or cache today and exposes five
+      functions; downstream calls only `draw_text` (177 + 22) and
+      `draw_text_centered` (142 + 6), and *never* the metric functions. The
+      contract to preserve is the geometry: 8 px glyph + 1 px spacing
+      (`(chars * 9 - 1) * scale`), `pos.y` as the row-0 baseline with
+      glyphs spanning `[pos.y - 7s, pos.y + s]`, and the `+3s` centring
+      offset. Change any of those and 347 call sites shift silently.
+
+      **The light cap is reachable and catastrophic at the cap.** The real
+      site is `frame.rs:411`/`435`, not 382 — 382 is `shadow_raycast_pass`.
+      `for i in 1..lights` opens a fresh render pass per light, each a
+      fullscreen triangle running up to `LIGHT_TAPS = 12` raycast samples
+      per covered pixel, early-outing past `radius_px`:
+
+      | lights | radius | ms | frame at 60 Hz |
+      | --- | --- | --- | --- |
+      | 384 | 1200 px | **25.1 ms** | **152%** |
+      | 384 | 400 px | 11.9 ms | 72% |
+      | 384 | 120 px | 7.6 ms | 46% |
+      | 64 | 1200 px | 4.0 ms | 24% |
+
+      Cost is area-proportional, so the 25 ms case needs 384 large
+      overlapping lights. A plausible interior at 64 lights stays under
+      4 ms, which matches the note at `mod.rs:275` that the on-foot
+      lattice fits comfortably. *Measured first with a constant-colour
+      fragment, which gave 5.3 ms at 384 and made the claim look weak —
+      that measured submission overhead alone. The march is the cost.*
+
+      **Instancing and the missing depth buffer are confirmed but
+      unquantified.** All 14 draw calls are `0..1`; every
+      `depth_stencil_attachment` is `None` and no pipeline sets
+      `depth_stencil: Some`, so ordering is painter's-algorithm only. The
+      main pass already splits `draw_indexed` into ranges around composite
+      points (`frame.rs:588`), which is the structure instancing has to
+      preserve.
+
+      *Downstream surface, the same constraint `TileGrid` has: roughly
+      2,100 `Batch` primitive call sites across void-claim and
+      mini-miner-2 (638 `rect`, 581 `line`, 351 `draw_text` in void-claim
+      alone) and **zero** `push_quad` in either. Both games go entirely
+      through the high-level primitives, so replacing `Batch`'s internals
+      behind the same methods moves no call site — and changing those
+      methods breaks two shipped games.*
 
 ---
 
@@ -773,3 +834,7 @@ ECS drops to zero.**
 | A*, 256×256 open grid, corner-to-corner | 14.5 ms |
 | `size_of::<Vertex>()` | 84 bytes |
 | Text: 10-char nameplate | 864 verts / 72 KB |
+| Text: 200 nameplates, build + upload | **9.8 ms / 16.7 MB** | — |
+| Text: same, one quad per glyph | **0.15 ms / 180 KB** | 23.7× fewer verts |
+| Lights: 384 × radius 1200 px | **25.1 ms/frame** | 152% of 16.6 ms |
+| Lights: 64 × radius 1200 px | 4.0 ms/frame | 24% |
