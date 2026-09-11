@@ -1009,6 +1009,23 @@ the atlas rather than switching bind groups mid-pass — worth knowing
 before the next draw-path change, because the same reasoning applies to
 instancing.*
 
+*Checked after `91da883`: `SpatialGrid` gained `clear`/`remove`/`update`
+and **`len()` changed meaning** — it now counts live colliders, where it
+used to return `bounds.len()`, which is the index space. With holes those
+differ. Nothing downstream notices, and the reason is worth recording so
+it is not re-derived: void-claim's nine `self.grid.is_empty()` calls
+(`module.rs`, `station_interior/floor.rs`) are all on `TileGrid<TileKind>`
+fields, a different type whose `is_empty` was untouched. Its only
+`SpatialGrid` field is `npc.rs:78`, which calls `query_circle` and never
+`len`/`is_empty`; its other two grids (`collision.rs:142`,
+`projectile.rs:144`) are fresh locals. mini-miner-2 does not use
+`SpatialGrid` at all. Anything sized per-slot wants the new
+`slot_count()`, not `len()`.*
+
+*Those three void-claim grids are all built fresh per call, so `clear()`
+buys them nothing without first holding the grid across ticks — an
+improvement to offer, not breakage owed.*
+
 **mini-miner-2 is broken right now.** It depends on this repo by
 `path = "../../../void-engine"` (`crates/miner/Cargo.toml`, replacing a
 commented-out `rev = "2f42af6"`), so it breaks the moment a signature
