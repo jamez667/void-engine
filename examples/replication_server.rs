@@ -405,8 +405,20 @@ fn net_thread(
             // arrives as its own uni stream carrying one framed message.
             // Ends when `accept_uni` errors, which is how a closed
             // connection reports itself.
+            // A peer that opens a stream and then sends nothing would park
+            // this loop forever, and because the loop is sequential that
+            // starves every later ack on the connection. `read_msg` cannot
+            // hold a clock — it is generic over any `AsyncRead` — so the
+            // bound belongs here, where the protocol is known: four bytes
+            // is not worth five seconds.
+            const ACK_DEADLINE: Duration = Duration::from_secs(5);
             while let Ok(mut recv) = conn.accept_uni().await {
-                match void_engine::net::framing::read_msg(&mut recv, MAX_ACK_BYTES).await {
+                let read = void_engine::net::framing::read_msg(&mut recv, MAX_ACK_BYTES);
+                let Ok(framed) = tokio::time::timeout(ACK_DEADLINE, read).await else {
+                    eprintln!("ack stream opened and sent nothing within {ACK_DEADLINE:?}");
+                    continue;
+                };
+                match framed {
                     Ok(bytes) => match Ack::decode(&bytes) {
                         Some(ack) => {
                             // Monotonic: an older ack carries no

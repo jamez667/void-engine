@@ -1281,13 +1281,91 @@ where it does not.
       money half is true and verified. The memory half was wrong in kind,
       not degree: it is a time leak on the spend path. Both corrected.*
 
-- [ ] **N6 — no timeout on the ack read path.** REASONED, not tested.
-      `read_msg` awaits `read_exact` on the 4-byte prefix with no timeout
-      (`framing.rs:46-62`), and the example accepts uni streams
-      sequentially (`replication_server.rs:382`). A client that opens a
-      stream and sends nothing parks that connection's ack loop forever.
-      Per-connection rather than server-wide, and quinn's stream limits
-      bound the rest — but it is a hazard in the driver games will copy.
+- [x] **N6 — no timeout on the ack read path.** Fixed at the caller, and
+      documented as a property of `read_msg` rather than a bug in it.
+
+      `read_msg` is generic over any `AsyncRead` and cannot hold a clock —
+      a timer there would drag a tokio timer feature onto every caller,
+      including the tests that drive it over an in-memory buffer with no
+      runtime. A control channel idle for an hour is also not an error, so
+      the deadline is a per-protocol fact exactly like `max_len`. Its docs
+      now say so explicitly, with the `tokio::time::timeout` shape.
+
+      The reference driver imposes the bound: five seconds for four bytes
+      (`replication_server.rs`). Without it a peer that opens a uni stream
+      and says nothing parks the sequential accept loop, starving every
+      later ack on that connection.
+
+      *`net` gains `tokio/time`. The base pin was `io-util` only, so the
+      one thing a netcode consumer needed to defend this path was
+      available solely to a build that also pulled `ledger-pg` — unrelated
+      and absurd. One timer, and the driver can show the right shape.*
+
+- [x] **N9 — `ledger_pg.rs` had no test module at all.** 776 lines of
+      writer thread, retry policy, reconnect and replay, reachable only
+      through Postgres-gated integration tests that skip without
+      `VOID_ENGINE_PG_URL`. On a developer machine `cargo test` reported
+      green while exercising none of it, and the `ledger-pg` CI axis —
+      which runs without a database — proved only that it compiles.
+
+      `is_transient` is the piece worth rescuing: it decides whether a
+      fault retries or kills the ledger, and it is wrong in both
+      directions expensively — a fatal fault retried hangs with writes
+      refused, a transient one called fatal turns a three-second failover
+      into an outage needing a restart. It took a
+      `tokio_postgres::Error`, which has no public constructor, so the
+      decision was untestable. Split into `is_fatal_code(&SqlState)`,
+      which is a pure function over a constructible type, with four tests:
+      the fatal set, the transient set, the unlisted-code default, and
+      that the two sets do not overlap.
+
+      *Unlisted codes default to **retryable**, deliberately: the fatal
+      set is small and well understood, and an unknown SQLSTATE is far
+      likelier to be an availability blip than a permanent schema fault.*
+
+      *Three constants I used did not exist — I wrote `SERIALIZATION_FAILURE`
+      and `DEADLOCK_DETECTED` from the shape of the API. The crate prefixes
+      class-40 codes `T_R_`. Verified all sixteen names against
+      `sqlstate.rs` in the registry rather than trusting the compiler's
+      "similar name" suggestion, which is the same shortcut that produced
+      the bad names.*
+
+      *`replay_into` stays untested: it takes `&[tokio_postgres::Row]`,
+      equally unconstructible, and extracting a testable core would mean
+      inventing an intermediate row type whose only purpose is the test.
+      Recorded rather than done.*
+
+- [x] **N10 — `available_at` scanned every resident hold.** Indexed.
+      Two `HashMap`s beside `reservations`: a total per `(account, asset)`,
+      and holds grouped by deadline in a `BTreeMap` so the lapsed portion
+      is a range query rather than a filter. Maintained at all four
+      mutation sites — reserve, spend, release, sweep.
+
+      | holds | old scan | indexed |
+      | --- | --- | --- |
+      | 500, shared deadline | 3.2 µs | 0.2 µs |
+      | 180,000, shared deadline | 1957 µs | 0.2 µs |
+      | 50,000, distinct deadlines | ~335 µs | 48 µs |
+      | 180,000, distinct deadlines | 1957 µs | **220 µs** |
+
+      **The honest row is the last one.** A real server takes holds on
+      different ticks, so they expire on different ticks, and the range
+      walks one entry per distinct deadline below `now` — 9x better, not
+      constant time. Sixteen spend checks still cost 3.5 ms at 180k.
+      `expire_reservations` on the tick is what actually bounds this; the
+      index buys headroom, not immunity.
+
+      *Which corrects N7's note that the scan needed "index by account, or
+      keep a per-account running total". A per-account total alone is
+      exactly wrong: lapsed holds must stop counting the instant their
+      deadline passes, and a precomputed total cannot know that. The
+      deadline grouping is the part that makes the total usable.*
+
+      *Four tests, because a parallel total that drifts from the holds it
+      summarises is a dupe vector in both directions — too low lets a
+      player spend reserved funds twice, too high locks money that was
+      released. One walks a sequence of reserve/spend/release/sweep
+      operations asserting the index equals a full scan after every step.*
 
 ### Measured and deliberately NOT fixed
 

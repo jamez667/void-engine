@@ -145,7 +145,14 @@ admin = ["ledger"]
 # consumers take the engine without this and the `net` module vanishes
 # entirely. Off by default because most games built on this engine are
 # single-player; multiplayer ones opt in with `features = ["net"]`.
-net = ["dep:tokio", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
+# `tokio/time` beyond the base `io-util` pin: `framing::read_msg` waits
+# forever by design (it is generic over any `AsyncRead` and cannot hold a
+# clock), so a server reading from an untrusted peer must bound it itself.
+# Without a timer in this feature set the only caller that can is one
+# already pulling `ledger-pg`, which is unrelated — so a netcode consumer
+# had no way to defend the ack path. One timer, and the reference driver
+# can show the right shape.
+net = ["dep:tokio", "tokio/time", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
 
 # Interest-managed replication: per-client area-of-interest, baseline+delta
 # snapshots, and the wire encoding for both.

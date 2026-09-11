@@ -427,25 +427,45 @@ fn account_parts(a: &Account) -> (&'static str, String) {
 /// opposite: retrying `UNDEFINED_TABLE` forever accomplishes nothing and
 /// hides a real problem behind an infinite loop.
 fn is_transient(e: &tokio_postgres::Error) -> bool {
-    use tokio_postgres::error::SqlState;
     match e.as_db_error() {
         // The server answered, so the connection is fine and the
-        // *statement* is wrong. Schema and constraint faults will fail
-        // identically forever.
-        Some(db) => !matches!(
-            *db.code(),
-            SqlState::UNIQUE_VIOLATION
-                | SqlState::CHECK_VIOLATION
-                | SqlState::NOT_NULL_VIOLATION
-                | SqlState::FOREIGN_KEY_VIOLATION
-                | SqlState::UNDEFINED_TABLE
-                | SqlState::UNDEFINED_COLUMN
-                | SqlState::DATATYPE_MISMATCH
-        ),
+        // *statement* is wrong.
+        Some(db) => !is_fatal_code(db.code()),
         // No `DbError` means the server never answered: a closed socket, a
         // timeout, a TLS fault. Worth another attempt.
         None => true,
     }
+}
+
+/// Is this SQLSTATE one that will fail identically forever?
+///
+/// Split out from [`is_transient`] so it can be tested. A
+/// `tokio_postgres::Error` has no public constructor and neither does
+/// `DbError`, so the classifier was reachable only through a live
+/// database — which meant the one decision that separates "retry a
+/// three-second failover" from "hang forever on a broken schema" was
+/// covered only by tests that skip without `VOID_ENGINE_PG_URL`. A
+/// `SqlState` *is* constructible, so this half is testable everywhere.
+///
+/// Getting it wrong is expensive in both directions: a fatal fault
+/// classified transient retries until `max_retries` while writes are
+/// refused, and a transient fault classified fatal turns a routine
+/// failover into an outage needing a restart.
+fn is_fatal_code(code: &tokio_postgres::error::SqlState) -> bool {
+    use tokio_postgres::error::SqlState;
+    matches!(
+        *code,
+        // Constraint violations: the data is wrong, not the connection.
+        SqlState::UNIQUE_VIOLATION
+            | SqlState::CHECK_VIOLATION
+            | SqlState::NOT_NULL_VIOLATION
+            | SqlState::FOREIGN_KEY_VIOLATION
+            // Schema faults: retrying `UNDEFINED_TABLE` forever hides a
+            // missing migration behind an infinite loop.
+            | SqlState::UNDEFINED_TABLE
+            | SqlState::UNDEFINED_COLUMN
+            | SqlState::DATATYPE_MISMATCH
+    )
 }
 
 /// Drain the journal into Postgres, retrying transient faults.
@@ -772,5 +792,100 @@ impl LedgerStore for PgLedger {
             };
             StoredReceipt { receipt, durability }
         })
+    }
+}
+
+/// Unit tests for the parts that need no database.
+///
+/// This file had **no test module at all** before these: 776 lines of
+/// writer thread, retry policy, reconnect and replay, reachable only
+/// through `tests/ledger_pg.rs` and `tests/ledger_outage.rs`, which skip
+/// themselves without `VOID_ENGINE_PG_URL`. So on a developer machine
+/// `cargo test` reported green while exercising none of it, and the
+/// `ledger-pg` CI axis — which runs without a database — proved only that
+/// the module compiles.
+///
+/// `is_fatal_code` is the piece worth rescuing from that: it is a pure
+/// function over a `SqlState`, it decides whether a fault retries or
+/// kills the ledger, and being wrong in either direction is expensive.
+#[cfg(test)]
+mod classifier_tests {
+    use super::is_fatal_code;
+    use tokio_postgres::error::SqlState;
+
+    /// Retrying these accomplishes nothing: the statement, not the
+    /// connection, is wrong, and it fails identically forever.
+    #[test]
+    fn schema_and_constraint_faults_are_fatal() {
+        for code in [
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::CHECK_VIOLATION,
+            SqlState::NOT_NULL_VIOLATION,
+            SqlState::FOREIGN_KEY_VIOLATION,
+            SqlState::UNDEFINED_TABLE,
+            SqlState::UNDEFINED_COLUMN,
+            SqlState::DATATYPE_MISMATCH,
+        ] {
+            assert!(is_fatal_code(&code), "{code:?} must not be retried forever");
+        }
+    }
+
+    /// The routine faults. Classifying any of these fatal turns a
+    /// three-second failover into an outage that needs an operator.
+    #[test]
+    fn connection_and_availability_faults_are_retryable() {
+        for code in [
+            SqlState::CONNECTION_EXCEPTION,
+            SqlState::CONNECTION_DOES_NOT_EXIST,
+            SqlState::CONNECTION_FAILURE,
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::TOO_MANY_CONNECTIONS,
+            // Class 40, transaction rollback — the crate prefixes these
+            // `T_R_`. Both are the textbook retryable faults: the whole
+            // point of a serialization failure is that re-running the
+            // transaction is expected to succeed.
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+            SqlState::QUERY_CANCELED,
+            SqlState::LOCK_NOT_AVAILABLE,
+        ] {
+            assert!(!is_fatal_code(&code), "{code:?} is transient and must be retried");
+        }
+    }
+
+    /// An unrecognised code defaults to retryable, deliberately: the
+    /// fatal set is small and well understood, and an unknown SQLSTATE is
+    /// far likelier to be an availability blip than a permanent schema
+    /// fault. Failing closed would turn every novel transient error into
+    /// a shard needing a restart.
+    #[test]
+    fn an_unlisted_code_defaults_to_retryable() {
+        assert!(!is_fatal_code(&SqlState::from_code("XX000")));
+        assert!(!is_fatal_code(&SqlState::IO_ERROR));
+    }
+
+    /// The two halves must partition: nothing may be both, and the fatal
+    /// set must not have quietly swallowed a transient code through a
+    /// copy-paste in the `matches!` arm.
+    #[test]
+    fn the_two_sets_do_not_overlap() {
+        let fatal = [
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::UNDEFINED_TABLE,
+            SqlState::DATATYPE_MISMATCH,
+        ];
+        let transient = [
+            SqlState::CONNECTION_FAILURE,
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::T_R_SERIALIZATION_FAILURE,
+        ];
+        for f in &fatal {
+            assert!(is_fatal_code(f));
+            assert!(!transient.contains(f), "{f:?} is listed in both sets");
+        }
+        for t in &transient {
+            assert!(!is_fatal_code(t));
+        }
     }
 }

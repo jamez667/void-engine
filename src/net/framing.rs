@@ -43,6 +43,30 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> std:
 /// An over-cap frame returns `InvalidData` and the stream is left
 /// mid-frame — it is not resynchronisable, so callers should treat this
 /// as fatal for the connection and close it.
+///
+/// # This waits forever, on purpose
+///
+/// There is no timeout here and there cannot usefully be one: this is
+/// generic over any `AsyncRead`, and a timer would drag a tokio timer
+/// feature onto every caller — including tests that drive it over an
+/// in-memory buffer with no runtime at all. A control channel that is
+/// legitimately idle for an hour is also not an error, so the right
+/// deadline is a per-protocol fact, exactly like `max_len`.
+///
+/// **A peer that opens a stream and then says nothing will park this
+/// future indefinitely.** On a sequential accept loop that parks the
+/// whole loop, so every later message from that connection is starved by
+/// one silent stream. Callers reading from an untrusted peer must impose
+/// their own bound:
+///
+/// ```ignore
+/// // Five seconds to send a 4-byte ack, or the stream is abandoned.
+/// match tokio::time::timeout(Duration::from_secs(5), read_msg(&mut recv, MAX_ACK_BYTES)).await {
+///     Ok(Ok(bytes)) => handle(bytes),
+///     Ok(Err(e))    => log::debug!("malformed frame: {e}"),
+///     Err(_elapsed) => log::debug!("peer opened a stream and sent nothing"),
+/// }
+/// ```
 pub async fn read_msg<R: AsyncReadExt + Unpin>(
     r: &mut R,
     max_len: usize,
