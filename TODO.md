@@ -617,13 +617,16 @@ unblocks the most downstream work.
       axis: `--features net` builds with persist *off* today, so a `net`-only
       gate referencing `persist::registry` would fail that existing job.
 
-- [ ] **R4 — Chunk the world; incremental broadphase.** Replace the flat
-      `TileGrid` (`Vec<T>` of `w*h`) with a chunk table keyed by `Sector2D`,
-      generated on demand. Give `SpatialGrid` `update`/`remove` so it stops
-      reallocating every tick.
+- [ ] **R4 — Incremental broadphase.** Give `SpatialGrid` `update`/`remove`
+      so it stops reallocating every tick. ~~Chunk the world~~ — the
+      `TileGrid` half is dropped; it holds authored rooms of a few thousand
+      cells, not a world. Both halves are measured below.
 
       **`TileGrid` is load-bearing in void-claim, which has no in-tree
-      callers to warn you.** `void_sim::module::Module` and
+      callers to warn you.** *Kept as a standing hazard note, not as
+      pending work: no `TileGrid` rewrite is planned, and this is what
+      would constrain one if a later change reaches for it.*
+      `void_sim::module::Module` and
       `void_sim::station_interior::Floor` each hold one as a
       `#[serde(skip)]` field and layer their own overlays on top, and
       `tilemap_editor` calls `rotate_tiles` so authoring rotation cannot
@@ -635,9 +638,34 @@ unblocks the most downstream work.
       methods is viable; changing the methods is not. mini-miner-2 does
       not use it at all.
 
-      **The premise was wrong, and the real bottleneck is now fixed — but
-      neither half of this entry's stated scope has been done.** No chunk
-      table, no `update`/`remove`; the checkbox stays open.
+      **The two halves of this entry have opposite fates. Measured.**
+      The chunk table should not be built; `update`/`remove` should, and
+      the checkbox stays open for that half alone.
+
+      **The chunk table has no world to chunk.** `TileGrid` never holds a
+      world — it holds hand-authored room interiors, one JSON file each.
+      void-claim's largest is the lobby at 55 rows × 40 cols = **2,200
+      cells**; `apartment_with_window` is 96 and `elevator` is 16. A
+      `Vec<T>` of 2,200 is a few kilobytes. Keying that by `Sector2D` and
+      generating it on demand is more machinery than the data it holds,
+      and the content already streams by being separate files that load
+      per module. mini-miner-2 does not use `TileGrid` at all.
+
+      *The "generated on demand" framing assumed a world-sized grid. The
+      terrain note below is the tell — the thing that genuinely wants
+      streaming is the noise field, which is not a `TileGrid` and is
+      already pure `f(position, seed)`. Reopen only if a game authors a
+      single grid large enough that `w*h` allocation shows in a profile;
+      at 2,200 cells it cannot.*
+
+      **`update`/`remove` is real and has live callers to break.** There
+      is no `clear()` on `SpatialGrid`, so "rebuild every tick" means a
+      fresh allocation every tick, and both in-tree drivers do exactly
+      that — `examples/replication_server.rs:201` and
+      `tests/replication_e2e.rs:149` each assign
+      `self.grid = SpatialGrid::new(CELL)` per tick. That is the honest
+      case for incremental update, and it is a modest one: 4.7 ms of
+      rebuild against ~50 ms of queries at 100k.
 
       What was wrong: the rebuild this entry is built around was never the
       bottleneck. The 26.4 ms it cites for 50k colliders measures 1.69 ms.
@@ -649,9 +677,14 @@ unblocks the most downstream work.
       tick that neither previously fit.
 
       So the *performance* case for an incremental broadphase is much
-      weaker than written, and whoever picks this up should re-justify it
-      on streaming and world size rather than on rebuild cost. The
-      `Relevancy` warning below still applies in full.
+      weaker than written. An earlier revision of this line said to
+      re-justify it "on streaming and world size rather than on rebuild
+      cost" — both of those are now measured dead too: the grids are
+      authored rooms, and the thing that wants streaming is the noise
+      field, which is not a `TileGrid`. What survives is the narrower case
+      above: a fresh allocation every tick at two live call sites, for a
+      structure with no `clear()`. The `Relevancy` warning below still
+      applies in full.
 
       *A dense world still costs ~180 ms at 100k, and that one is not a
       broadphase problem. It carries 9.6 overlaps per entity against a
@@ -677,11 +710,12 @@ unblocks the most downstream work.
       which before writing the incremental path, not after: the failure mode
       is a client being told about the wrong entity, which no type checks.
 
-      *Measured while building R3: the rebuild itself is not the bottleneck
-      it looks like. At 100k colliders a full rebuild is 4.7 ms against
-      ~50 ms of per-client queries, so incremental update is worth doing for
-      the tile grid and for larger worlds, but it does not unblock
-      replication and should not be justified on that basis.*
+      *Measured while building R3: the rebuild is not the bottleneck it
+      looks like — the 4.7 ms against ~50 ms of queries cited above. It
+      does not unblock replication and must not be justified on that
+      basis. An earlier revision added "worth doing for the tile grid and
+      for larger worlds"; the tile-grid half is dropped, and no larger
+      world exists to point at.*
 
       *The terrain noise is already pure `f(position, seed)` and streams
       perfectly. It is held back by the container, not its own design.*
