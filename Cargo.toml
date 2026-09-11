@@ -131,6 +131,21 @@ ledger-pg = [
 # single-player; multiplayer ones opt in with `features = ["net"]`.
 net = ["dep:tokio", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
 
+# Interest-managed replication: per-client area-of-interest, baseline+delta
+# snapshots, and the wire encoding for both.
+#
+# Implies `net` for the transport and `persist` for the component registry —
+# replication names components on the wire by their registry `NameId`, which
+# is the same two-byte interning a save file uses, and inventing a second
+# naming scheme for the network would be the one way to let a save file and
+# a packet disagree about what a component is.
+#
+# Separate from `net` rather than folded into it because the transport
+# primitives stand alone: a game doing its own replication over `chunk` and
+# `quic` should not be made to compile the registry and an encoder it will
+# not call.
+replication = ["net", "persist"]
+
 [workspace]
 # Standalone crate: an empty workspace table stops Cargo walking up to a
 # parent workspace if this repo is ever checked out inside one.

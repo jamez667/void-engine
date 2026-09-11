@@ -20,8 +20,17 @@
 //! dropping a world-state item. All three are lifted from a shipped
 //! authoritative-server game and generalised — none of them knows what a
 //! snapshot, an entity or a tick is.
+//!
+//! [`replication`] is the exception, and is gated on its own feature for
+//! exactly that reason: deciding what each client should see means knowing
+//! about entities, components and ticks. Keeping it behind
+//! `replication = ["net", "persist"]` leaves the primitives above usable by
+//! a game that wants to write its own, which is why they were generalised
+//! in the first place.
 
 pub mod chunk;
 pub mod framing;
 pub mod interp;
 pub mod quic;
+#[cfg(feature = "replication")]
+pub mod replication;

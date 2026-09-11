@@ -65,6 +65,13 @@ jobs:
       - name: Clippy (ledger-pg)
         run: cargo clippy --all-targets --no-default-features --features ledger-pg -- -D warnings
 
+      # `replication` is the only axis where `net` and `persist` are on
+      # together. Neither of their own axes compiles this module: `net`
+      # builds with persist *off*, and `persist` has no netcode. Without
+      # this step it is unchecked.
+      - name: Clippy (replication)
+        run: cargo clippy --all-targets --no-default-features --features replication -- -D warnings
+
       - name: Test (default features)
         run: cargo test --all-targets
 
@@ -85,6 +92,22 @@ jobs:
       # The database-backed run is the `ledger-pg` job below.
       - name: Test (ledger-pg, no database)
         run: cargo test --all-targets --no-default-features --features ledger-pg
+
+      - name: Test (replication)
+        run: cargo test --all-targets --no-default-features --features replication
+
+      # The replication module lives behind a two-feature gate, which is a
+      # new shape in this tree and an easy one to get subtly wrong: with a
+      # bad `cfg` it simply vanishes and every step above still passes.
+      # Assert the count, the same way the persist-only suites do.
+      - name: Replication actually ran
+        run: |
+          out=$(cargo test --lib --no-default-features --features replication replication 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "3 passed" || {
+            echo "expected 3 replication tests; the cfg gate may be wrong"
+            exit 1
+          }
 
       # Phase 1 and 2's exit criteria both live only on this axis: without
       # `persist` these files compile to empty binaries. Asserting the
