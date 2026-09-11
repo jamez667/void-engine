@@ -515,9 +515,11 @@ unblocks the most downstream work.
       retention policy; a reconciliation mismatch must page a human, not
       append to a log nobody reads.*
 
-- [ ] **R3 — Replication with interest management.** Per-client AoI query →
+- [x] **R3 — Replication with interest management.** Per-client AoI query →
       relevancy set → baseline+delta snapshot → quantized, bit-packed encode →
-      the existing `net/chunk.rs` `send_chunked`.
+      the existing `net/chunk.rs` `send_chunked`. **Engine side complete**;
+      what remains is a game driving it from a socket, which is deliberately
+      the game's to own — see *Left* below.
 
       *Without AoI, per-client bandwidth is O(world entities) — the hard wall
       between a session game and an MMO.*
@@ -602,6 +604,22 @@ unblocks the most downstream work.
       `TileGrid` (`Vec<T>` of `w*h`) with a chunk table keyed by `Sector2D`,
       generated on demand. Give `SpatialGrid` `update`/`remove` so it stops
       reallocating every tick (50k colliders = 26.4ms rebuild).
+
+      **This breaks `net::replication::Relevancy`, by construction.** That
+      type maps a grid index back to an `EntityId` by recording entities in
+      insertion order, which is correct *only* because the grid is rebuilt
+      from scratch every tick and indices are therefore assigned fresh.
+      With `update`/`remove`, an index outlives the tick that created it and
+      the parallel vector has to be maintained rather than rebuilt — or the
+      grid has to hand back a stable id instead of a dense index. Decide
+      which before writing the incremental path, not after: the failure mode
+      is a client being told about the wrong entity, which no type checks.
+
+      *Measured while building R3: the rebuild itself is not the bottleneck
+      it looks like. At 100k colliders a full rebuild is 4.7 ms against
+      ~50 ms of per-client queries, so incremental update is worth doing for
+      the tile grid and for larger worlds, but it does not unblock
+      replication and should not be justified on that basis.*
 
       *The terrain noise is already pure `f(position, seed)` and streams
       perfectly. It is held back by the container, not its own design.*
