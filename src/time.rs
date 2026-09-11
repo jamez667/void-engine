@@ -18,6 +18,25 @@ pub struct Timestep {
     accumulator: f32,
     /// Seconds per fixed step. Set once at construction.
     dt: f32,
+    /// Wall-clock seconds [`advance`] has thrown away at the
+    /// [`MAX_ACCUM_S`] clamp, cumulative.
+    ///
+    /// This is the *only* place that knows sim time was lost. The clamp
+    /// exists to stop a catch-up burst, and it is correct — but it
+    /// converts "the server is overloaded" into "the world quietly runs
+    /// slower than wall clock", with nothing anywhere reporting it. A
+    /// loop that wants to notice reads this; reconstructing it from
+    /// outside would be guesswork, because by the time `advance` returns
+    /// the excess is already gone.
+    ///
+    /// [`advance`]: Timestep::advance
+    dropped_s: f64,
+    /// Steps [`advance`] has handed out, cumulative. Paired with
+    /// `dropped_s` so a reader can express loss as a fraction of work
+    /// actually done rather than as a bare number of seconds.
+    ///
+    /// [`advance`]: Timestep::advance
+    stepped: u64,
 }
 
 impl Timestep {
@@ -41,7 +60,7 @@ impl Timestep {
     /// A timestep with an explicit step duration in seconds.
     pub fn with_dt(dt: f32) -> Self {
         assert!(dt > 0.0 && dt.is_finite(), "step duration must be positive and finite, got {dt}");
-        Self { accumulator: 0.0, dt }
+        Self { accumulator: 0.0, dt, dropped_s: 0.0, stepped: 0 }
     }
 
     /// The dedicated-server default, [`SERVER_HZ`].
@@ -57,11 +76,33 @@ impl Timestep {
     }
 
     pub fn advance(&mut self, frame_dt: f32) -> (u32, f32) {
+        // The clamp is the moment sim time is lost, so it is the only
+        // place that can count it. See `dropped_s`.
+        if frame_dt > MAX_ACCUM_S {
+            self.dropped_s += (frame_dt - MAX_ACCUM_S) as f64;
+        }
         self.accumulator += frame_dt.min(MAX_ACCUM_S);
         let steps = (self.accumulator / self.dt) as u32;
         self.accumulator -= steps as f32 * self.dt;
+        self.stepped += steps as u64;
         let alpha = self.accumulator / self.dt;
         (steps, alpha)
+    }
+
+    /// Cumulative wall-clock seconds discarded by the spiral-of-death
+    /// clamp — sim time this loop will never run.
+    ///
+    /// Zero on any loop keeping up. Non-zero and growing means the world
+    /// is running slower than real time, which no other signal reports:
+    /// the loop does not stutter, it does not error, it simply simulates
+    /// less than a second per second.
+    pub fn dropped_seconds(&self) -> f64 {
+        self.dropped_s
+    }
+
+    /// Cumulative steps handed out by [`advance`](Timestep::advance).
+    pub fn stepped(&self) -> u64 {
+        self.stepped
     }
 
     /// Give back `steps` worth of time that `advance` handed out but the
@@ -225,5 +266,70 @@ mod tests {
     #[should_panic(expected = "tick rate must be positive")]
     fn a_zero_tick_rate_is_rejected() {
         let _ = Timestep::with_hz(0.0);
+    }
+
+    // ── overrun accounting ───────────────────────────────────────────
+
+    /// A loop keeping up must report no loss at all, or the signal is
+    /// worthless: an alert that fires in the healthy case gets muted.
+    #[test]
+    fn a_loop_that_keeps_up_drops_nothing() {
+        let mut t = Timestep::with_hz(30.0);
+        for _ in 0..300 {
+            t.advance(1.0 / 30.0);
+        }
+        assert_eq!(t.dropped_seconds(), 0.0, "a healthy loop must report zero loss");
+        assert_eq!(t.stepped(), 300);
+    }
+
+    /// The clamp is where sim time dies, so that is where it is counted.
+    #[test]
+    fn time_past_the_clamp_is_counted_as_dropped() {
+        let mut t = Timestep::with_hz(30.0);
+        // One second of wall clock in a single frame: the clamp banks
+        // 0.25 s and discards 0.75 s.
+        t.advance(1.0);
+        assert!(
+            (t.dropped_seconds() - 0.75).abs() < 1e-6,
+            "expected 0.75 s dropped, got {}",
+            t.dropped_seconds(),
+        );
+        // And it accumulates rather than reporting only the last frame.
+        t.advance(1.0);
+        assert!(
+            (t.dropped_seconds() - 1.5).abs() < 1e-6,
+            "loss must accumulate, got {}",
+            t.dropped_seconds(),
+        );
+    }
+
+    /// A frame exactly at the clamp is not yet a loss — the boundary must
+    /// not report phantom drops on a loop running right at the limit.
+    #[test]
+    fn a_frame_exactly_at_the_clamp_drops_nothing() {
+        let mut t = Timestep::with_hz(30.0);
+        t.advance(MAX_ACCUM_S);
+        assert_eq!(t.dropped_seconds(), 0.0);
+    }
+
+    /// The whole point: sustained overrun shows up as a growing deficit
+    /// rather than as nothing at all. This is the shape of a server in
+    /// silent slow motion — it never errors, it simply runs less world
+    /// than wall clock.
+    #[test]
+    fn sustained_overrun_accumulates_a_visible_deficit() {
+        let mut t = Timestep::with_hz(30.0);
+        // Ten frames that each took a full second to produce, on a loop
+        // that wanted 33 ms.
+        for _ in 0..10 {
+            t.advance(1.0);
+        }
+        let ran = t.stepped() as f64 * (1.0 / 30.0);
+        let wall = 10.0;
+        assert!(t.dropped_seconds() > 7.0, "got {}", t.dropped_seconds());
+        assert!(
+            ran < wall * 0.3,
+            "a badly overrun loop must simulate far less than wall clock: {ran} vs {wall}",
+        );
     }
 }

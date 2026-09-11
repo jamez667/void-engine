@@ -135,7 +135,12 @@ fn a_headless_server_resumes_where_it_stopped() {
     };
     run_headless_with(
         first,
-        HeadlessConfig { hz: 30.0, max_ticks: Some(20), uncapped: true },
+        HeadlessConfig {
+            hz: 30.0,
+            max_ticks: Some(20),
+            uncapped: true,
+            ..Default::default()
+        },
         || true,
     );
 
@@ -152,7 +157,12 @@ fn a_headless_server_resumes_where_it_stopped() {
     };
     run_headless_with(
         second,
-        HeadlessConfig { hz: 30.0, max_ticks: Some(10), uncapped: true },
+        HeadlessConfig {
+            hz: 30.0,
+            max_ticks: Some(10),
+            uncapped: true,
+            ..Default::default()
+        },
         || true,
     );
 

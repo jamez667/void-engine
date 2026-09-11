@@ -107,7 +107,12 @@ fn main() {
     println!("connected: {} -> {}", conn.remote_address(), ALPN.escape_ascii());
 
     let sim = Server::new(conn, acked.clone());
-    let cfg = HeadlessConfig { hz: 30.0, max_ticks: Some(TICKS), uncapped: false };
+    let cfg = HeadlessConfig {
+        hz: 30.0,
+        max_ticks: Some(TICKS),
+        uncapped: false,
+        ..Default::default()
+    };
     let stats = sim.stats.clone();
     run_headless_with(sim, cfg, || true);
 

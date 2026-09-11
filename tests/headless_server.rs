@@ -43,7 +43,12 @@ impl App for MoveSim {
 
 #[test]
 fn a_server_ticks_the_world_with_no_window() {
-    let cfg = HeadlessConfig { hz: 30.0, max_ticks: Some(60), uncapped: true };
+    let cfg = HeadlessConfig {
+        hz: 30.0,
+        max_ticks: Some(60),
+        uncapped: true,
+        ..Default::default()
+    };
     let sim = MoveSim { ticks: 0, spawned: 0 };
     let exit = run_headless_with(sim, cfg, || true);
     assert_eq!(exit, Exit::TickLimit, "should stop on the tick limit");
@@ -67,7 +72,12 @@ fn init_runs_and_can_populate_the_world() {
         fn fixed_update(&mut self, _ctx: &mut SimCtx) {}
     }
 
-    let cfg = HeadlessConfig { hz: 30.0, max_ticks: Some(1), uncapped: true };
+    let cfg = HeadlessConfig {
+        hz: 30.0,
+        max_ticks: Some(1),
+        uncapped: true,
+        ..Default::default()
+    };
     run_headless_with(Spy(spawned.clone()), cfg, || true);
     assert_eq!(spawned.get(), 7, "init must see a live World");
 }
@@ -86,7 +96,12 @@ fn uncapped_runs_an_exact_number_of_ticks() {
         }
     }
 
-    let cfg = HeadlessConfig { hz: 30.0, max_ticks: Some(250), uncapped: true };
+    let cfg = HeadlessConfig {
+        hz: 30.0,
+        max_ticks: Some(250),
+        uncapped: true,
+        ..Default::default()
+    };
     let exit = run_headless_with(Counter(count.clone()), cfg, || true);
     assert_eq!(exit, Exit::TickLimit);
     assert_eq!(count.get(), 250, "uncapped mode must run exactly max_ticks");
@@ -138,13 +153,81 @@ fn can_advance_false_defers_ticks() {
     let mut iters = 0;
     run_headless_with(
         Stalled(ticks.clone()),
-        HeadlessConfig { hz: 30.0, max_ticks: Some(10), uncapped: true },
+        HeadlessConfig {
+            hz: 30.0,
+            max_ticks: Some(10),
+            uncapped: true,
+            ..Default::default()
+        },
         || {
             iters += 1;
             iters <= 20
         },
     );
     assert_eq!(ticks.get(), 0, "a stalled sim must not advance");
+}
+
+/// The server loop must be able to say whether it is keeping up.
+///
+/// Before this existed, a headless server that overran its budget simply
+/// simulated less world per second with no counter, no log and no error —
+/// the windowed loop had `[perf]` and a `PerfSnapshot`, and the one loop
+/// with nobody watching it had nothing.
+#[test]
+fn a_healthy_loop_reports_that_it_is_keeping_up() {
+    use std::sync::{Arc, Mutex};
+    use void_engine::app_headless::TickHealth;
+
+    struct Idle;
+    impl App for Idle {
+        fn init(&mut self, _ctx: &mut SimCtx) {}
+        fn fixed_update(&mut self, _ctx: &mut SimCtx) {}
+    }
+
+    let seen: Arc<Mutex<Vec<TickHealth>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+
+    run_headless_with(
+        Idle,
+        HeadlessConfig {
+            hz: 30.0,
+            max_ticks: Some(120),
+            uncapped: true,
+            // Report every window, so an uncapped run still produces one.
+            health_every: std::time::Duration::ZERO,
+            on_health: Some(Box::new(move |h| sink.lock().unwrap().push(h))),
+        },
+        || true,
+    );
+
+    let reports = seen.lock().unwrap();
+    assert!(!reports.is_empty(), "a measured loop must report something");
+    let total: u64 = reports.iter().map(|h| h.ticks).sum();
+    assert!(total > 0, "reports must account for ticks actually run");
+    for h in reports.iter() {
+        assert_eq!(h.target_hz, 30.0);
+        assert_eq!(h.dropped_s, 0.0, "an idle sim must not lose sim time");
+        assert!(h.worst_tick_s < 0.5, "an empty tick should be fast, got {}", h.worst_tick_s);
+    }
+}
+
+/// Measurement is opt-in: with no sink, the loop does no timing at all.
+#[test]
+fn health_reporting_is_off_by_default() {
+    struct Idle;
+    impl App for Idle {
+        fn init(&mut self, _ctx: &mut SimCtx) {}
+        fn fixed_update(&mut self, _ctx: &mut SimCtx) {}
+    }
+
+    let cfg = HeadlessConfig {
+        hz: 30.0,
+        max_ticks: Some(10),
+        uncapped: true,
+        ..Default::default()
+    };
+    assert!(cfg.on_health.is_none(), "a server must opt in to being measured");
+    assert_eq!(run_headless_with(Idle, cfg, || true), Exit::TickLimit);
 }
 
 /// `SimCtx::dt` reflects the loop's configured rate, so the same
@@ -162,7 +245,12 @@ fn dt_matches_the_configured_tick_rate() {
     }
 
     for hz in [30.0f32, 60.0] {
-        let cfg = HeadlessConfig { hz, max_ticks: Some(1), uncapped: true };
+        let cfg = HeadlessConfig {
+            hz,
+            max_ticks: Some(1),
+            uncapped: true,
+            ..Default::default()
+        };
         run_headless_with(DtSpy(seen.clone()), cfg, || true);
         assert!(
             (seen.get() - 1.0 / hz).abs() < 1e-6,

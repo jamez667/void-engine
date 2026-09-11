@@ -1065,12 +1065,46 @@ where it does not.
 
 ### Still open from the second audit
 
-- [ ] **N3 — silent slow-motion under sustained tick overrun.** MEASURED,
-      not yet fixed. `app_headless.rs:87-134` has no instrumentation at
-      all: no timing around `fixed_update`, no count of steps requested
-      versus run, no overrun signal. When a tick overruns, the loop skips
-      its sleep, feeds true elapsed time to `advance`, and `MAX_ACCUM_S`
-      silently discards the excess.
+- [x] **N3 — silent slow-motion under sustained tick overrun.** Fixed.
+      `app_headless.rs` had no instrumentation at all: no timing around
+      `fixed_update`, no count of steps requested versus run, no overrun
+      signal. When a tick overruns, the loop skips its sleep, feeds true
+      elapsed time to `advance`, and `MAX_ACCUM_S` silently discards the
+      excess.
+
+      **The counter lives in `Timestep`, not in the loop.** The clamp at
+      `time.rs:advance` is the exact moment sim time is destroyed, and it
+      is the only place that knows how much: by the time `advance`
+      returns, the excess is gone and a caller could only guess at it.
+      So `Timestep` now accumulates `dropped_seconds()` and `stepped()`,
+      and the loop reads them.
+
+      `HeadlessConfig` gains `on_health: Option<Box<dyn FnMut(TickHealth)>>`
+      and `health_every`. A callback rather than a returned handle, matching
+      how `should_run` is already passed — the engine takes no view on how
+      a server shares this with a health endpoint or a log, and a game
+      closes over an `Arc<Mutex<_>>` to read it from another thread.
+      `TickHealth` carries ticks, elapsed, achieved vs target hz, dropped
+      sim seconds, and mean/worst `fixed_update` time, plus
+      `realtime_ratio()` and `keeping_up()`.
+
+      *Measurement is opt-in and costs nothing when off: with no sink the
+      loop skips the `Instant::now()` calls entirely rather than timing and
+      discarding. `health_reporting_is_off_by_default` pins that.*
+
+      *Six tests: four on the accounting (a healthy loop drops exactly
+      zero — an alert that fires in the healthy case gets muted; the clamp
+      boundary drops nothing; loss accumulates rather than reporting only
+      the last frame; sustained overrun shows a growing deficit), two on
+      the loop (a measured run reports, an unmeasured one does not).*
+
+      *Adding two fields to `HeadlessConfig` broke eight struct literals,
+      two of them in `tests/crash_recovery.rs` which only compiles on the
+      `persist` axis and which the IDE never flagged. Found by enumerating
+      every `HeadlessConfig` in the tree at once instead of chasing
+      diagnostics one line number at a time — the analyzer shows one axis's
+      view and I took it for the whole tree. All eight now use
+      `..Default::default()`, so the next field added breaks none of them.*
 
       | `fixed_update` cost | sim/wall | sim time lost per 3 s |
       | --- | --- | --- |

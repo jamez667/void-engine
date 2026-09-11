@@ -61,7 +61,7 @@ pub mod walk;
 pub mod world;
 
 pub use app::{App, SimCtx};
-pub use app_headless::{Exit, HeadlessConfig, run_headless, run_headless_with};
+pub use app_headless::{Exit, HeadlessConfig, TickHealth, run_headless, run_headless_with};
 #[cfg(feature = "client")]
 pub use app::{ClientApp, run};
 pub use ecs::{EntityId, World};
