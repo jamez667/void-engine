@@ -123,6 +123,22 @@ ledger-pg = [
     "tokio/sync",
 ]
 
+# A read-only operator status page: an HTTP endpoint serving what the
+# ledger audits and the tick loop already know, as HTML and as JSON.
+#
+# Implies `ledger` because that is what there is to report on — writer
+# health, zero-sum drift, the reservation backlog. A game without tier-3
+# value tracking has nothing for this page to say.
+#
+# No new dependencies: the HTTP/1.1 subset and the JSON writer are in
+# `src/admin/` precisely so this feature costs a `std::net::TcpListener`
+# and nothing else. See that module for what it deliberately does not do.
+#
+# Off by default, and it binds nothing unless a game calls `admin::serve`.
+# This is the first listening socket the engine itself owns, which is why
+# the bind address is a required argument rather than a default.
+admin = ["ledger"]
+
 # Networking is opt-in for the same reason audio is: a game that has no
 # netcode should not carry the code, the threads, or the attack surface of a
 # transport it never opens. Single-player games (mini-miner-2) and headless

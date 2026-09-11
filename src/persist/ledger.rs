@@ -512,6 +512,19 @@ impl Ledger {
             .unwrap_or(0)
     }
 
+    /// The highest tick any transfer has carried.
+    ///
+    /// The in-memory ledger has no durable storage, so this is also what
+    /// it reports as its committed watermark — nothing here is at risk of
+    /// outliving the process, which is the sense in which every tick it
+    /// has seen is "committed". A durable backend answers that question
+    /// differently; see `LedgerStore::acked_tick`.
+    ///
+    /// Monotonic: a late-arriving lower tick does not wind it back.
+    pub fn now_tick(&self) -> u64 {
+        self.now_tick
+    }
+
     /// Balance minus anything reserved by in-flight transfers.
     ///
     /// This is what a spend must check against. Using the raw balance

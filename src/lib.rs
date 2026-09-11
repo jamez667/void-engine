@@ -17,6 +17,13 @@
 //! `net` feature) `net`. Game logic written against [`App`] compiles into
 //! both; only `ClientApp` needs the GPU.
 
+/// A read-only operator status page over HTTP — the `admin` feature.
+///
+/// Surfaces the ledger audits, the reservation backlog and the loop's own
+/// tick health, none of which had a caller before it existed. Binds
+/// nothing unless a game calls `admin::serve`.
+#[cfg(feature = "admin")]
+pub mod admin;
 pub mod app;
 /// The headless fixed-tick driver. Available in every build.
 pub mod app_headless;

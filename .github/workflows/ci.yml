@@ -65,6 +65,12 @@ jobs:
       - name: Clippy (ledger-pg)
         run: cargo clippy --all-targets --no-default-features --features ledger-pg -- -D warnings
 
+      # The operator status page. Its HTTP subset, JSON writer and HTML
+      # renderer compile on no other axis, so without this step the whole
+      # module is unchecked — the same gap `ledger` had before its step.
+      - name: Clippy (admin)
+        run: cargo clippy --all-targets --no-default-features --features admin -- -D warnings
+
       # `replication` is the only axis where `net` and `persist` are on
       # together. Neither of their own axes compiles this module: `net`
       # builds with persist *off*, and `persist` has no netcode. Without
@@ -115,6 +121,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      - name: Doc links (admin)
+        run: cargo doc --no-deps --no-default-features --features admin
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Doc links (replication)
         run: cargo doc --no-deps --no-default-features --features replication
         env:
@@ -143,6 +154,11 @@ jobs:
 
       - name: Test (replication)
         run: cargo test --all-targets --no-default-features --features replication
+
+      # The admin page binds real loopback sockets in its tests, on port 0
+      # so parallel runs cannot collide.
+      - name: Test (admin)
+        run: cargo test --all-targets --no-default-features --features admin
 
       # `Replicate` is the axis that says what reaches a client, and its
       # default is "nothing". A regression that silently flipped that

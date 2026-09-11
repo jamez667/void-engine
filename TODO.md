@@ -1063,6 +1063,51 @@ where it does not.
       `u32::MAX`, so the bound stays live in every test instead of being
       bypassed by the tests that exist to check it.*
 
+- [x] **N8 — the ledger's safety mechanisms had no caller and no seam.**
+      Read-only half done. The audit found `audit_zero_sum`,
+      `audit_balances_match_entries`, `health`, `journal_depth`,
+      `reconcile_now` and `drain_log_events` each correct, tested, and
+      unreachable from a running server — `SimCtx` carries `world`,
+      `input`, `dt`, so a game holding a ledger had to invent its own
+      health endpoint to see any of it.
+
+      **`admin` feature (implies `ledger`), off by default.** `GET /`
+      serves a self-contained HTML page; `GET /api/status` serves the same
+      data as JSON. Both render from one `Status` captured at one instant,
+      so the page and the endpoint cannot tell an operator two different
+      stories mid-incident — a test pins that they agree on health.
+
+      What it surfaces: zero-sum discrepancies, balance-cache drift,
+      resident and lapsed reservation counts (N7's stall predictor),
+      writer state and journal depth, acked tick, and N3's `TickHealth` —
+      achieved vs target Hz, dropped sim seconds, mean and worst tick.
+
+      *No new dependencies.* The HTTP/1.1 subset (`admin::http`) and the
+      JSON writer (`admin::json`) are ~250 lines together, because adding
+      a web framework to serve two routes would be the one dependency in
+      this crate nobody could justify in a sentence. Bounded deliberately:
+      8 KiB of headers, 5 s IO timeout, 16 concurrent connections shed
+      rather than queued, bodies never read.
+
+      **What it deliberately does not do.** There are no mutating routes,
+      so `reconcile_now` and `expire_reservations` *still have no caller* —
+      the page makes the backlog visible, not swept. Triggering either is a
+      privileged action on a socket and needs an authentication story this
+      does not have. `serve` takes the bind address as a required argument
+      rather than defaulting it; `loopback()` is the documented choice,
+      and a test asserts the bound address is loopback.
+
+      *Two escapers, not one: HTML and JSON escape different character
+      sets for different grammars, and merging them is how a value safe in
+      one context becomes an injection in the other. Both have hostile-input
+      tests — a `<script>` asset name, a database error containing quotes.*
+
+      *`Ledger` does not implement `LedgerStore` — only `PgLedger` does —
+      which I assumed the other way round and had to correct after writing
+      400 lines against it. Hence `Status::from_ledger` beside
+      `from_store`: the in-memory tier is the one with no database to
+      query, so if these audits are not on this page they are nowhere.*
+
 ### Still open from the second audit
 
 - [x] **N3 — silent slow-motion under sustained tick overrun.** Fixed.
