@@ -181,6 +181,13 @@ required-features = ["client"]
 name = "material_preview"
 required-features = ["client"]
 
+# Drives the replication stack against a real QUIC connection, both ends
+# in one process. Needs the module it exercises, so it is pinned to
+# `replication` rather than compiled against types that are not there.
+[[example]]
+name = "replication_server"
+required-features = ["replication"]
+
 # Both of these drive the renderer directly — one stands up a headless wgpu
 # device and reads pixels back, the other parses shader.wgsl through naga.
 # Neither can exist in a build without the GPU stack, so they are pinned to
