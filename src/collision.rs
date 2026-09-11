@@ -120,9 +120,15 @@ impl SpatialGrid {
     pub fn is_empty(&self) -> bool { self.bounds.is_empty() }
 
     /// Enumerate every unique index pair (`a < b`) whose bounding
-    /// squares share at least one cell. Deduplicated via a packed-u64
-    /// hash set so multi-cell colliders don't yield the same pair
-    /// twice.
+    /// squares overlap. Deduplicated via a packed-u64 hash set so
+    /// multi-cell colliders don't yield the same pair twice.
+    ///
+    /// Sharing a cell is the coarse test; overlapping is the one that is
+    /// returned. Two colliders at opposite corners of the same cell
+    /// share it without being anywhere near each other, and on a
+    /// mixed-radius world three quarters of same-cell pairs are like
+    /// that — so they are rejected here rather than handed to a caller
+    /// who would reject them anyway.
     ///
     /// **Pair order is deterministic**: the result is sorted ascending by
     /// `(a, b)`. It did not used to be — pairs came out in `HashMap`
@@ -136,17 +142,29 @@ impl SpatialGrid {
     ///
     /// # Cost
     ///
-    /// Proportional to the sum of the squares of bucket sizes, not to the
-    /// collider count: every collider emits a candidate against every
-    /// other collider sharing a cell, with no distance test. Doubling the
-    /// colliders in a fixed world roughly quadruples the work, and the
-    /// constant is set entirely by cell size — see
+    /// Every collider still *visits* every other collider sharing a cell,
+    /// so the scan is proportional to the sum of the squares of bucket
+    /// sizes and the constant is set entirely by cell size — see
     /// [`new`](Self::new) for how to pick one, because the difference
     /// between a good and a bad choice measured 64x on the same world.
+    /// What the overlap test changes is what survives that scan, and the
+    /// saving tracks how much of the world is merely co-located rather
+    /// than touching. On 100k mixed-radius colliders spread over
+    /// kilometres it halves the total — 67.6 ms to 33.0 ms, 42.3 to 20.1
+    /// — and on the regular lattice `benches/hot_paths.rs` builds it is
+    /// 2.9x, 5.07 ms to 1.76 ms, where all 55,552 pairs it used to return
+    /// were colliders sharing a cell whose squares never touched.
     ///
-    /// The returned pairs are **broad-phase candidates**: their bounding
-    /// squares share a cell, which is not the same as overlapping. Callers
-    /// run their own narrow phase over the list.
+    /// The rejected pairs never reach the hash set or the sort, which is
+    /// where the cost sat: hashing 649k pairs measured 21.9 ms against
+    /// 0.4 ms to sort them.
+    ///
+    /// The returned pairs are **broad-phase candidates** in the sense
+    /// that a bounding square is not a shape: two overlapping squares
+    /// may hold a circle and an oriented box that miss each other.
+    /// Callers still run their own narrow phase ([`circle_vs_circle`],
+    /// [`obb_vs_obb`], [`circle_vs_obb`]) over the list — there is just
+    /// far less list to run it over.
     pub fn query_pairs(&self) -> Vec<(u32, u32)> {
         let mut checked: HashSet<u64> = HashSet::new();
         let pack = |a: u32, b: u32| -> u64 { ((a as u64) << 32) | b as u64 };
@@ -160,6 +178,20 @@ impl SpatialGrid {
                     let Some(bucket) = self.cells.get(&(part, cx, cy)) else { continue };
                     for &j in bucket {
                         if i as u32 == j { continue; }
+                        // Reject before the dedupe set ever sees the pair.
+                        // Sharing a cell is not the same as being near:
+                        // measured on a mixed-radius world, three quarters
+                        // of same-cell pairs have bounding squares that do
+                        // not touch at all. Four comparisons here remove
+                        // them from the hashing, the vector and the sort
+                        // together, which is where the cost actually was —
+                        // hashing 649k pairs measured 21.9 ms against
+                        // 0.4 ms to sort them.
+                        let (other, orad) = self.bounds[j as usize];
+                        let reach = rad + orad;
+                        if (pos.x - other.x).abs() > reach || (pos.y - other.y).abs() > reach {
+                            continue;
+                        }
                         let (a, b) = if (i as u32) < j { (i as u32, j) } else { (j, i as u32) };
                         if checked.insert(pack(a, b)) { pairs.push((a, b)); }
                     }

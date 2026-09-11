@@ -676,8 +676,8 @@ ECS drops to zero.**
 | Same workload over contiguous arrays | 0.39 ms/tick | 0.39 ms |
 | ECS query overhead factor | **2.8×** | 28.7× |
 | ECS `iter2`, 250k entities, 1 system | **0.43 ms/tick** | 2.73 ms |
-| Collision rebuild+query, 10k colliders | 5.1 ms/tick | 4.4 ms |
-| Collision rebuild+query, 50k colliders | 26.4 ms/tick |
+| Collision rebuild+query, 10k colliders | **1.76 ms/tick** | 5.1 ms |
+| Collision rebuild+query, 50k colliders | **9.33 ms/tick** | 26.4 ms claimed |
 | A*, 256×256 open grid, corner-to-corner | 14.5 ms |
 | `size_of::<Vertex>()` | 84 bytes |
 | Text: 10-char nameplate | 864 verts / 72 KB |

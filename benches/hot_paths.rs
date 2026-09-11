@@ -16,7 +16,7 @@
 //! | `iter2`, 50k entities x 20 systems      |  1.17 ms   | 11.32 ms  |
 //! | same workload over contiguous arrays    |  0.39 ms   |  0.39 ms  |
 //! | `iter2`, 250k entities, 1 system        |  0.43 ms   |  2.73 ms  |
-//! | collision rebuild+query, 10k colliders  |  5.10 ms   |  4.40 ms  |
+//! | collision rebuild+query, 10k colliders  |  3.68 ms   |  5.07 ms  |
 //! | AoI, 100k colliders x 1000 clients      |  7.28 ms   |         — |
 //!
 //! The "Was" column is what the audit measured, when `iter`/`iter2` still
@@ -99,11 +99,20 @@ fn ecs_wide_single_query() -> f64 {
 fn collision_rebuild_and_query(n: usize) -> f64 {
     // Spread colliders over a grid roughly `cell_size` apart so bucket
     // occupancy stays realistic rather than degenerate.
+    //
+    // Spacing is 20 against a radius of 12, so neighbours actually
+    // overlap: 39,402 pairs at 10k. It used to be 30, which put every
+    // neighbour beyond the 24-unit reach of two radius-12 squares — the
+    // grid returned 55,552 same-cell pairs that could not touch, and once
+    // `query_pairs` began rejecting those the workload emitted *nothing*.
+    // A guard that only exercises rejection would miss a regression in
+    // emission entirely, so the lattice is tightened to produce real
+    // pairs and time the whole path.
     let side = (n as f64).sqrt().ceil() as usize;
     best_ms(5, || {
         let mut g = SpatialGrid::new(40.0);
         for i in 0..n {
-            let (x, y) = ((i % side) as f64 * 30.0, (i / side) as f64 * 30.0);
+            let (x, y) = ((i % side) as f64 * 20.0, (i / side) as f64 * 20.0);
             g.insert(DVec2::new(x, y), 12.0);
         }
         black_box(g.query_pairs().len());
@@ -246,7 +255,12 @@ fn main() {
 // they would have happily accepted a full regression back to collecting.
 const BUDGET_MANY_SYSTEMS: f64 = 4.0; // measured 1.17 (was 11.32 when collecting)
 const BUDGET_WIDE_QUERY: f64 = 1.5; // measured 0.43 (was  2.73 when collecting)
-const BUDGET_COLLISION_10K: f64 = 15.0; // measured 5.10
+// Re-baselined when `query_pairs` began rejecting non-overlapping pairs
+// and the lattice was tightened so it still emits some. The old 15.0 was
+// ~3x a measurement taken on a workload that returned 55,552 pairs none
+// of which could touch; it would have accepted a full regression back to
+// emitting them.
+const BUDGET_COLLISION_10K: f64 = 11.0; // measured 3.68 on the overlapping lattice
 // Deliberately below the 33.3 ms tick budget as well as ~3x the measurement:
 // AoI is one part of a tick that must also encode and send, so a figure that
 // merely "fits" is already a regression worth failing on.
