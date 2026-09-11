@@ -519,9 +519,41 @@ unblocks the most downstream work.
       relevancy set → baseline+delta snapshot → quantized, bit-packed encode →
       the existing `net/chunk.rs` `send_chunked`.
 
-      *`SpatialGrid` is already the right structure but is referenced only
-      inside `collision.rs`. Without AoI, per-client bandwidth is O(world
-      entities) — the hard wall between a session game and an MMO.*
+      *Without AoI, per-client bandwidth is O(world entities) — the hard wall
+      between a session game and an MMO.*
+
+      **Done: the AoI primitive.** `SpatialGrid::query_circle_into` +
+      `AoiScratch`, guarded in `benches/hot_paths.rs`.
+
+      The brief assumed `SpatialGrid` could be used as-is. It is the right
+      structure, but the naive path measured **42.7 ms** for 100k colliders
+      × 1000 clients against a **33.3 ms** tick at 30 Hz — over budget on
+      relevancy alone, before encoding anything. The cost was not the
+      algorithm: allocation was 28 ms and the `HashSet` dedupe 12 ms, i.e.
+      99.3%. A caller-owned scratch with generation-stamped dedupe gives
+      ~12.4 ms (~7.3 ms on the bench's denser lattice), leaving ~20 ms of
+      tick for the rest of replication.
+
+      Measured and rejected along the way: sharing one widened query across
+      a bucket of nearby clients (39.9 ms — the wider radius cancels the
+      fewer queries exactly), and staggering AoI across ticks (works, 14.9 ms
+      at 1/4, but 132 ms to refresh is visible pop-in; keep it in reserve for
+      the far ring only). **R4 is not a prerequisite** — grid rebuild is
+      4.7 ms against ~50 ms of queries, so incremental broadphase does not
+      unblock this.
+
+      Settled for the remaining work: components go on the wire as
+      `NameId(u16)`, but ids are registration-order and *not* stable across
+      runs, so each connection needs a name→id header once on the reliable
+      stream (`framing.rs`) before any datagram uses them. `EntityId` is
+      8 bytes raw — 440 MB/s of pure identity at 1834 entities × 1000
+      clients × 30 Hz — so index is varint'd and generation moves into
+      spawn/despawn events rather than every delta. No quantization or
+      bit-packing exists in the crate yet; that layer is new work, not
+      wiring. The module wants `replication = ["net", "persist"]` (following
+      `ledger = ["persist"]`) at `src/net/replication.rs`, plus a seventh CI
+      axis: `--features net` builds with persist *off* today, so a `net`-only
+      gate referencing `persist::registry` would fail that existing job.
 
 - [ ] **R4 — Chunk the world; incremental broadphase.** Replace the flat
       `TileGrid` (`Vec<T>` of `w*h`) with a chunk table keyed by `Sector2D`,

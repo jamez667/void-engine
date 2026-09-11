@@ -17,6 +17,7 @@
 //! | same workload over contiguous arrays    |  0.39 ms   |  0.39 ms  |
 //! | `iter2`, 250k entities, 1 system        |  0.43 ms   |  2.73 ms  |
 //! | collision rebuild+query, 10k colliders  |  5.10 ms   |  4.40 ms  |
+//! | AoI, 100k colliders x 1000 clients      |  7.28 ms   |         — |
 //!
 //! The "Was" column is what the audit measured, when `iter`/`iter2` still
 //! collected each query into a heap-allocated `Vec` of raw pointers. Making
@@ -26,7 +27,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use glam::DVec2;
-use void_engine::collision::SpatialGrid;
+use void_engine::collision::{AoiScratch, SpatialGrid};
 use void_engine::components::{Transform2D, Velocity};
 use void_engine::World;
 
@@ -100,6 +101,39 @@ fn collision_rebuild_and_query(n: usize) -> f64 {
     })
 }
 
+/// Area-of-interest: one true-radius query per connected client, per tick.
+///
+/// The budget that matters is the whole tick — 33.3 ms at 30 Hz — and this
+/// is only the relevancy half of replication, before anything is encoded or
+/// sent. The "Was" column is `query_circle`, whose per-call `HashSet` + `Vec`
+/// put this workload over the tick budget on its own; `query_circle_into`
+/// reuses a caller-owned scratch and filters to the true disc.
+///
+/// The grid is built outside the timed closure deliberately: this guards the
+/// query path, and `collision_rebuild_and_query` already covers rebuild.
+fn aoi_query_per_client() -> f64 {
+    let side = (100_000f64).sqrt().ceil() as usize;
+    let mut grid = SpatialGrid::new(400.0);
+    let mut clients = Vec::with_capacity(1_000);
+    for i in 0..100_000usize {
+        let (x, y) = ((i % side) as f64 * 31.0, (i / side) as f64 * 31.0);
+        grid.insert(DVec2::new(x, y), 2.0);
+        // Every hundredth collider doubles as a client viewpoint, so the
+        // query centres sit in occupied cells rather than empty space.
+        if i % 100 == 0 { clients.push(DVec2::new(x, y)); }
+    }
+
+    let mut scratch = AoiScratch::new();
+    best_ms(5, || {
+        let mut hits = 0usize;
+        for c in &clients {
+            grid.query_circle_into(*c, 500.0, 0, &mut scratch);
+            hits += black_box(scratch.hits.len());
+        }
+        black_box(hits);
+    })
+}
+
 fn report(label: &str, ms: f64, budget_ms: f64) -> bool {
     let ok = ms <= budget_ms;
     println!(
@@ -129,6 +163,7 @@ fn main() {
     all_ok &= report("ecs iter2: 50k entities x 20 systems", ecs_many_systems(), BUDGET_MANY_SYSTEMS);
     all_ok &= report("ecs iter2: 250k entities, 1 system", ecs_wide_single_query(), BUDGET_WIDE_QUERY);
     all_ok &= report("collision rebuild+query: 10k", collision_rebuild_and_query(10_000), BUDGET_COLLISION_10K);
+    all_ok &= report("aoi query: 100k colliders x 1000 clients", aoi_query_per_client(), BUDGET_AOI);
     println!();
     if !all_ok {
         eprintln!("one or more hot paths regressed past budget");
@@ -146,3 +181,12 @@ fn main() {
 const BUDGET_MANY_SYSTEMS: f64 = 4.0; // measured 1.17 (was 11.32 when collecting)
 const BUDGET_WIDE_QUERY: f64 = 1.5; // measured 0.43 (was  2.73 when collecting)
 const BUDGET_COLLISION_10K: f64 = 15.0; // measured 5.10
+// Deliberately below the 33.3 ms tick budget as well as ~3x the measurement:
+// AoI is one part of a tick that must also encode and send, so a figure that
+// merely "fits" is already a regression worth failing on.
+//
+// This lattice is denser and more uniform than a real world; the same query
+// over uniform-random positions across a 10 km square measures ~12.4 ms, and
+// `query_circle_into`'s own docs quote that figure. Both are real — bucket
+// occupancy is what the cost tracks, so the guard pins the layout it builds.
+const BUDGET_AOI: f64 = 22.0; // measured 7.28 on this lattice
