@@ -31,6 +31,15 @@ use void_engine::collision::{AoiScratch, SpatialGrid};
 use void_engine::components::{Transform2D, Velocity};
 use void_engine::World;
 
+#[cfg(feature = "replication")]
+use void_engine::ecs::EntityId;
+#[cfg(feature = "replication")]
+use void_engine::net::bitpack::BitWriter;
+#[cfg(feature = "replication")]
+use void_engine::net::snapshot::{EntityItem, ItemKind, SnapshotPacket};
+#[cfg(feature = "replication")]
+use void_engine::persist::registry::NameId;
+
 /// Run `f` `iters` times and return the best per-iteration time in ms.
 ///
 /// Best-of rather than mean: we are bounding the achievable cost, and the
@@ -134,6 +143,55 @@ fn aoi_query_per_client() -> f64 {
     })
 }
 
+/// Snapshot encoding: the other half of a replication tick.
+///
+/// AoI decides *who* each client sees; this turns that into bytes. It is
+/// the half nothing measured until it was written, and the steady-state
+/// figure is what says the pipeline fits at all: ~7 ms of relevancy plus
+/// this, against 33.3 ms.
+///
+/// The writer is reused across every packet because that is what the
+/// real path does, not because it is much faster: measured, reuse saves
+/// about 3% (5.44 ms against 5.61 ms), since one avoided allocation is
+/// noise beside ~500 bytes of bit-pushing per packet. Guarding the shape
+/// the caller actually uses is the point.
+#[cfg(feature = "replication")]
+fn snapshot_encode_per_tick(clients: usize, per_client: usize) -> f64 {
+    let items: Vec<EntityItem> = (0..per_client as u32)
+        .map(|i| EntityItem {
+            // A sixteenth are arrivals, the rest position updates, which
+            // is roughly what a moving crowd produces.
+            kind: if i % 16 == 0 { ItemKind::Entered } else { ItemKind::Updated },
+            entity: EntityId { index: i, generation: 1 },
+            pos: DVec2::new((i % 900) as f64 - 450.0, (i % 700) as f64 - 350.0),
+            rot: 0.3,
+            vel: DVec2::new(9.0, -4.0),
+            component: NameId(3),
+        })
+        .collect();
+
+    let packets: Vec<SnapshotPacket> = (0..clients)
+        .map(|c| SnapshotPacket {
+            tick: 100,
+            is_header: true,
+            keyframe: false,
+            your_entity: EntityId { index: c as u32, generation: 1 },
+            names: Vec::new(),
+            items: items.clone(),
+        })
+        .collect();
+
+    let mut writer = BitWriter::new();
+    best_ms(5, || {
+        let mut bytes = 0usize;
+        for p in &packets {
+            p.encode_into(&mut writer, 500.0);
+            bytes += black_box(writer.byte_len());
+        }
+        black_box(bytes);
+    })
+}
+
 fn report(label: &str, ms: f64, budget_ms: f64) -> bool {
     let ok = ms <= budget_ms;
     println!(
@@ -164,6 +222,14 @@ fn main() {
     all_ok &= report("ecs iter2: 250k entities, 1 system", ecs_wide_single_query(), BUDGET_WIDE_QUERY);
     all_ok &= report("collision rebuild+query: 10k", collision_rebuild_and_query(10_000), BUDGET_COLLISION_10K);
     all_ok &= report("aoi query: 100k colliders x 1000 clients", aoi_query_per_client(), BUDGET_AOI);
+    #[cfg(feature = "replication")]
+    {
+        all_ok &= report(
+            "snapshot encode: 1000 clients x 40 items",
+            snapshot_encode_per_tick(1_000, 40),
+            BUDGET_ENCODE,
+        );
+    }
     println!();
     if !all_ok {
         eprintln!("one or more hot paths regressed past budget");
@@ -190,3 +256,13 @@ const BUDGET_COLLISION_10K: f64 = 15.0; // measured 5.10
 // `query_circle_into`'s own docs quote that figure. Both are real — bucket
 // occupancy is what the cost tracks, so the guard pins the layout it builds.
 const BUDGET_AOI: f64 = 22.0; // measured 7.28 on this lattice
+// Encoding is the half of a replication tick that AoI does not cover, and
+// the two must fit together: ~7 ms of relevancy plus ~6 ms of encoding
+// leaves about 20 ms for chunking, sending and the game itself.
+//
+// Tighter than 3x on purpose. Encode cost is linear in items, so a
+// regression here is not a constant factor — 120 items per client instead
+// of 40 measures 16.4 ms, and a change that quietly tripled per-item cost
+// would still pass a looser budget while eating half the tick.
+#[cfg(feature = "replication")]
+const BUDGET_ENCODE: f64 = 15.0; // measured 5.77 at 1000 x 40
