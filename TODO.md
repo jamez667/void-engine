@@ -114,9 +114,20 @@ unblocks the most downstream work.
       `HeadlessConfig::uncapped` runs an exact tick count with a synthetic
       clock so replays and CI are reproducible.
 
-- [ ] **R2 - Persistence and ledger.** Designed 2026-09-10 (rev 3), not
-      built. Full design published as an artifact; decisions recorded here so
-      they outlive the link.
+- [x] **R2 - Persistence and ledger.** Done 2026-09-10, all five phases.
+      Three tiers by Cargo feature (`persist` / `ledger` / `ledger-pg`),
+      an append-only double-entry ledger whose balances are derived rather
+      than stored, and a crash matrix whose exit criterion is met: a row
+      forged straight into Postgres with no counterparty is caught by
+      `reconcile_now`, not by a player noticing
+      (`tests/crash_matrix.rs:99`). Design published as an artifact;
+      decisions recorded below so they outlive the link.
+
+      *This header read "Designed 2026-09-10 (rev 3), not built" while the
+      body below recorded five shipped phases and said "R2 is done". The
+      phase notes were appended as each landed and the header was never
+      revisited — the same defect found in R4 and R5, where a summary
+      written once outlived the work it described.*
 
       **Rev 2 supersedes rev 1.** Rev 1 stored balances as mutable values
       written transactionally and logged changes beside them. That cannot
@@ -431,8 +442,17 @@ unblocks the most downstream work.
       job that owns its own docker, since a `services:` container cannot
       be stopped from inside the job.
 
-      **Phase 5 complete (2026-09-10).** 4 more tests, 293 total across
-      six axes. R2 is done.
+      **Phase 5 complete (2026-09-10).** 4 more tests. R2 is done.
+
+      *Every "N total across six axes" figure in these phase notes — 237,
+      264, 272, 281, 293 — was measured with `--features X` layered on the
+      default `client` feature, which is **not** the build CI gates. CI
+      runs each non-default axis as `--no-default-features --features X`.
+      Re-measured in CI shape on 2026-09-11: 154 headless, 192 net, 203
+      persist, 241 ledger, 256 ledger-pg, 293 replication, 189 default.
+      The phase figures are not wrong about what they counted; they are
+      incomparable to these. Note the 293 agreeing with replication's
+      current count is coincidence, not confirmation.*
 
       Nine boundaries were already covered by earlier phases: process
       death between checkpoints, a torn checkpoint write, first boot, the
