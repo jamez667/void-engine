@@ -517,9 +517,8 @@ unblocks the most downstream work.
 
 - [x] **R3 — Replication with interest management.** Per-client AoI query →
       relevancy set → baseline+delta snapshot → quantized, bit-packed encode →
-      the existing `net/chunk.rs` `send_chunked`. **Engine side complete**;
-      what remains is a game driving it from a socket, which is deliberately
-      the game's to own — see *Left* below.
+      the existing `net/chunk.rs` `send_chunked`. **Complete**, and proven
+      against a real QUIC connection rather than only a fake sink.
 
       *Without AoI, per-client bandwidth is O(world entities) — the hard wall
       between a session game and an MMO.*
@@ -557,18 +556,36 @@ unblocks the most downstream work.
       Encoding is guarded too: 1000 clients × 40 items is 5.46 ms, so
       relevancy plus encode is ~12.5 ms of the tick.
 
-      **Left:** wiring it to a live socket — a receive loop feeding
-      `ClientLink::record_ack`, and calling the per-tick step from a real
-      `fixed_update`. A compile test confirmed `quinn`'s
-      `accept_uni`/`read_datagram` need no Cargo change (quinn brings
-      `tokio/default` + `sync` itself), and `quic.rs` deliberately has no
-      connection wrapper, so that loop is the game's to own — the engine
-      supplies types, not a reactor.
+      And proven against a socket: `examples/replication_server.rs` runs
+      both ends over loopback for 120 ticks, one keyframe and 119 deltas
+      in 602 datagrams, after which the client's 280 reconstructed
+      entities equal the server's 280 visible ones. Acknowledgements make
+      the full round trip; nothing is undeliverable.
 
-      *Known gap: CI never runs `cargo doc`, so broken intra-doc links go
-      unnoticed — one sat in `net/mod.rs` from `7ac5124` until a manual
-      run found it, and `renderer/mod.rs:257` has an unrelated one from
-      `a1dbc30` still outstanding.*
+      The threading is the part worth reading before writing a real
+      server. `fixed_update` is synchronous and stays that way, so the
+      simulation owns a thread and runs `run_headless_with` on it. The
+      network side owns a second thread with a current-thread runtime,
+      because accepting a connection and reading a stream are async and
+      this axis resolves `tokio/rt` but not `rt-multi-thread`. What makes
+      the split cheap is that **`send_datagram` needs no runtime** —
+      measured, it reports a 1162-byte path MTU and sends from a plain
+      thread — so snapshots go out on the simulation thread through
+      `QuinnSink` with no hop, and only the ack path is driven on the
+      runtime. Note `tokio/macros` is absent too, so `select!` does not
+      exist here; `tokio::time::timeout` is the substitute.
+
+      *`quic.rs` still has `server_endpoint` but no client equivalent, so
+      a client calls `quinn::Endpoint::client` directly. An asymmetry in
+      the engine's surface, not a blocker.*
+
+      *Known gap: CI never runs `cargo doc`, so a broken intra-doc link
+      goes unnoticed until someone runs it by hand. Two were found that
+      way and both are fixed — one in `net/mod.rs` from `7ac5124`, and
+      `renderer/mod.rs:257` from `a1dbc30`, where an inserted function had
+      also split a doc comment away from the one it described. Every axis
+      measures zero warnings today, so a `cargo doc` step could be added
+      without first cleaning anything up.*
 
       The brief assumed `SpatialGrid` could be used as-is. It is the right
       structure, but the naive path measured **42.7 ms** for 100k colliders

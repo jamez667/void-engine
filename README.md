@@ -114,3 +114,10 @@ cargo build
 cargo test
 cargo run --example bubble_preview
 ```
+
+Replication runs against a real QUIC connection, both ends in one process:
+
+```
+cargo run --release --no-default-features --features replication \
+    --example replication_server
+```
