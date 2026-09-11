@@ -28,7 +28,7 @@ use void_engine::ecs::EntityId;
 use void_engine::net::chunk::{
     send_chunked, ChunkHint, ChunkResult, DatagramSink, SendOutcome, MIN_DATAGRAM_BUDGET,
 };
-use void_engine::net::replication::{Ack, ClientLink, Relevancy};
+use void_engine::net::replication::{Ack, ClientLink, KeyframeBudget, Plan, Relevancy};
 use void_engine::net::snapshot::{EntityItem, ItemKind, NameEntry, SnapshotPacket};
 use void_engine::persist::registry::NameId;
 use void_engine::World;
@@ -179,12 +179,27 @@ impl Server {
         eye: DVec2,
         link: &mut ClientLink,
         hint: &mut ChunkHint,
+        budget: &mut KeyframeBudget,
         wire: &mut Wire,
     ) -> Vec<EntityId> {
+        // One call is one tick, so the keyframe allowance resets here. A
+        // budget that is never reset behaves as a whole-run allowance
+        // instead: it works until the run is long enough to exhaust it,
+        // and then every client silently defers forever.
+        budget.begin();
+
         self.rebuild_grid();
         let visible = self.visible_from(eye);
 
-        let keyframe = link.plan(tick).is_some();
+        // Matched exhaustively rather than tested with `is_some`: a
+        // deferred client must not fall into the delta branch, because a
+        // delta against a baseline the server knows is stale corrupts the
+        // client's view silently.
+        let keyframe = match link.plan(tick, budget) {
+            Plan::Keyframe(_) => true,
+            Plan::Delta => false,
+            Plan::Deferred(_) => return Vec::new(),
+        };
         let items: Vec<EntityItem> = if keyframe {
             visible.iter().map(|&id| self.item(id, ItemKind::Entered)).collect()
         } else {
@@ -258,11 +273,12 @@ fn a_client_view_tracks_the_server_across_ticks() {
 
     let mut link = ClientLink::new(90);
     let mut hint = ChunkHint::new();
+    let mut budget = KeyframeBudget::default();
     let mut client = ClientView::default();
 
     // Tick 1: first contact, so a keyframe.
     let mut wire = Wire::default();
-    let visible = server.send_tick(1, eye, &mut link, &mut hint, &mut wire);
+    let visible = server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     assert!(visible.contains(&near_a) && visible.contains(&near_b));
     assert!(!visible.contains(&far), "far entity must be out of range");
@@ -273,7 +289,7 @@ fn a_client_view_tracks_the_server_across_ticks() {
     server.move_to(traveller, 60.0, 0.0);
     server.move_to(near_a, 15.0, 5.0);
     let mut wire = Wire::default();
-    let visible = server.send_tick(2, eye, &mut link, &mut hint, &mut wire);
+    let visible = server.send_tick(2, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     assert!(visible.contains(&traveller), "the traveller came into range");
     assert_eq!(client.ids(), sorted(&visible), "a delta must keep the views in step");
@@ -283,7 +299,7 @@ fn a_client_view_tracks_the_server_across_ticks() {
     // client rather than lingering as a ghost.
     server.move_to(traveller, 480.0, 0.0);
     let mut wire = Wire::default();
-    let visible = server.send_tick(3, eye, &mut link, &mut hint, &mut wire);
+    let visible = server.send_tick(3, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     assert!(!visible.contains(&traveller), "the traveller left");
     assert!(
@@ -295,7 +311,7 @@ fn a_client_view_tracks_the_server_across_ticks() {
 
     // Tick 4: nothing moves. The views must still agree.
     let mut wire = Wire::default();
-    let visible = server.send_tick(4, eye, &mut link, &mut hint, &mut wire);
+    let visible = server.send_tick(4, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     assert_eq!(client.ids(), sorted(&visible), "a quiet tick must not desync anything");
 }
@@ -309,10 +325,11 @@ fn positions_arrive_intact() {
 
     let mut link = ClientLink::new(90);
     let mut hint = ChunkHint::new();
+    let mut budget = KeyframeBudget::default();
     let mut client = ClientView::default();
 
     let mut wire = Wire::default();
-    server.send_tick(1, eye, &mut link, &mut hint, &mut wire);
+    server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
 
     let got = client.entities.get(&e).copied().expect("the entity must have arrived");
@@ -327,11 +344,12 @@ fn the_name_table_reaches_the_client() {
     let mut server = Server::new();
     let mut link = ClientLink::new(90);
     let mut hint = ChunkHint::new();
+    let mut budget = KeyframeBudget::default();
     let mut client = ClientView::default();
 
     server.spawn_at(0.0, 0.0);
     let mut wire = Wire::default();
-    server.send_tick(1, DVec2::ZERO, &mut link, &mut hint, &mut wire);
+    server.send_tick(1, DVec2::ZERO, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
 
     assert_eq!(
@@ -358,10 +376,11 @@ fn a_chunked_keyframe_reconstructs_exactly() {
 
     let mut link = ClientLink::new(90);
     let mut hint = ChunkHint::new();
+    let mut budget = KeyframeBudget::default();
     let mut client = ClientView::default();
 
     let mut wire = Wire::default();
-    let visible = server.send_tick(1, eye, &mut link, &mut hint, &mut wire);
+    let visible = server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     assert!(wire.sent.len() > 1, "this keyframe should have chunked");
     client.apply(&wire.sent);
 
@@ -395,10 +414,11 @@ fn a_silent_client_is_periodically_restored_by_a_keyframe() {
 
     let mut link = ClientLink::new(WINDOW);
     let mut hint = ChunkHint::new();
+    let mut budget = KeyframeBudget::default();
     let mut client = ClientView::default();
 
     let mut wire = Wire::default();
-    server.send_tick(1, eye, &mut link, &mut hint, &mut wire);
+    server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     client.acknowledge(&mut link, 1);
 
@@ -410,7 +430,7 @@ fn a_silent_client_is_periodically_restored_by_a_keyframe() {
     for tick in 2..=20u32 {
         server.move_to(drifter, 20.0 + (tick % 7) as f64, 0.0);
         let mut sent = Wire::default();
-        let visible = server.send_tick(tick, eye, &mut link, &mut hint, &mut sent);
+        let visible = server.send_tick(tick, eye, &mut link, &mut hint, &mut budget, &mut sent);
 
         let head = SnapshotPacket::decode(&sent.sent[0], HALF, 1024, 8192).unwrap();
         if head.keyframe {
@@ -455,10 +475,11 @@ fn a_recycled_index_does_not_confuse_the_client() {
 
     let mut link = ClientLink::new(90);
     let mut hint = ChunkHint::new();
+    let mut budget = KeyframeBudget::default();
     let mut client = ClientView::default();
 
     let mut wire = Wire::default();
-    server.send_tick(1, eye, &mut link, &mut hint, &mut wire);
+    server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     client.acknowledge(&mut link, 1);
     assert!(client.entities.contains_key(&first));
@@ -471,7 +492,7 @@ fn a_recycled_index_does_not_confuse_the_client() {
     assert_ne!(second.generation, first.generation);
 
     let mut wire = Wire::default();
-    let visible = server.send_tick(2, eye, &mut link, &mut hint, &mut wire);
+    let visible = server.send_tick(2, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
 
     assert!(client.entities.contains_key(&second), "the new tenant must arrive");

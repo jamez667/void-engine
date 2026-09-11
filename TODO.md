@@ -542,6 +542,19 @@ unblocks the most downstream work.
       remembered size for continuation chunks, which carry no bulk header
       and so fit more than the one measured size allows.
 
+      `KeyframeBudget` closes a thundering herd. Keyframes were decided
+      per client with no shared limit: one costs 0.388 ms to encode, so 64
+      clients taking one on the same tick is 25.9 ms of a 33.3 ms tick and
+      1000 clients is **413 ms** — twelve times the budget, reachable on
+      any restart or shard migration. A per-tick allowance (13 ≈ 5 ms)
+      turns that into a queue draining in 2.6 s, and `plan` returns
+      `Plan::{Delta, Keyframe, Deferred}` so a deferred client cannot be
+      mistaken for one that may take a delta — that mistake would apply
+      changes against a baseline the server knows it lacks.
+
+      Encoding is guarded too: 1000 clients × 40 items is 5.46 ms, so
+      relevancy plus encode is ~12.5 ms of the tick.
+
       **Left:** wiring it to a live socket — a receive loop feeding
       `ClientLink::record_ack`, and calling the per-tick step from a real
       `fixed_update`. A compile test confirmed `quinn`'s

@@ -51,7 +51,7 @@
 //!
 //! [`World::despawn`]: crate::World::despawn
 //! [`EntityId`]: crate::EntityId
-
+//!
 //! # Why there is one baseline per client and not a history
 //!
 //! A delta is computed against what the client last *acknowledged*, which
@@ -136,6 +136,107 @@ pub enum KeyframeReason {
     Stalled { ticks_behind: u32 },
 }
 
+/// What to send a client this tick.
+///
+/// Three outcomes rather than two, because a budget makes "needs a
+/// keyframe" and "gets one now" different questions. Returning
+/// `Option<KeyframeReason>` collapsed them, and a caller writing the
+/// obvious `if plan.is_some() { keyframe } else { delta }` would then send
+/// a *delta* to a client the server knows has a stale baseline — the
+/// client applies changes against state it does not have and its view is
+/// quietly wrong from then on. Making [`Plan::Deferred`] its own variant
+/// means a caller matching exhaustively cannot fall into that branch by
+/// accident.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Send a delta against the client's baseline.
+    Delta,
+    /// Send a full keyframe, and report it with [`ClientLink::commit_keyframe`].
+    Keyframe(KeyframeReason),
+    /// A keyframe is owed but this tick's budget is spent. **Send nothing
+    /// to this client.**
+    ///
+    /// Not a failure: the need is latched and the client is served on a
+    /// later tick. Skipping a tick costs that client one frame of
+    /// staleness, where a delta would cost it a permanently wrong view and
+    /// an unbudgeted keyframe would cost every other client the tick.
+    Deferred(KeyframeReason),
+}
+
+impl Plan {
+    /// True when this tick should produce a keyframe.
+    pub fn is_keyframe(self) -> bool { matches!(self, Plan::Keyframe(_)) }
+
+    /// True when nothing may be sent to this client this tick.
+    pub fn is_deferred(self) -> bool { matches!(self, Plan::Deferred(_)) }
+}
+
+/// How many keyframes a tick may afford, across every client.
+///
+/// Without one, keyframes are decided per client with no shared limit, and
+/// the failure is not gradual. Measured: one keyframe over ~1800 visible
+/// entities encodes in 0.388 ms, so 64 clients taking one on the same tick
+/// costs 25.9 ms of a 33.3 ms tick and 1000 clients costs **413 ms** —
+/// twelve times the entire budget. That is reachable rather than
+/// theoretical: a server restart, a shard migration, or one network blip
+/// that stalls many clients at once makes every link owe a keyframe on the
+/// same tick, and the server stops rather than degrades.
+///
+/// A budget turns that into a queue. At 13 per tick — about 5 ms — a
+/// thousand reconnecting clients are all served within 2.6 seconds at
+/// 30 Hz, and no tick is ever blown doing it.
+///
+/// Caller-owned, like [`ChunkHint`]: reset once per tick, pass to every
+/// [`ClientLink::plan`] call in that tick.
+///
+/// [`ChunkHint`]: crate::net::chunk::ChunkHint
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KeyframeBudget {
+    per_tick: u32,
+    spent: u32,
+}
+
+impl KeyframeBudget {
+    /// A budget of `per_tick` keyframes.
+    ///
+    /// Sizing it: divide the slice of the tick you will spend on keyframes
+    /// by what one costs. At the measured 0.388 ms per keyframe over ~1800
+    /// entities, 13 is roughly 5 ms.
+    ///
+    /// Zero is legal and means "no keyframes this tick", which is a way to
+    /// shed load deliberately — every client that needs one is deferred and
+    /// keeps its need latched.
+    pub fn new(per_tick: u32) -> Self {
+        Self { per_tick, spent: 0 }
+    }
+
+    /// Start a new tick. Call once per tick, before any `plan`.
+    pub fn begin(&mut self) {
+        self.spent = 0;
+    }
+
+    /// Keyframes still available this tick.
+    pub fn remaining(&self) -> u32 { self.per_tick.saturating_sub(self.spent) }
+
+    /// Keyframes granted so far this tick.
+    pub fn spent(&self) -> u32 { self.spent }
+
+    /// Take a slot, or report there is none left.
+    fn claim(&mut self) -> bool {
+        if self.spent >= self.per_tick {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+}
+
+impl Default for KeyframeBudget {
+    /// 13 per tick: about 5 ms at the measured cost, which drains a
+    /// thousand reconnecting clients in 2.6 seconds at 30 Hz.
+    fn default() -> Self { Self::new(13) }
+}
+
 /// Per-connection replication state: what this client has confirmed, and
 /// what it is therefore believed to hold.
 ///
@@ -204,13 +305,14 @@ impl ClientLink {
         }
     }
 
-    /// Decide what the snapshot for `tick` must be.
+    /// Decide what to send this client for `tick`.
     ///
     /// A keyframe is owed on a new connection, and again whenever the
     /// client has fallen further behind than `stall_after_ticks`. The
     /// decision is latched: once owed, it stays owed until
     /// [`commit_keyframe`] reports one was actually sent, so a keyframe
-    /// cannot be lost by the caller asking twice.
+    /// cannot be lost by the caller asking twice — or by `budget` being
+    /// spent when it asked.
     ///
     /// Staleness is measured from the later of the last acknowledgement
     /// and the last keyframe sent. Measuring from the acknowledgement
@@ -220,8 +322,15 @@ impl ClientLink {
     /// the send counted, a silent client costs one keyframe per
     /// `stall_after_ticks` instead: three seconds apart at 30 Hz.
     ///
+    /// `budget` is what stops a thousand clients needing a keyframe on the
+    /// same tick from taking 413 ms of a 33.3 ms tick. A client that is
+    /// owed one when the budget is spent comes back [`Plan::Deferred`],
+    /// which means **send it nothing**: its need stays latched and it is
+    /// served on a later tick. Sending a delta instead would apply changes
+    /// against a baseline the server knows it does not have.
+    ///
     /// [`commit_keyframe`]: ClientLink::commit_keyframe
-    pub fn plan(&mut self, tick: u32) -> Option<KeyframeReason> {
+    pub fn plan(&mut self, tick: u32, budget: &mut KeyframeBudget) -> Plan {
         if self.keyframe_owed.is_none() {
             let reference = match (self.acked_tick, self.keyframed_at) {
                 (Some(a), Some(k)) => Some(a.max(k)),
@@ -241,14 +350,24 @@ impl ClientLink {
                         .map_or(tick, |acked| tick.saturating_sub(acked));
                     log::warn!(
                         "event=replication_client_stalled {ticks_behind} ticks behind \
-                         (limit {}); sending a keyframe",
+                         (limit {}); a keyframe is owed",
                         self.stall_after_ticks,
                     );
                     self.keyframe_owed = Some(KeyframeReason::Stalled { ticks_behind });
                 }
             }
         }
-        self.keyframe_owed
+
+        match self.keyframe_owed {
+            None => Plan::Delta,
+            // The slot is taken here rather than in `commit_keyframe`, so
+            // a caller that asks and then drops the answer still consumes
+            // the tick's capacity. Charging on delivery instead would let
+            // a loop over a thousand links grant a thousand keyframes and
+            // discover the cost only once they were all encoded.
+            Some(reason) if budget.claim() => Plan::Keyframe(reason),
+            Some(reason) => Plan::Deferred(reason),
+        }
     }
 
     /// Record that a keyframe carrying `visible` was sent at `tick`.
@@ -382,12 +501,17 @@ mod tests {
 
     fn ent(index: u32) -> EntityId { EntityId { index, generation: 0 } }
 
+    /// A budget large enough never to bind, so the assertions around it
+    /// keep testing what they tested before budgets existed. Exhaustion
+    /// has tests of its own.
+    fn budget() -> KeyframeBudget { KeyframeBudget::new(1_000) }
+
     /// A new connection holds nothing, so its first snapshot cannot be a
     /// delta against anything.
     #[test]
     fn a_new_link_owes_a_keyframe() {
         let mut link = ClientLink::new(90);
-        assert_eq!(link.plan(1), Some(KeyframeReason::FirstSnapshot));
+        assert_eq!(link.plan(1, &mut budget()), Plan::Keyframe(KeyframeReason::FirstSnapshot));
         assert_eq!(link.acked_tick(), None);
         assert_eq!(link.baseline_len(), 0);
     }
@@ -399,12 +523,12 @@ mod tests {
     #[test]
     fn sending_a_keyframe_does_not_acknowledge_it() {
         let mut link = ClientLink::new(90);
-        link.plan(1);
+        link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1), ent(2)]);
 
         assert_eq!(link.baseline_len(), 2, "the baseline is what was sent");
         assert_eq!(link.acked_tick(), None, "but nothing has been confirmed");
-        assert_eq!(link.plan(2), None, "the keyframe is no longer owed, though");
+        assert_eq!(link.plan(2, &mut budget()), Plan::Delta, "the keyframe is no longer owed");
     }
 
     /// Acks are monotonic. Replays and reorderings are normal on a lossy
@@ -429,15 +553,15 @@ mod tests {
     #[test]
     fn a_stalled_client_is_owed_a_keyframe() {
         let mut link = ClientLink::new(90);
-        link.plan(1);
+        link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
         link.record_ack(Ack { tick: 1 });
 
-        assert_eq!(link.plan(50), None, "49 ticks behind is within the limit");
-        assert_eq!(link.plan(91), None, "90 behind is exactly the limit");
+        assert_eq!(link.plan(50, &mut budget()), Plan::Delta, "49 ticks behind is within the limit");
+        assert_eq!(link.plan(91, &mut budget()), Plan::Delta, "90 behind is exactly the limit");
         assert_eq!(
-            link.plan(92),
-            Some(KeyframeReason::Stalled { ticks_behind: 91 }),
+            link.plan(92, &mut budget()),
+            Plan::Keyframe(KeyframeReason::Stalled { ticks_behind: 91 }),
             "91 behind is past it",
         );
     }
@@ -446,16 +570,16 @@ mod tests {
     #[test]
     fn a_keyframe_decision_latches_until_it_is_sent() {
         let mut link = ClientLink::new(10);
-        link.plan(1);
+        link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
         link.record_ack(Ack { tick: 1 });
 
-        let owed = link.plan(100).expect("stalled");
-        assert_eq!(link.plan(100), Some(owed), "asking again must not clear it");
-        assert_eq!(link.plan(101), Some(owed));
+        let Plan::Keyframe(owed) = link.plan(100, &mut budget()) else { panic!("stalled") };
+        assert_eq!(link.plan(100, &mut budget()), Plan::Keyframe(owed), "asking again must not clear it");
+        assert_eq!(link.plan(101, &mut budget()), Plan::Keyframe(owed));
 
         link.commit_keyframe(101, [ent(1)]);
-        assert_eq!(link.plan(101), None, "and only sending clears it");
+        assert_eq!(link.plan(101, &mut budget()), Plan::Delta, "and only sending clears it");
     }
 
     /// **The bug this field exists for.** A client that stops acking must
@@ -471,14 +595,14 @@ mod tests {
     fn a_silent_client_costs_one_keyframe_per_window_not_one_per_tick() {
         let window = 10;
         let mut link = ClientLink::new(window);
-        link.plan(1);
+        link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
         link.record_ack(Ack { tick: 1 });
 
         // The client goes silent here: no further acks, ever.
         let mut keyframes = 0;
         for tick in 2..=200u32 {
-            if link.plan(tick).is_some() {
+            if link.plan(tick, &mut budget()).is_keyframe() {
                 keyframes += 1;
                 link.commit_keyframe(tick, [ent(1)]);
             }
@@ -497,20 +621,121 @@ mod tests {
     #[test]
     fn a_stall_reports_lateness_from_the_clients_own_ack() {
         let mut link = ClientLink::new(10);
-        link.plan(1);
+        link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
         link.record_ack(Ack { tick: 5 });
 
-        link.plan(20);
+        link.plan(20, &mut budget());
         link.commit_keyframe(20, [ent(1)]);
 
-        match link.plan(40).expect("stalled again") {
-            KeyframeReason::Stalled { ticks_behind } => assert_eq!(
+        match link.plan(40, &mut budget()) {
+            Plan::Keyframe(KeyframeReason::Stalled { ticks_behind }) => assert_eq!(
                 ticks_behind, 35,
                 "lateness is measured from the ack at tick 5, not the keyframe at 20",
             ),
             other => panic!("expected a stall, got {other:?}"),
         }
+    }
+
+    /// **The thundering herd.** A budget of one means the second client
+    /// needing a keyframe on the same tick is deferred, not served — and
+    /// deferred is not the same answer as "send a delta".
+    #[test]
+    fn a_spent_budget_defers_rather_than_sending_a_delta() {
+        let mut budget = KeyframeBudget::new(1);
+        let mut first = ClientLink::new(90);
+        let mut second = ClientLink::new(90);
+
+        assert_eq!(first.plan(1, &mut budget), Plan::Keyframe(KeyframeReason::FirstSnapshot));
+        let deferred = second.plan(1, &mut budget);
+        assert_eq!(deferred, Plan::Deferred(KeyframeReason::FirstSnapshot));
+        assert!(deferred.is_deferred());
+        assert!(!deferred.is_keyframe());
+        assert_ne!(
+            deferred, Plan::Delta,
+            "a deferred client must never read as one that can take a delta: \
+             its baseline is empty, so a delta would corrupt its view",
+        );
+    }
+
+    /// A deferred client keeps its claim. The need is latched, so the
+    /// next tick with room serves it — nothing is lost by waiting.
+    #[test]
+    fn a_deferred_client_is_served_on_a_later_tick() {
+        let mut spent = KeyframeBudget::new(0);
+        let mut link = ClientLink::new(90);
+
+        assert!(link.plan(1, &mut spent).is_deferred(), "no budget at all");
+        assert!(link.plan(2, &mut spent).is_deferred(), "still none");
+
+        let mut roomy = KeyframeBudget::new(1);
+        assert_eq!(
+            link.plan(3, &mut roomy),
+            Plan::Keyframe(KeyframeReason::FirstSnapshot),
+            "the claim survived two deferrals",
+        );
+    }
+
+    /// The allowance is per tick, so `begin` restores it. Without the
+    /// reset a budget is a whole-run allowance that silently runs out.
+    #[test]
+    fn begin_restores_the_allowance_each_tick() {
+        let mut budget = KeyframeBudget::new(2);
+        let mut a = ClientLink::new(90);
+        let mut b = ClientLink::new(90);
+        let mut c = ClientLink::new(90);
+
+        assert!(a.plan(1, &mut budget).is_keyframe());
+        assert!(b.plan(1, &mut budget).is_keyframe());
+        assert!(c.plan(1, &mut budget).is_deferred(), "two per tick means two");
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(budget.spent(), 2);
+
+        budget.begin();
+        assert_eq!(budget.remaining(), 2, "a new tick restores the allowance");
+        assert!(c.plan(2, &mut budget).is_keyframe());
+    }
+
+    /// A client that needs no keyframe costs nothing, so a busy tick does
+    /// not starve the clients that were only ever going to take deltas.
+    #[test]
+    fn a_delta_does_not_spend_the_budget() {
+        let mut budget = KeyframeBudget::new(1);
+        let mut link = ClientLink::new(90);
+
+        link.plan(1, &mut budget);
+        link.commit_keyframe(1, [ent(1)]);
+        link.record_ack(Ack { tick: 1 });
+        budget.begin();
+
+        assert_eq!(link.plan(2, &mut budget), Plan::Delta);
+        assert_eq!(budget.remaining(), 1, "a delta must not consume a keyframe slot");
+        assert_eq!(budget.spent(), 0);
+    }
+
+    /// Sizing, as the docs claim it: 13 per tick is the default, and a
+    /// thousand clients drain in the stated number of ticks.
+    #[test]
+    fn the_default_budget_drains_a_thousand_clients_in_the_stated_time() {
+        let mut budget = KeyframeBudget::default();
+        assert_eq!(budget.remaining(), 13, "the documented default");
+
+        let mut links: Vec<ClientLink> = (0..1_000).map(|_| ClientLink::new(90)).collect();
+        let mut served = 0usize;
+        let mut ticks = 0u32;
+        while served < links.len() {
+            ticks += 1;
+            budget.begin();
+            for link in links.iter_mut() {
+                if let Plan::Keyframe(_) = link.plan(ticks, &mut budget) {
+                    link.commit_keyframe(ticks, [ent(1)]);
+                    served += 1;
+                }
+            }
+        }
+        // 1000 / 13 = 77 ticks, which is 2.6 s at 30 Hz.
+        assert_eq!(ticks, 77, "a thousand clients at 13 a tick");
+        assert!((ticks as f64 / 30.0) < 3.0, "under three seconds at 30 Hz");
     }
 
     /// The delta itself: what the client lacks, and what it can no longer
