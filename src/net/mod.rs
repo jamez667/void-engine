@@ -28,6 +28,8 @@
 //! a game that wants to write its own, which is why they were generalised
 //! in the first place.
 
+#[cfg(feature = "replication")]
+pub mod bitpack;
 pub mod chunk;
 pub mod framing;
 pub mod interp;

@@ -122,6 +122,18 @@ jobs:
             exit 1
           }
 
+      # The wire format's round-trip properties. These are the tests that
+      # fail when an encoder change silently desyncs the two ends, so a
+      # cfg regression that stopped running them would be expensive.
+      - name: Bit packing actually ran
+        run: |
+          out=$(cargo test --lib --no-default-features --features replication bitpack 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "13 passed" || {
+            echo "expected 13 bit-packing tests; the cfg gate may be wrong"
+            exit 1
+          }
+
       # Phase 1 and 2's exit criteria both live only on this axis: without
       # `persist` these files compile to empty binaries. Asserting the
       # counts stops a broken cfg gate silently turning either into a no-op
