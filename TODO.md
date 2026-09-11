@@ -1179,6 +1179,51 @@ where it does not.
       gives a number worth quoting. Four contaminated comparisons in the
       first audit, three here.*
 
+- [x] **N7 — the reservation scan was unobservable, and worse than
+      documented.** Accessors added; the scan itself is still open.
+
+      `Ledger::available_at` filters *every* resident reservation on every
+      call, and every non-mint transfer calls it. `reservations` was a
+      private map with no accessor, so the build-up that drives that cost
+      could not be seen at all — the most valuable number for a status
+      page was the one number the type would not surface.
+      `reservation_count()` and `lapsed_reservations(now_tick)` now do,
+      the latter sharing a predicate with `expire_reservations` so it
+      cannot promise a sweep that will not happen.
+
+      **Re-measured rather than taken on report**, and the numbers moved:
+
+      | resident holds | one `available_at` |
+      | --- | --- |
+      | 500 | 3.2 µs |
+      | 5,000 | 30.4 µs |
+      | 50,000 | 334.9 µs |
+      | 180,000 | **1957 µs** |
+      | after a sweep | 0.1 µs |
+
+      At 500 players taking a hold every ten seconds, an eight-hour shard
+      reaches ~180k holds unswept — where one spend check costs 2 ms and
+      sixteen of them exhaust a 33.3 ms tick on affordability tests alone.
+
+      *The audit reported 1.30 / 377.7 / 1.9 µs. The shape reproduced and
+      the magnitudes did not, which is why this was re-derived: every other
+      number committed today I measured myself, and of the two figures I
+      took on trust, one (N4's 271 ms) held and one (N5's 27.5 ms) was
+      measuring something other than what it claimed.*
+
+      **The correction that matters: cost tracks *resident* holds, not
+      lapsed ones.** 500 live and 500 lapsed measure identically, because
+      the filter walks them either way — the audit framed this as a
+      sweep-hygiene problem, and it is not. Sweeping helps a shard whose
+      holds have lapsed; a shard whose holds are genuinely all live gets no
+      relief and needs the scan fixed (index by account, or a per-account
+      running total). That remains open.
+
+      *The docs on `Reservation` and `expire_reservations` said forgetting
+      the sweep "leaks a little memory but never a player's money". The
+      money half is true and verified. The memory half was wrong in kind,
+      not degree: it is a time leak on the spend path. Both corrected.*
+
 - [ ] **N6 — no timeout on the ack read path.** REASONED, not tested.
       `read_msg` awaits `read_exact` on the 4-byte prefix with no timeout
       (`framing.rs:46-62`), and the example accepts uni streams

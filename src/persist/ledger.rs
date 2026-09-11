@@ -306,8 +306,9 @@ pub struct Discrepancy {
 ///
 /// Expiry bites on *read*, not on a sweep: an elapsed hold stops counting
 /// against [`Ledger::available`] immediately, so a server that never calls
-/// [`Ledger::expire_reservations`] leaks a little memory but never a
-/// player's money.
+/// [`Ledger::expire_reservations`] never locks a player's money — but it
+/// does pay for the hold on every spend check, which is a cost in time and
+/// not merely in space. See that method for the measured curve.
 ///
 /// The id is named explicitly rather than matched by amount, because two
 /// holds on one account for the same sum are indistinguishable and
@@ -582,9 +583,40 @@ impl Ledger {
     /// sweep rather than because the code was correct.
     ///
     /// Expired holds already stop counting against `available` the moment
-    /// their tick passes — this only reclaims the memory — so a server
-    /// that forgets to call it leaks a little space but never locks a
-    /// player's money.
+    /// their tick passes, so a server that forgets to call this never
+    /// locks a player's money.
+    ///
+    /// # It is not only memory that leaks
+    ///
+    /// An earlier version of this note said forgetting the sweep "leaks a
+    /// little space". The money claim holds; the space claim understated
+    /// it, because resident holds cost *time* on the spend path.
+    /// [`available_at`](Self::available_at) filters every resident
+    /// reservation on every call, and every non-mint transfer calls it:
+    ///
+    /// | resident holds | one `available_at` |
+    /// | --- | --- |
+    /// | 500 | 3.2 µs |
+    /// | 5,000 | 30.4 µs |
+    /// | 50,000 | 334.9 µs |
+    /// | 180,000 | **1957 µs** |
+    /// | after a sweep | 0.1 µs |
+    ///
+    /// At 500 players taking one hold every ten seconds, an eight-hour
+    /// shard accumulates ~180k holds if nothing sweeps — and at that point
+    /// a single spend check costs 2 ms, so sixteen of them exhaust a
+    /// 33.3 ms tick on affordability tests alone. The failure is silent
+    /// and then sudden.
+    ///
+    /// **The cost tracks *resident* holds, not lapsed ones.** 500 live and
+    /// 500 lapsed measure identically (3.2 µs), because the filter walks
+    /// them either way. Sweeping is what helps; a shard whose holds are
+    /// genuinely all live gets no relief from it and needs the scan itself
+    /// fixed — index by account, or keep a per-account running total.
+    ///
+    /// [`reservation_count`](Self::reservation_count) and
+    /// [`lapsed_reservations`](Self::lapsed_reservations) exist so that
+    /// build-up is visible before it bites.
     pub fn expire_reservations(&mut self, now_tick: u64) -> usize {
         let before = self.reservations.len();
         self.reservations
@@ -597,6 +629,40 @@ impl Ledger {
         self.reservations
             .get(&id)
             .filter(|r| r.expires_after_tick >= now_tick)
+    }
+
+    /// How many holds are resident, lapsed or not.
+    ///
+    /// This is the number that predicts a stall. [`available_at`] filters
+    /// *every* resident hold on every call, and a spend calls it — so this
+    /// count, not the live-hold count, is what sets the cost of checking
+    /// whether a player can afford something. A server that never sweeps
+    /// grows it without bound.
+    ///
+    /// Worth surfacing on a status page beside
+    /// [`lapsed_reservations`](Self::lapsed_reservations): the gap between
+    /// them is dead weight, and it is invisible until the tick budget goes.
+    ///
+    /// [`available_at`]: Self::available_at
+    pub fn reservation_count(&self) -> usize {
+        self.reservations.len()
+    }
+
+    /// How many resident holds have lapsed and are waiting for a sweep.
+    ///
+    /// Exactly what [`expire_reservations`](Self::expire_reservations)
+    /// would reclaim if called with the same tick — the two share a
+    /// predicate deliberately, so this number cannot promise a sweep that
+    /// does not happen.
+    ///
+    /// A climbing value means callers reserve and abandon, and that the
+    /// sweep is not being run often enough (or at all). Both are worth
+    /// knowing *before* the scan cost shows up as a missed tick.
+    pub fn lapsed_reservations(&self, now_tick: u64) -> usize {
+        self.reservations
+            .values()
+            .filter(|r| r.expires_after_tick < now_tick)
+            .count()
     }
 
     /// Release a reservation without spending it.
@@ -1096,6 +1162,38 @@ mod tests {
             1000,
             "lapsed the tick after, with no sweep having run",
         );
+    }
+
+    /// The count a status page shows must agree with what a sweep would
+    /// actually reclaim, or the number lies about the remedy.
+    #[test]
+    fn lapsed_count_matches_what_a_sweep_reclaims() {
+        let (mut l, alice) = funded("alice", 1000);
+        for i in 0..8u64 {
+            // Deadlines 1..8, so at tick 5 exactly four have lapsed.
+            l.reserve(&alice, "credits", 10, i + 1).unwrap();
+        }
+        assert_eq!(l.reservation_count(), 8, "all eight are resident");
+        assert_eq!(l.lapsed_reservations(5), 4, "deadlines 1-4 are past at tick 5");
+
+        let swept = l.expire_reservations(5);
+        assert_eq!(swept, 4, "the sweep must reclaim exactly what was counted");
+        assert_eq!(l.reservation_count(), 4, "and the resident count must fall by that much");
+        assert_eq!(l.lapsed_reservations(5), 0, "nothing lapsed remains");
+    }
+
+    /// Resident is not the same as live. The gap between the two is the
+    /// dead weight that makes every spend check slower.
+    #[test]
+    fn resident_holds_outlive_their_deadlines_until_swept() {
+        let (mut l, alice) = funded("alice", 1000);
+        l.reserve(&alice, "credits", 10, 2).unwrap();
+
+        // Well past the deadline: it no longer counts against `available`…
+        assert_eq!(l.available_at(&alice, "credits", 99), 1000, "funds come back on their own");
+        // …but it is still resident, and still scanned on every spend.
+        assert_eq!(l.reservation_count(), 1, "an unswept hold stays resident");
+        assert_eq!(l.lapsed_reservations(99), 1);
     }
 
     #[test]
