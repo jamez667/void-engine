@@ -143,10 +143,13 @@ impl Server {
     }
 
     /// Rebuild the broadphase from the world, recording the index→entity
-    /// mapping as it goes. The grid has no incremental update, so this is
-    /// what a server tick actually does.
+    /// mapping as it goes — what a server tick actually does.
+    ///
+    /// `clear` rather than a fresh grid: slot numbering restarts from zero
+    /// either way, so `Relevancy`'s insertion-order mapping is unaffected,
+    /// but the buffers survive the tick.
     fn rebuild_grid(&mut self) {
-        self.grid = SpatialGrid::new(CELL);
+        self.grid.clear();
         self.relevancy.begin();
         let mut rows: Vec<(EntityId, DVec2)> =
             self.world.iter::<Transform2D>().map(|(id, t)| (id, t.pos)).collect();

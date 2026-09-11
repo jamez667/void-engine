@@ -94,8 +94,14 @@ fn ecs_wide_single_query() -> f64 {
 }
 
 /// Broadphase rebuild + pair query, which is what a server tick actually
-/// pays: `SpatialGrid` has no incremental update, so the whole structure is
-/// rebuilt from scratch every tick.
+/// pays.
+///
+/// Times the *fresh-grid* shape deliberately, not `clear`. A driver should
+/// use `SpatialGrid::clear` — it retains the buckets and measured 3.75 ms
+/// against 3.33 ms here, and 10.95 to 3.00 on a denser cell — but this
+/// guard exists to catch algorithmic regressions in insert and
+/// `query_pairs`, and allocating fresh is the arm that keeps the two
+/// separable. `clear` has its own correctness tests in `collision.rs`.
 fn collision_rebuild_and_query(n: usize) -> f64 {
     // Spread colliders over a grid roughly `cell_size` apart so bucket
     // occupancy stays realistic rather than degenerate.

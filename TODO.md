@@ -617,10 +617,12 @@ unblocks the most downstream work.
       axis: `--features net` builds with persist *off* today, so a `net`-only
       gate referencing `persist::registry` would fail that existing job.
 
-- [ ] **R4 — Incremental broadphase.** Give `SpatialGrid` `update`/`remove`
-      so it stops reallocating every tick. ~~Chunk the world~~ — the
-      `TileGrid` half is dropped; it holds authored rooms of a few thousand
-      cells, not a world. Both halves are measured below.
+- [x] **R4 — Incremental broadphase.** Closed. `SpatialGrid` stops
+      reallocating every tick — via `clear`, which retains the buckets,
+      not via `update`/`remove` as this entry assumed. Those exist too,
+      tested and unused. ~~Chunk the world~~ — the `TileGrid` half is
+      dropped; it holds authored rooms of a few thousand cells, not a
+      world. Both halves are measured below.
 
       **`TileGrid` is load-bearing in void-claim, which has no in-tree
       callers to warn you.** *Kept as a standing hazard note, not as
@@ -639,8 +641,51 @@ unblocks the most downstream work.
       not use it at all.
 
       **The two halves of this entry have opposite fates. Measured.**
-      The chunk table should not be built; `update`/`remove` should, and
-      the checkbox stays open for that half alone.
+      The chunk table should not be built. The broadphase half is **done**.
+
+      **What landed.** `SpatialGrid` gained `clear`, `remove`, `update`,
+      `slot_count`, `slot_alive`, `resolve`, `id_of`, `insert_tracked`, and
+      a generational `ColliderId`. `remove` leaves a hole rather than
+      compacting — compaction would renumber a *live* collider, and callers
+      hold indices within a tick, which is the "told about the wrong
+      entity" failure this was supposed to prevent, not cause. Slots carry
+      a generation bumped on every remove, mirroring `EntityId` in the ECS,
+      so a stale handle fails closed via `resolve` instead of naming its
+      slot's new occupant. Ten tests in `collision::incremental_tests`
+      cover reuse, hole-skipping in `query_pairs`, multi-cell unhook,
+      bucket membership across `update`, and `clear` semantics.
+
+      **The shipped win is the allocation fix, and it is larger than the
+      entry predicted.** Both drivers now call `grid.clear()` instead of
+      assigning a fresh `SpatialGrid::new(CELL)`. Rebuild alone, insert
+      only:
+
+      | world                  | fresh    | cleared  |
+      | ---------------------- | -------- | -------- |
+      | 10k lattice, cell 40   |  0.84 ms |  0.32 ms |
+      | 50k lattice, cell 40   |  4.09 ms |  1.72 ms |
+      | 100k sparse, cell 400  |  3.41 ms |  2.07 ms |
+      | 100k sparse, cell 40   | 10.95 ms |  3.00 ms |
+
+      The gain tracks cell count, not collider count — many small buckets
+      is where per-tick allocation dominates, so a 40-unit cell gains 3.6x
+      where a 400-unit one gains 1.6x. Pair sets verified identical between
+      arms at every size, and `clear_leaves_a_grid_equivalent_to_a_fresh_one`
+      pins that in the suite.
+
+      *`remove`/`update` are available and tested but **not in use**: both
+      drivers still rebuild wholesale, because `clear` gets the measured
+      win without touching the relevancy invariant. Do not read the table
+      above as their benefit — they are unmeasured, and their case is
+      streaming, not allocation.*
+
+      **The `Relevancy` hazard did not bite, for a reason worth keeping.**
+      `clear` restarts slot numbering from zero exactly as a fresh grid
+      would, so insertion-order `push` stays correct and `Relevancy` needed
+      no change at all. The hazard is real only for a caller that removes
+      or updates *incrementally*, where an index outlives the tick that
+      made it. That warning now lives on the `remove` doc comment, where
+      such a caller will actually meet it, rather than only here.
 
       **The chunk table has no world to chunk.** `TileGrid` never holds a
       world — it holds hand-authored room interiors, one JSON file each.
@@ -658,17 +703,20 @@ unblocks the most downstream work.
       single grid large enough that `w*h` allocation shows in a profile;
       at 2,200 cells it cannot.*
 
-      **`update`/`remove` is real and has live callers to break.** There
-      is no `clear()` on `SpatialGrid`, so "rebuild every tick" means a
-      fresh allocation every tick, and both in-tree drivers do exactly
-      that — `examples/replication_server.rs:201` and
-      `tests/replication_e2e.rs:149` each assign
-      `self.grid = SpatialGrid::new(CELL)` per tick. That is the honest
-      case for incremental update, and it is a modest one: 4.7 ms of
-      rebuild against ~50 ms of queries at 100k.
+      *What the case was, before it was acted on: `SpatialGrid` had no
+      `clear()`, so "rebuild every tick" meant a fresh allocation every
+      tick, and both in-tree drivers assigned
+      `self.grid = SpatialGrid::new(CELL)` per tick. It looked modest —
+      4.7 ms of rebuild against ~50 ms of queries at 100k. Both drivers now
+      call `clear()`, and the measured gain was larger than that framing
+      suggested; see the table above.*
 
       What was wrong: the rebuild this entry is built around was never the
-      bottleneck. The 26.4 ms it cites for 50k colliders measures 1.69 ms.
+      bottleneck — which is not contradicted by the table above. A cost
+      that was never dominant still got 3.6x cheaper, and both facts hold:
+      the entry was wrong about *why* the work mattered, and the work was
+      worth doing anyway for a smaller, differently-shaped reason.
+      The 26.4 ms it cites for 50k colliders measures 1.69 ms.
       `query_pairs` was the cost, for a reason the entry does not mention —
       it returned every pair sharing a cell with no distance test, and on a
       mixed-radius world three quarters of those had bounding squares that
@@ -676,15 +724,15 @@ unblocks the most downstream work.
       halved it: 67.6 ms to 33.0, 42.3 to 20.1, both now inside a 30 Hz
       tick that neither previously fit.
 
-      So the *performance* case for an incremental broadphase is much
+      So the *performance* case for an incremental broadphase was much
       weaker than written. An earlier revision of this line said to
       re-justify it "on streaming and world size rather than on rebuild
-      cost" — both of those are now measured dead too: the grids are
-      authored rooms, and the thing that wants streaming is the noise
-      field, which is not a `TileGrid`. What survives is the narrower case
-      above: a fresh allocation every tick at two live call sites, for a
-      structure with no `clear()`. The `Relevancy` warning below still
-      applies in full.
+      cost" — both of those are measured dead: the grids are authored
+      rooms, and the thing that wants streaming is the noise field, which
+      is not a `TileGrid`. What survived was narrower and was acted on: the
+      per-tick allocation at two live call sites, fixed by `clear`. The
+      `Relevancy` warning below is what an *incremental* caller must still
+      read — see the note above on why `clear` did not trip it.
 
       *A dense world still costs ~180 ms at 100k, and that one is not a
       broadphase problem. It carries 9.6 overlaps per entity against a
@@ -700,15 +748,29 @@ unblocks the most downstream work.
       per-cluster grids (84 ms against a 33.3 ms tick, so a caller cannot
       work around this today).*
 
-      **This breaks `net::replication::Relevancy`, by construction.** That
-      type maps a grid index back to an `EntityId` by recording entities in
-      insertion order, which is correct *only* because the grid is rebuilt
-      from scratch every tick and indices are therefore assigned fresh.
-      With `update`/`remove`, an index outlives the tick that created it and
-      the parallel vector has to be maintained rather than rebuilt — or the
-      grid has to hand back a stable id instead of a dense index. Decide
-      which before writing the incremental path, not after: the failure mode
-      is a client being told about the wrong entity, which no type checks.
+      **An incremental caller breaks `net::replication::Relevancy`, by
+      construction — and this is the decision that was made about it.**
+      That type maps a grid index back to an `EntityId` by recording
+      entities in insertion order, which is correct *only* because indices
+      are assigned fresh from zero each tick. `clear` preserves that
+      exactly, which is why the allocation fix needed no change here. But
+      with `update`/`remove` an index outlives the tick that created it,
+      and then insertion order means nothing.
+
+      The resolution taken: **the grid hands back a stable id**
+      (`ColliderId`, index + generation, `resolve` to check it) *and* keeps
+      the dense index as the in-tick currency. `query_pairs` and
+      `AoiScratch::hits` still yield bare `u32` slots, because nothing is
+      removed mid-query and resolving a generation per hit would cost more
+      than it buys. So `Relevancy` is untouched and stays correct for
+      rebuild-style callers; an incremental one holds `ColliderId`s and
+      maintains its own mapping. The rule is on the `remove` doc comment:
+      finish consuming a query's output before removing anything it named,
+      because a bare index will happily address the slot's next occupant.
+
+      *The failure mode this guards is a client being told about the wrong
+      entity, which no type checks — hence a generation that fails closed
+      rather than a convention that must be remembered.*
 
       *Measured while building R3: the rebuild is not the bottleneck it
       looks like — the 4.7 ms against ~50 ms of queries cited above. It
