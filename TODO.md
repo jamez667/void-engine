@@ -529,14 +529,31 @@ unblocks the most downstream work.
       and `Replicate` on the registry. Behind `replication = ["net",
       "persist"]` with its own CI axis and four count assertions.
 
-      **Left:** wiring it to a live connection — a receive loop feeding
-      `ClientLink::record_ack`, and the per-tick server step that walks
-      relevancy → diff → encode → `send_chunked`. The pieces are built and
-      tested in isolation; nothing yet drives them from a socket. A
-      compile test confirmed `quinn`'s `accept_uni`/`read_datagram` need
-      no Cargo change (quinn brings `tokio/default` + `sync` itself), and
-      `quic.rs` deliberately has no connection wrapper, so that loop is
-      the game's to own — the engine supplies types, not a reactor.
+      The pipeline is proven to compose: `tests/replication_e2e.rs` drives
+      relevancy → diff → encode → chunk → decode across several ticks with
+      entities entering and leaving, asserting the client's reconstructed
+      view equals the server's at every tick, including a chunked keyframe
+      and a recycled entity index.
+
+      `ChunkHint` also lives here now. Halving alone packed 28 items where
+      93 fit — 66 datagrams against an ideal 20, 33% utilisation — so a
+      connection remembers capacity across sends. That recovers half the
+      waste (66 → 34 datagrams, 63% utilisation); the rest needs a second
+      remembered size for continuation chunks, which carry no bulk header
+      and so fit more than the one measured size allows.
+
+      **Left:** wiring it to a live socket — a receive loop feeding
+      `ClientLink::record_ack`, and calling the per-tick step from a real
+      `fixed_update`. A compile test confirmed `quinn`'s
+      `accept_uni`/`read_datagram` need no Cargo change (quinn brings
+      `tokio/default` + `sync` itself), and `quic.rs` deliberately has no
+      connection wrapper, so that loop is the game's to own — the engine
+      supplies types, not a reactor.
+
+      *Known gap: CI never runs `cargo doc`, so broken intra-doc links go
+      unnoticed — one sat in `net/mod.rs` from `7ac5124` until a manual
+      run found it, and `renderer/mod.rs:257` has an unrelated one from
+      `a1dbc30` still outstanding.*
 
       The brief assumed `SpatialGrid` could be used as-is. It is the right
       structure, but the naive path measured **42.7 ms** for 100k colliders

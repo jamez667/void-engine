@@ -165,6 +165,21 @@ jobs:
             exit 1
           }
 
+      # The only test that proves the replication pieces *compose*: a grid
+      # index surviving the trip to an entity id, a client reconstructing
+      # from the wire exactly what the server believed it could see, and
+      # both holding as entities move in and out of range across ticks.
+      # Unit tests on either side of a seam cannot see a disagreement
+      # about the seam itself, which is what this catches.
+      - name: Replication end-to-end actually ran
+        run: |
+          out=$(cargo test --test replication_e2e --no-default-features --features replication 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "6 passed" || {
+            echo "expected 6 end-to-end replication tests; the cfg gate may be wrong"
+            exit 1
+          }
+
       # Phase 1 and 2's exit criteria both live only on this axis: without
       # `persist` these files compile to empty binaries. Asserting the
       # counts stops a broken cfg gate silently turning either into a no-op
