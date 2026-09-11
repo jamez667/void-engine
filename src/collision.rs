@@ -45,11 +45,46 @@ pub struct SpatialGrid {
 
 impl SpatialGrid {
     /// Build an empty grid with the given cell size (world units).
-    /// Picking this well is a workload trade-off: much larger than a
-    /// typical collider and each cell buckets many colliders, blowing
-    /// up the per-pair scan under crowding; much smaller and each
-    /// collider inserts into many cells. Ship-sized colliders top out
-    /// around 50 m; 400 m is the shipping default in void_sim.
+    ///
+    /// # Sizing it
+    ///
+    /// Aim for a **mean bucket occupancy in the low single digits**, and
+    /// measure it for your own world rather than copying a number. That
+    /// is the quantity [`query_pairs`](Self::query_pairs) actually tracks:
+    /// its cost grows with the sum of the squares of bucket sizes, so a
+    /// cell that buckets tens of colliders is quadratically worse than one
+    /// that buckets a few.
+    ///
+    /// Occupancy is the target rather than a cell-to-collider ratio,
+    /// because no single ratio holds. Measured at 20k colliders, the best
+    /// cell was 32x the collider diameter at radius 1, 8x at radius 5, and
+    /// 2x at radius 25 — the ratio moves with density, while the occupancy
+    /// at the optimum stays small in every case.
+    ///
+    /// Distribution matters more than count. The same 40k colliders of
+    /// radius 2, total time for one rebuild plus one `query_pairs`:
+    ///
+    /// | world              | best cell | total   | mean bucket there |
+    /// | ------------------ | --------- | ------- | ----------------- |
+    /// | uniform over 10 km |      32 m |  6.8 ms |               1.2 |
+    /// | clustered, 2 km    |      32 m |  7.9 ms |               1.4 |
+    /// | clustered, 500 m   |      16 m | 10.5 ms |               1.7 |
+    /// | clustered, 150 m   |       8 m | 23.7 ms |               2.9 |
+    /// | clustered, 50 m    |       4 m |  119 ms |               5.8 |
+    ///
+    /// Two things to take from the last row. Tight clustering pulls the
+    /// best cell *down*, so a size tuned on a uniform world is badly wrong
+    /// for a crowded one — at 400 m that same clustered world costs over
+    /// three seconds. And at genuinely dense clustering **no cell size
+    /// fits a 33.3 ms tick**: tuning has run out, and the fix is fewer
+    /// pairs (partitions, smaller worlds, a different broad phase), not a
+    /// better number here.
+    ///
+    /// Ship-sized colliders top out around 50 m; 400 m is the shipping
+    /// default in void_sim and holds up for that workload — a few thousand
+    /// ships spread over kilometres keeps buckets nearly empty, and 400 m
+    /// measures within noise of the best cell there. It is the wrong
+    /// default for small, numerous, clustered colliders.
     pub fn new(cell_size: f64) -> Self {
         Self { cell_size, cells: HashMap::new(), bounds: Vec::new(), parts: Vec::new() }
     }
@@ -98,6 +133,20 @@ impl SpatialGrid {
     /// from identical inputs, which silently breaks replay, lockstep and
     /// server/client agreement. Sorting costs one O(n log n) pass over
     /// the pair list and buys back reproducibility.
+    ///
+    /// # Cost
+    ///
+    /// Proportional to the sum of the squares of bucket sizes, not to the
+    /// collider count: every collider emits a candidate against every
+    /// other collider sharing a cell, with no distance test. Doubling the
+    /// colliders in a fixed world roughly quadruples the work, and the
+    /// constant is set entirely by cell size — see
+    /// [`new`](Self::new) for how to pick one, because the difference
+    /// between a good and a bad choice measured 64x on the same world.
+    ///
+    /// The returned pairs are **broad-phase candidates**: their bounding
+    /// squares share a cell, which is not the same as overlapping. Callers
+    /// run their own narrow phase over the list.
     pub fn query_pairs(&self) -> Vec<(u32, u32)> {
         let mut checked: HashSet<u64> = HashSet::new();
         let pack = |a: u32, b: u32| -> u64 { ((a as u64) << 32) | b as u64 };
