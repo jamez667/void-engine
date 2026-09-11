@@ -778,6 +778,16 @@ breaking change lands here and the consuming game is fixed after. This
 records what is currently owed, because nothing else does — neither repo
 is in this workspace and `cargo check` here will never notice.
 
+*Checked after `77f7c4c`: the glyph atlas replaced the renderer's texture
+and broke nothing downstream. mini-miner-2 fails on exactly the two
+`send_chunked` call sites below and nothing else; void-claim makes 355
+`draw_text` calls but zero `push_quad`, zero raw `uv` writes and zero
+`Vertex` constructions, so it only ever touches the high-level API the
+atlas kept intact. That was the point of reserving the white texel inside
+the atlas rather than switching bind groups mid-pass — worth knowing
+before the next draw-path change, because the same reasoning applies to
+instancing.*
+
 **mini-miner-2 is broken right now.** It depends on this repo by
 `path = "../../../void-engine"` (`crates/miner/Cargo.toml`, replacing a
 commented-out `rev = "2f42af6"`), so it breaks the moment a signature
