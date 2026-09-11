@@ -1087,24 +1087,63 @@ where it does not.
       measures nothing. An operator's first evidence of overload is player
       complaints. Fixing it touches `app_headless.rs` only.
 
-- [ ] **N4 — `!entered.contains(id)` is a linear scan per visible
-      entity.** MEASURED. Both drivers build the update list this way
-      (`replication_server.rs:285`, `replication_e2e.rs:254`). Steady
-      state is genuinely cheap — 0.31 ms at 500 clients with `entered`
-      empty — but it bites exactly on a mass-arrival tick: **271 ms at 500
-      clients** with 1834 entered, against a 33.3 ms budget. That is the
-      post-keyframe tick and any shard migration, restart or crowd event,
-      and `KeyframeBudget` deliberately staggers keyframes so those ticks
-      recur rather than passing once. Driver-side, small: a `HashSet`, or
-      exploit that both lists are already sorted.
+- [x] **N4 — `!entered.contains(id)` was a linear scan per visible
+      entity.** Fixed, and the largest win of the second audit. Both
+      drivers built the update list this way. Steady state was already
+      free, but a mass-arrival tick was catastrophic. `diff` returns
+      `entered` sorted, so the filter is now a `binary_search_by_key`:
 
-- [ ] **N5 — `diff` allocates a fresh `HashSet` per client per tick.**
-      MEASURED. `replication.rs:410` builds `seen` from the visible set on
-      every call: **55 µs per client, 27.5 ms for 500** — most of a tick,
-      on top of the ~12.5 ms R3 measured for AoI and encode. The
-      `entered`/`left` buffers are caller-owned precisely to avoid
-      allocation, and this line quietly undoes that. Fix mirrors
-      `AoiScratch`: hoist the set into caller-owned scratch.
+      | 500 clients, 1834 visible | scan | binary search |
+      | --- | --- | --- |
+      | 0 entered (steady state) | 0.35 ms | 0.00 ms |
+      | 280 entered | 71.95 ms | 10.45 ms |
+      | 1000 entered | 192.70 ms | 11.75 ms |
+      | 1834 entered (full arrival) | 253.95 ms | 13.90 ms |
+
+      *Both filters verified to select identical updates before timing.
+      That the worst case is the post-keyframe tick matters: `KeyframeBudget`
+      staggers keyframes deliberately, so large-`entered` ticks recur
+      rather than passing once.*
+
+      *A sorted-merge would have been faster still, but it requires
+      `visible` sorted by `EntityId` — true in both reference drivers only
+      because they insert into the grid in id order, and not something
+      `diff` can require of an arbitrary caller. The binary search needs no
+      such assumption. Nearly designing on that unguaranteed property is
+      the same error class as the generation-0 assumption in N1.*
+
+- [x] **N5 — `diff` allocated a fresh `HashSet` per client per tick.**
+      Fixed with a caller-owned `DiffScratch`, mirroring `AoiScratch` —
+      **but the win is ~5-6% at 1834 visible entities and nothing at 280,
+      not the 27.5 ms the audit claimed.**
+
+      That 27.5 ms was the cost of *building the membership set at all*,
+      which the fix still pays; what reuse saves is the allocator traffic
+      around it. Measured at 500 clients against an otherwise identical
+      body: −0.33% at 280 visible, +1.06% at 1000, +5.56% at 1834, +5.87%
+      at 1834 with heavy churn.
+
+      *Three measurements disagreed before one was trustworthy, and the
+      sequence is worth keeping.* Timing a bare `HashSet::collect` against
+      the whole of `diff` made the fix look 33% slower — comparing an
+      allocation against a function that also does baseline lookups and two
+      sorts. Timing it against a **local copy** of the pre-fix body showed
+      the same 20-39% gap, stable across runs, which looked structural;
+      the explanation offered for it — that `collect` sizes its table
+      better than `clear`+`extend` — was then disproved outright: fresh
+      `collect`, cleared `extend`, `+reserve` and `with_capacity` all
+      measure within noise (6.56/6.49/6.45/6.63 ms at 1834), and `clear`
+      does retain capacity (3584 slots before and after).
+
+      The real cause was that the local copy optimises differently from a
+      cross-crate call. A three-arm harness — local+alloc, local+reuse,
+      real `diff` — showed the shipped code **fastest of the three** in
+      every row (26.40 ms against 34.42 ms at 1834), and the honest
+      isolation of the set change is local-vs-local.
+
+      *Only an A/B where every arm is identical except the one variable
+      gives a number worth quoting. Four contaminated comparisons in the
+      first audit, three here.*
 
 - [ ] **N6 — no timeout on the ack read path.** REASONED, not tested.
       `read_msg` awaits `read_exact` on the 4-byte prefix with no timeout

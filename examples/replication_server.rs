@@ -58,7 +58,9 @@ use void_engine::components::{Transform2D, Velocity};
 use void_engine::ecs::EntityId;
 use void_engine::net::chunk::{send_chunked, ChunkHint, ChunkResult, QuinnSink};
 use void_engine::net::quic::{insecure_skip_verification, server_endpoint, CertSource};
-use void_engine::net::replication::{Ack, ClientLink, KeyframeBudget, Plan, Relevancy, MAX_ACK_BYTES};
+use void_engine::net::replication::{
+    Ack, ClientLink, DiffScratch, KeyframeBudget, Plan, Relevancy, MAX_ACK_BYTES,
+};
 use void_engine::net::snapshot::{EntityItem, ItemKind, NameEntry, SnapshotPacket};
 use void_engine::persist::registry::NameId;
 use void_engine::{App, SimCtx};
@@ -168,6 +170,9 @@ struct Server {
     budget: KeyframeBudget,
     entered: Vec<EntityId>,
     left: Vec<EntityId>,
+    /// Held across ticks: `diff`'s membership set, reused rather than
+    /// rebuilt per call. See `ClientLink::diff`.
+    diff_scratch: DiffScratch,
     names: Vec<NameEntry>,
     eye: DVec2,
     stats: Arc<std::sync::Mutex<Stats>>,
@@ -188,6 +193,7 @@ impl Server {
             budget: KeyframeBudget::default(),
             entered: Vec::new(),
             left: Vec::new(),
+            diff_scratch: DiffScratch::new(),
             names: vec![NameEntry { name: "transform2d".to_string(), id: NameId(0) }],
             eye: DVec2::ZERO,
             stats: Arc::new(std::sync::Mutex::new(Stats::default())),
@@ -275,7 +281,7 @@ impl App for Server {
         let items: Vec<EntityItem> = if keyframe {
             visible.iter().map(|&id| self.item(ctx.world, id, ItemKind::Entered)).collect()
         } else {
-            self.link.diff(&visible, &mut self.entered, &mut self.left);
+            self.link.diff(&visible, &mut self.entered, &mut self.left, &mut self.diff_scratch);
             let entered = self.entered.clone();
             let left = self.left.clone();
             // Departures first: a recycled index can be both a `Left` (old
@@ -286,9 +292,18 @@ impl App for Server {
                 .map(|&id| EntityItem::left(id))
                 .chain(entered.iter().map(|&id| self.item(ctx.world, id, ItemKind::Entered)))
                 .chain(
+                    // `entered` comes back sorted from `diff`, so this is a
+                    // binary search rather than a scan per visible entity.
+                    // At 500 clients on a mass-arrival tick the scan
+                    // measured 271 ms against a 33.3 ms budget.
                     visible
                         .iter()
-                        .filter(|id| !entered.contains(id))
+                        .filter(|id| {
+                            entered.binary_search_by_key(&(id.index, id.generation), |e| {
+                                (e.index, e.generation)
+                            })
+                            .is_err()
+                        })
                         .map(|&id| self.item(ctx.world, id, ItemKind::Updated)),
                 )
                 .collect()
