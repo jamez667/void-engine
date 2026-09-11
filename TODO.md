@@ -686,16 +686,17 @@ unblocks the most downstream work.
       *The terrain noise is already pure `f(position, seed)` and streams
       perfectly. It is held back by the container, not its own design.*
 
-- [ ] **R5 — Rebuild the client draw path.** ~~Glyph atlas~~ (done), and a
-      sprite texture atlas or `D2Array` — the only item still standing.
-      ~~Instancing~~, ~~clustered lights~~ and the depth buffer are each
-      addressed below: clustering was measured and dropped, instancing was
-      inspected and dropped (no timing was ever taken — the draw-site
-      count settles it), and the depth buffer is real but has a
-      14-pipeline blast radius.
+- [x] **R5 — Rebuild the client draw path.** Closed without the rewrite.
+      ~~Glyph atlas~~ done; ~~clustered lights~~ measured and dropped;
+      ~~instancing~~ inspected and dropped (no timing taken — the
+      draw-site count settles it); ~~sprite atlas~~ deferred, its premise
+      does not hold yet; depth buffer deferred on a 14-pipeline blast
+      radius. Each is recorded below with the trigger that would reopen it.
 
-      *Was framed as a rewrite of the draw path. Measurement cut it down to
-      one item — the entry below records what survived and why.*
+      *Was framed as a rewrite of the draw path. Checking the five claims
+      one at a time left nothing to rewrite: one was real and is done, two
+      were true and not worth acting on, two are real but premature. The
+      entry below is the record of which is which.*
 
       **Measured, 2026-09-11, RTX 3080 Ti at 1080p.** All five claims are
       *true as stated*, but only two are worth acting on. The glyph atlas
@@ -829,6 +830,33 @@ unblocks the most downstream work.
       *If instancing is revisited, it needs a workload where per-draw
       state actually changes — many distinct textures, say — which the
       single-atlas design has just made less likely rather than more.*
+
+      **The sprite atlas has no content to atlas.** The entry's parochial
+      detail — "one 1×1 white pixel exists today" — was the whole truth
+      about the engine's texture story, and it is no longer even that: the
+      white pixel is now the glyph atlas. But an atlas solves *binding
+      churn*, and there is none to solve. The main pass binds exactly one
+      texture bind group, `white_texture_bind_group`, at all four
+      geometry-draw sites (`frame.rs:284`, `:366`, `:601`, `:650`). Every
+      other texture the engine creates is a render target for an offscreen
+      pass (`godray.rs:379`, `lights.rs:429`, `postprocess.rs:291`,
+      `shadow.rs:395`, `sun.rs:285`), not sprite content.
+
+      No public API takes a texture, so a game *cannot* supply sprite
+      content today. Neither game tries: every `Batch` primitive writes
+      `uv = [0.5, 0.5]` and samples the white texel. mini-miner-2's
+      `textured` flag (`map.rs:133`) is not sampling — it is a zoom
+      threshold (`px_per_m >= COVER_PPM`, 12.0) choosing between elevation
+      tint and a procedural `blend_at`/`blended_surface` colour computed
+      on the CPU and written into vertex colours. The name means "shows
+      what it is made of", not "reads from an image".
+
+      *So the work is an atlas for sprites that do not exist, reached
+      through an API that does not exist. The trigger to reopen is the
+      API, not the atlas: when a game needs to draw from an image, the
+      texture-binding entry point comes first and the atlas is the obvious
+      shape for it — the glyph atlas already proves the pattern, including
+      the white texel that keeps untextured primitives working unchanged.*
 
       **The depth buffer is confirmed and still unmeasured.** Every
       `depth_stencil_attachment` is `None` and no pipeline sets
