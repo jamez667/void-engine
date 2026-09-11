@@ -21,12 +21,15 @@
 //! authoritative-server game and generalised — none of them knows what a
 //! snapshot, an entity or a tick is.
 //!
-//! [`replication`] is the exception, and is gated on its own feature for
-//! exactly that reason: deciding what each client should see means knowing
-//! about entities, components and ticks. Keeping it behind
+//! The `replication` module is the exception, and is gated on its own
+//! feature for exactly that reason: deciding what each client should see
+//! means knowing about entities, components and ticks. Keeping it behind
 //! `replication = ["net", "persist"]` leaves the primitives above usable by
 //! a game that wants to write its own, which is why they were generalised
 //! in the first place.
+//!
+//! (Named in prose rather than linked: this header is rendered on the
+//! plain `net` axis too, where that module does not exist.)
 
 #[cfg(feature = "replication")]
 pub mod bitpack;

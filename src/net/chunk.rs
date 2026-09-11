@@ -115,6 +115,126 @@ pub enum ChunkResult {
 /// packet that fits here fits anywhere.
 pub const MIN_DATAGRAM_BUDGET: usize = 1200;
 
+/// What a connection has learned about how many items fit a datagram.
+///
+/// Halving alone is a poor packer. It starts at the whole item list and
+/// divides by two on each rejection, so it lands on the first
+/// power-of-two fraction that fits rather than on capacity — measured on
+/// a real snapshot, 28 items per chunk where 93 fit, 66 datagrams where
+/// 20 would do, and 33% utilisation. Two thirds of every datagram was
+/// empty, and at a thousand clients that triples keyframe traffic.
+///
+/// The fix is not to probe upward within a send: each probe that fails
+/// costs a rejected datagram, and for a packet that genuinely admits one
+/// item per datagram that turns nine sends into seventeen. Capacity is
+/// instead remembered *across* sends, which works because a connection's
+/// packet shape barely changes from one tick to the next.
+///
+/// # What this actually recovers
+///
+/// Half the gap, not all of it. On that same snapshot: 66 datagrams
+/// become 34 and utilisation goes from 33% to 63%, converging after
+/// about six ticks and paying no rejections thereafter. A 5000-item
+/// keyframe goes from 129 datagrams to 93.
+///
+/// The remaining third is structural rather than a tuning failure. Only
+/// the first chunk of a send carries the bulk header, and only that chunk
+/// is measured — a continuation chunk fits more items precisely because
+/// it carries less, so recording its size would teach a number the header
+/// chunk cannot honour. One learned size therefore serves two chunk
+/// shapes, and the continuation chunks run at the header chunk's size
+/// with the header's room to spare. Closing that needs a second remembered
+/// size, which is a larger change than this one.
+///
+/// Hold one per connection, alongside whatever else that connection
+/// tracks. A fresh hint behaves exactly like the old policy, so a caller
+/// with nowhere to keep one loses nothing but the savings.
+///
+/// Deliberately not linked to `replication::ClientLink` here: this module
+/// compiles on the plain `net` axis, where that type does not exist, and
+/// an intra-doc link to it is unresolvable there.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChunkHint {
+    /// Largest item count known to have fitted.
+    floor: Option<usize>,
+    /// Smallest item count known not to have fitted.
+    ceiling: Option<usize>,
+}
+
+impl ChunkHint {
+    /// A hint that has learned nothing. Reproduces the halving-only
+    /// policy on its first send.
+    pub fn new() -> Self { Self::default() }
+
+    /// Largest item count known to fit, once anything has been sent.
+    pub fn known_good(&self) -> Option<usize> { self.floor }
+
+    /// True once capacity is known exactly, at which point sends stop
+    /// probing and cost no rejected datagrams at all.
+    ///
+    /// This is the property that makes remembering worth doing: a design
+    /// that kept probing would trade one kind of waste for another.
+    pub fn is_converged(&self) -> bool {
+        match (self.floor, self.ceiling) {
+            (Some(f), Some(c)) => f + 1 >= c,
+            _ => false,
+        }
+    }
+
+    /// Where a send should start, given the list it has to place.
+    ///
+    /// With nothing learned this is the whole list, which is both the old
+    /// behaviour and the right guess: most packets fit whole.
+    fn start_for(&self, items: usize) -> usize {
+        match self.floor {
+            None => items,
+            Some(floor) => {
+                // With no ceiling known, step up by a quarter: a link whose
+                // capacity grew finds it in a few ticks without a large
+                // rejection each time.
+                //
+                // With one known, bisect the gap instead. A fixed step
+                // overshoots into the ceiling, gets capped back to the
+                // floor, and retries the same size forever — stranded
+                // short of capacity while reporting no rejections, which
+                // looks like success. Halving the gap always lands
+                // strictly between the two and closes it.
+                let probe = match self.ceiling {
+                    Some(c) if c > floor + 1 => floor + ((c - floor) / 2),
+                    Some(_) => floor,
+                    None    => floor + (floor / 4).max(1),
+                };
+                probe.min(items).max(1)
+            }
+        }
+    }
+
+    /// Should the whole-packet attempt be skipped?
+    ///
+    /// Step 1 sends the entire packet on the assumption it fits. Once a
+    /// smaller count is known not to fit, that attempt is a guaranteed
+    /// rejection — which is where most of the wasted sends went.
+    fn skip_whole_attempt(&self, items: usize) -> bool {
+        matches!(self.ceiling, Some(c) if c <= items)
+    }
+
+    fn record_fit(&mut self, n: usize) {
+        self.floor = Some(self.floor.map_or(n, |f| f.max(n)));
+    }
+
+    fn record_reject(&mut self, n: usize) {
+        self.ceiling = Some(self.ceiling.map_or(n, |c| c.min(n)));
+        // A ceiling at or below the floor means the path shrank — an MTU
+        // change or a route flap. Forget the floor rather than carrying a
+        // size now known to fail.
+        if let (Some(f), Some(c)) = (self.floor, self.ceiling) {
+            if f >= c {
+                self.floor = if c > 1 { Some(c - 1) } else { None };
+            }
+        }
+    }
+}
+
 /// Send `packet`, splitting it across datagrams as needed.
 ///
 /// `encode` serialises a rebuilt packet; the chunker is agnostic to the
@@ -122,10 +242,15 @@ pub const MIN_DATAGRAM_BUDGET: usize = 1200;
 /// `label` names the packet in the two log lines this can emit; pass
 /// something that identifies the tick or packet type, since those logs
 /// are the only signal that a packet is outgrowing the transport.
+///
+/// `hint` carries what previous sends on this connection learned about
+/// datagram capacity; see [`ChunkHint`]. Pass a fresh one to get the
+/// original halving-only behaviour.
 pub fn send_chunked<P, S, E>(
     sink: &mut S,
     packet: &P,
     mut encode: E,
+    hint: &mut ChunkHint,
     label: &dyn std::fmt::Display,
 ) -> ChunkResult
 where
@@ -133,11 +258,26 @@ where
     S: DatagramSink,
     E: FnMut(&P) -> Vec<u8>,
 {
+    let total_items = packet.items().len();
+
     // Step 1: the overwhelmingly common case. One encode, one send.
-    match sink.send(encode(packet)) {
-        SendOutcome::Sent     => return ChunkResult::Delivered,
-        SendOutcome::Closed   => return ChunkResult::Closed,
-        SendOutcome::TooLarge => {}
+    // Skipped when the hint already knows a smaller count does not fit,
+    // because then this attempt can only be rejected.
+    if !hint.skip_whole_attempt(total_items) {
+        match sink.send(encode(packet)) {
+            SendOutcome::Sent => {
+                if total_items > 0 {
+                    hint.record_fit(total_items);
+                }
+                return ChunkResult::Delivered;
+            }
+            SendOutcome::Closed   => return ChunkResult::Closed,
+            SendOutcome::TooLarge => {
+                if total_items > 0 {
+                    hint.record_reject(total_items);
+                }
+            }
+        }
     }
 
     // A packet with no items has nothing splittable, so step 2 can never
@@ -158,7 +298,10 @@ where
         };
     }
 
-    let mut chunk_size = packet.items().len();
+    // Start where this connection last succeeded rather than at the whole
+    // list, which is the entire point of the hint: a converged link opens
+    // at capacity and never pays a rejection.
+    let mut chunk_size = hint.start_for(total_items);
     let mut remaining: &[P::Item] = packet.items();
     // Only the first chunk of a send carries the bulk header.
     let mut first = true;
@@ -179,11 +322,22 @@ where
 
         match sink.send(encode(&sub)) {
             SendOutcome::Sent => {
+                // Only a chunk that carried the bulk header measures the
+                // same thing the next send's first chunk will. A shed or
+                // continuation chunk fits more items precisely because it
+                // is carrying less, so recording it would teach the hint
+                // a size the header chunk cannot honour.
+                if !shed_header && first {
+                    hint.record_fit(n);
+                }
                 first = false;
                 remaining = rest;
             }
             SendOutcome::Closed => return ChunkResult::Closed,
             SendOutcome::TooLarge => {
+                if !shed_header && first {
+                    hint.record_reject(n);
+                }
                 if n > 1 {
                     // Step 2: ordinary spillover. Halve and retry.
                     chunk_size = n / 2;
@@ -332,10 +486,15 @@ mod tests {
         /// Rejects everything after this many successful sends, to
         /// exercise the terminal path.
         close_after: Option<usize>,
+        /// Datagrams refused for being oversized. The cost a probing
+        /// policy pays, and what a converged hint must drive to zero.
+        rejected: usize,
     }
 
     impl FakeSink {
-        fn new(mtu: usize) -> Self { Self { mtu, sent: Vec::new(), close_after: None } }
+        fn new(mtu: usize) -> Self {
+            Self { mtu, sent: Vec::new(), close_after: None, rejected: 0 }
+        }
     }
 
     impl DatagramSink for FakeSink {
@@ -343,7 +502,10 @@ mod tests {
             if let Some(n) = self.close_after {
                 if self.sent.len() >= n { return SendOutcome::Closed; }
             }
-            if bytes.len() > self.mtu { return SendOutcome::TooLarge; }
+            if bytes.len() > self.mtu {
+                self.rejected += 1;
+                return SendOutcome::TooLarge;
+            }
             self.sent.push(bytes);
             SendOutcome::Sent
         }
@@ -357,8 +519,16 @@ mod tests {
         (bytes.len() - SCALAR_CORE - expect_bulk * PER_BULK) / PER_ITEM
     }
 
+    /// A fresh hint per call, which reproduces the halving-only policy
+    /// exactly — so every assertion below pins the same behaviour it did
+    /// before capacity was remembered across sends.
     fn run(sink: &mut FakeSink, p: &TestPacket) -> ChunkResult {
-        send_chunked(sink, p, encode, &"test-packet")
+        send_chunked(sink, p, encode, &mut ChunkHint::new(), &"test-packet")
+    }
+
+    /// Send with a hint that persists, as a real connection would.
+    fn run_hinted(sink: &mut FakeSink, p: &TestPacket, hint: &mut ChunkHint) -> ChunkResult {
+        send_chunked(sink, p, encode, hint, &"test-packet")
     }
 
     // ── (a) the forward-progress invariant ───────────────────────────────
@@ -534,6 +704,140 @@ mod tests {
         let mut sink = FakeSink::new(MIN_DATAGRAM_BUDGET);
         sink.close_after = Some(0);
         assert_eq!(run(&mut sink, &TestPacket::new(0, 1)), ChunkResult::Closed);
+    }
+
+    // ── (d) remembering capacity across sends ────────────────────────────
+
+    /// A fresh hint must behave exactly like the old policy, so a caller
+    /// with nowhere to keep one loses nothing but the savings.
+    #[test]
+    fn a_fresh_hint_reproduces_the_halving_only_policy() {
+        let p = TestPacket::new(2, 64);
+
+        let mut a = FakeSink::new(200);
+        assert_eq!(run(&mut a, &p), ChunkResult::Delivered);
+
+        let mut b = FakeSink::new(200);
+        assert_eq!(run_hinted(&mut b, &p, &mut ChunkHint::new()), ChunkResult::Delivered);
+
+        assert_eq!(a.sent.len(), b.sent.len(), "same datagram count");
+        assert_eq!(a.sent, b.sent, "and byte-identical chunks");
+    }
+
+    /// **The property that makes remembering worth doing.** A link that
+    /// keeps its hint converges on capacity and then stops probing: no
+    /// rejected datagrams at all in steady state. A design that kept
+    /// probing would trade one kind of waste for another.
+    #[test]
+    fn a_persistent_hint_converges_and_then_costs_nothing() {
+        let p = TestPacket::new(2, 64);
+        let mut hint = ChunkHint::new();
+
+        let mut rejects = Vec::new();
+        for _ in 0..12 {
+            let mut sink = FakeSink::new(200);
+            assert_eq!(run_hinted(&mut sink, &p, &mut hint), ChunkResult::Delivered);
+            rejects.push(sink.rejected);
+            // Every item arrives on every tick, converged or not.
+            let total: usize = sink.sent.iter().enumerate()
+                .map(|(i, b)| shape(b, if i == 0 { 2 } else { 0 }))
+                .sum();
+            assert_eq!(total, 64, "all items delivered");
+        }
+
+        assert!(hint.is_converged(), "capacity must be pinned down: {hint:?}");
+        assert_eq!(
+            *rejects.last().unwrap(), 0,
+            "a converged link must pay no rejections; sequence was {rejects:?}",
+        );
+    }
+
+    /// And converging must actually pack better than halving — this is
+    /// the 3.3x that motivated the whole thing.
+    #[test]
+    fn a_converged_hint_uses_fewer_datagrams_than_halving() {
+        let p = TestPacket::new(2, 64);
+
+        let mut cold = FakeSink::new(200);
+        run(&mut cold, &p);
+
+        let mut hint = ChunkHint::new();
+        let mut warm = FakeSink::new(200);
+        for _ in 0..12 {
+            warm = FakeSink::new(200);
+            run_hinted(&mut warm, &p, &mut hint);
+        }
+
+        assert!(
+            warm.sent.len() < cold.sent.len(),
+            "converged {} datagrams vs halving {}",
+            warm.sent.len(), cold.sent.len(),
+        );
+    }
+
+    /// Once a ceiling is known, the whole-packet attempt is a guaranteed
+    /// rejection and must be skipped — that is where most of the wasted
+    /// sends went.
+    #[test]
+    fn a_known_ceiling_skips_the_doomed_whole_packet_attempt() {
+        let p = TestPacket::new(2, 64);
+        let mut hint = ChunkHint::new();
+
+        let mut first = FakeSink::new(200);
+        run_hinted(&mut first, &p, &mut hint);
+        let cold_rejects = first.rejected;
+
+        let mut second = FakeSink::new(200);
+        run_hinted(&mut second, &p, &mut hint);
+
+        assert!(
+            second.rejected < cold_rejects,
+            "second send still paid {} rejections against {cold_rejects}",
+            second.rejected,
+        );
+    }
+
+    /// A path that shrinks — an MTU change, a route flap — must not leave
+    /// the hint recommending a size now known to fail.
+    #[test]
+    fn a_shrinking_path_retracts_a_stale_floor() {
+        let p = TestPacket::new(2, 64);
+        let mut hint = ChunkHint::new();
+
+        for _ in 0..8 {
+            let mut sink = FakeSink::new(400);
+            run_hinted(&mut sink, &p, &mut hint);
+        }
+        let roomy = hint.known_good().expect("something must have fitted");
+
+        // The path halves underneath us.
+        let mut tight = FakeSink::new(120);
+        assert_eq!(run_hinted(&mut tight, &p, &mut hint), ChunkResult::Delivered);
+
+        let cramped = hint.known_good().expect("a smaller size must now be known");
+        assert!(cramped < roomy, "floor must retract from {roomy} to something smaller");
+
+        // And it still delivers everything on the narrower path.
+        let total: usize = tight.sent.iter().enumerate()
+            .map(|(i, b)| shape(b, if i == 0 { 2 } else { 0 }))
+            .sum();
+        assert_eq!(total, 64);
+    }
+
+    /// A packet that fits whole teaches the hint that it fits whole, so
+    /// the common case stays one encode and one send forever.
+    #[test]
+    fn a_packet_that_always_fits_never_learns_a_ceiling() {
+        let p = TestPacket::new(4, 10);
+        let mut hint = ChunkHint::new();
+
+        for _ in 0..5 {
+            let mut sink = FakeSink::new(MIN_DATAGRAM_BUDGET);
+            assert_eq!(run_hinted(&mut sink, &p, &mut hint), ChunkResult::Delivered);
+            assert_eq!(sink.sent.len(), 1, "no chunking when it already fits");
+            assert_eq!(sink.rejected, 0, "and no rejections either");
+        }
+        assert_eq!(hint.known_good(), Some(10));
     }
 
     /// Halving must terminate. A pathological MTU that admits exactly

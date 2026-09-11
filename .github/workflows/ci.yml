@@ -122,6 +122,20 @@ jobs:
             exit 1
           }
 
+      # The chunker's escalation policy plus the capacity hint. These
+      # encode a production incident (1,325 entities dropped in 44
+      # seconds) as executable assertions, so losing them silently would
+      # cost more than most: the failure they guard against is invisible
+      # until it is in front of players.
+      - name: Chunking actually ran
+        run: |
+          out=$(cargo test --lib --features net net::chunk:: 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "19 passed" || {
+            echo "expected 19 chunking tests; the cfg gate may be wrong"
+            exit 1
+          }
+
       # The wire format's round-trip properties. These are the tests that
       # fail when an encoder change silently desyncs the two ends, so a
       # cfg regression that stopped running them would be expensive.

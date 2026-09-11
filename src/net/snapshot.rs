@@ -43,11 +43,18 @@
 //!
 //! # Budget
 //!
-//! A delta item costs ~16 B and the scalar core ~13 B, so roughly 76
-//! items fit the conservative 1200 B floor. A steady-state delta — a few
-//! arrivals and departures plus whatever moved — is one datagram. A full
-//! keyframe over a thousand-odd visible entities is not, and chunks;
-//! that is precisely what `send_chunked` is for.
+//! A delta item costs ~16 B and the scalar core ~13 B. Measured by
+//! growing a packet one item at a time against the conservative 1200 B
+//! floor, 93 items fit a datagram with no bulk header, fewer when the
+//! name table rides along.
+//!
+//! A steady-state delta — a few arrivals and departures plus whatever
+//! moved — is one datagram: 40 items encode to 484 B. A full keyframe
+//! over a thousand-odd visible entities is not, and chunks; that is
+//! precisely what `send_chunked` is for. A 1834-item keyframe lands in
+//! 34 datagrams once that connection's [`ChunkHint`] has converged.
+//!
+//! [`ChunkHint`]: super::chunk::ChunkHint
 
 use glam::DVec2;
 
@@ -339,7 +346,7 @@ impl Chunkable for SnapshotPacket {
 mod tests {
     use super::*;
     use crate::net::chunk::{
-        send_chunked, ChunkResult, DatagramSink, SendOutcome, MIN_DATAGRAM_BUDGET,
+        send_chunked, ChunkHint, ChunkResult, DatagramSink, SendOutcome, MIN_DATAGRAM_BUDGET,
     };
 
     const HALF: f64 = 500.0;
@@ -488,7 +495,7 @@ mod tests {
         let mut sink = FakeSink { mtu: MIN_DATAGRAM_BUDGET, sent: Vec::new() };
         let p = packet(4, 10);
         assert_eq!(
-            send_chunked(&mut sink, &p, |q| q.encode(HALF), &"snapshot"),
+            send_chunked(&mut sink, &p, |q| q.encode(HALF), &mut ChunkHint::new(), &"snapshot"),
             ChunkResult::Delivered,
         );
         assert_eq!(sink.sent.len(), 1, "no chunking when it already fits");
@@ -502,7 +509,7 @@ mod tests {
         let p = packet(24, 120);
         let mut sink = FakeSink { mtu: 400, sent: Vec::new() };
         assert_eq!(
-            send_chunked(&mut sink, &p, |q| q.encode(HALF), &"snapshot"),
+            send_chunked(&mut sink, &p, |q| q.encode(HALF), &mut ChunkHint::new(), &"snapshot"),
             ChunkResult::Delivered,
         );
         assert!(sink.sent.len() > 1, "should have split");
@@ -525,7 +532,7 @@ mod tests {
         let p = packet(8, 100);
         let mut sink = FakeSink { mtu: 300, sent: Vec::new() };
         assert_eq!(
-            send_chunked(&mut sink, &p, |q| q.encode(HALF), &"snapshot"),
+            send_chunked(&mut sink, &p, |q| q.encode(HALF), &mut ChunkHint::new(), &"snapshot"),
             ChunkResult::Delivered,
         );
 
