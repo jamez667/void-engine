@@ -522,8 +522,21 @@ unblocks the most downstream work.
       *Without AoI, per-client bandwidth is O(world entities) — the hard wall
       between a session game and an MMO.*
 
-      **Done: the AoI primitive.** `SpatialGrid::query_circle_into` +
-      `AoiScratch`, guarded in `benches/hot_paths.rs`.
+      **Done: the AoI primitive, the wire format, and the packet.**
+      `SpatialGrid::query_circle_into` + `AoiScratch` (guarded in
+      `benches/hot_paths.rs`), `net::bitpack`, `net::replication`
+      (`Relevancy`, `ClientLink`, `Ack`), `net::snapshot::SnapshotPacket`,
+      and `Replicate` on the registry. Behind `replication = ["net",
+      "persist"]` with its own CI axis and four count assertions.
+
+      **Left:** wiring it to a live connection — a receive loop feeding
+      `ClientLink::record_ack`, and the per-tick server step that walks
+      relevancy → diff → encode → `send_chunked`. The pieces are built and
+      tested in isolation; nothing yet drives them from a socket. A
+      compile test confirmed `quinn`'s `accept_uni`/`read_datagram` need
+      no Cargo change (quinn brings `tokio/default` + `sync` itself), and
+      `quic.rs` deliberately has no connection wrapper, so that loop is
+      the game's to own — the engine supplies types, not a reactor.
 
       The brief assumed `SpatialGrid` could be used as-is. It is the right
       structure, but the naive path measured **42.7 ms** for 100k colliders

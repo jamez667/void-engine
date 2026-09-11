@@ -102,7 +102,7 @@ jobs:
       # state to every nearby player without failing anything else.
       - name: Replicate classification actually ran
         run: |
-          out=$(cargo test --lib --no-default-features --features persist replicate_tests 2>&1)
+          out=$(cargo test --lib --no-default-features --features persist persist::registry::replicate_tests:: 2>&1)
           echo "$out"
           echo "$out" | grep -q "6 passed" || {
             echo "expected 6 replicate-classification tests; the cfg gate may be wrong"
@@ -115,7 +115,7 @@ jobs:
       # Assert the count, the same way the persist-only suites do.
       - name: Replication actually ran
         run: |
-          out=$(cargo test --lib --no-default-features --features replication replication 2>&1)
+          out=$(cargo test --lib --no-default-features --features replication net::replication:: 2>&1)
           echo "$out"
           echo "$out" | grep -q "16 passed" || {
             echo "expected 16 replication tests; the cfg gate may be wrong"
@@ -127,10 +127,27 @@ jobs:
       # cfg regression that stopped running them would be expensive.
       - name: Bit packing actually ran
         run: |
-          out=$(cargo test --lib --no-default-features --features replication bitpack 2>&1)
+          out=$(cargo test --lib --no-default-features --features replication net::bitpack:: 2>&1)
           echo "$out"
           echo "$out" | grep -q "13 passed" || {
             echo "expected 13 bit-packing tests; the cfg gate may be wrong"
+            exit 1
+          }
+
+      # The packet that ties the rest together. `the_name_table_rides_only_
+      # the_first_chunk` is the guard against re-cloning a bulk header into
+      # every chunk — the production bug `chunk` exists to prevent, which
+      # cost 1,325 dropped entities in 44 seconds.
+      #
+      # Filters are `::`-qualified deliberately. A bare `snapshot` also
+      # matches four `net::interp` tests, so the count would silently
+      # depend on an unrelated module's test total.
+      - name: Snapshot packet actually ran
+        run: |
+          out=$(cargo test --lib --no-default-features --features replication net::snapshot:: 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "12 passed" || {
+            echo "expected 12 snapshot-packet tests; the cfg gate may be wrong"
             exit 1
           }
 

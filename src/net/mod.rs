@@ -36,3 +36,5 @@ pub mod interp;
 pub mod quic;
 #[cfg(feature = "replication")]
 pub mod replication;
+#[cfg(feature = "replication")]
+pub mod snapshot;
