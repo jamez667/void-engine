@@ -61,7 +61,12 @@ impl DatagramSink for Wire {
 /// What a client believes, rebuilt only from datagrams it received.
 #[derive(Default)]
 struct ClientView {
-    entities: HashMap<EntityId, DVec2>,
+    /// Keyed by entity *index*, because that is all an `Updated` carries.
+    /// The value keeps the full `EntityId` from the `Entered` that
+    /// introduced this tenant, so the tests can still assert identity —
+    /// and so a generation arriving out of step is visible rather than
+    /// filed under a second key.
+    entities: HashMap<u32, (EntityId, DVec2)>,
     /// Name table learned from the header chunk, as a real client would.
     names: HashMap<NameId, String>,
     last_tick: u32,
@@ -84,12 +89,33 @@ impl ClientView {
                 self.names.insert(e.id, e.name.clone());
             }
             for item in &p.items {
+                // Keyed by index, not by the full `EntityId`: an `Updated`
+                // carries no generation, so keying on the whole id would
+                // file it separately from the `Entered` that introduced
+                // the entity. `Entered`/`Left` bracket every change of
+                // tenant, so the index is unambiguous within a view.
                 match item.kind {
-                    ItemKind::Entered | ItemKind::Updated => {
-                        self.entities.insert(item.entity, item.pos);
+                    ItemKind::Entered => {
+                        self.entities.insert(item.key(), (item.entity, item.pos));
+                    }
+                    ItemKind::Updated => {
+                        // Keep the identity established by `Entered`; an
+                        // update carries no generation to replace it with.
+                        match self.entities.get_mut(&item.key()) {
+                            Some((_, pos)) => *pos = item.pos,
+                            None => { self.entities.insert(item.key(), (item.entity, item.pos)); }
+                        }
                     }
                     ItemKind::Left => {
-                        self.entities.remove(&item.entity);
+                        // Only if this is still the tenant that left. A
+                        // `Left` carries an authoritative generation, so a
+                        // departure of the *previous* occupant of a
+                        // recycled index must not evict the new one —
+                        // which is reachable whenever a driver emits
+                        // `Entered` before `Left` within a tick.
+                        if self.entities.get(&item.key()).is_some_and(|(id, _)| *id == item.entity) {
+                            self.entities.remove(&item.key());
+                        }
                     }
                 }
             }
@@ -97,9 +123,23 @@ impl ClientView {
     }
 
     fn ids(&self) -> Vec<EntityId> {
-        let mut v: Vec<EntityId> = self.entities.keys().copied().collect();
+        let mut v: Vec<EntityId> = self.entities.values().map(|(id, _)| *id).collect();
         v.sort_unstable_by_key(|e| (e.index, e.generation));
         v
+    }
+
+    /// The full id the client believes occupies `index`, if any.
+    fn tenant(&self, index: u32) -> Option<EntityId> {
+        self.entities.get(&index).map(|(id, _)| *id)
+    }
+
+    /// Position held for an entity, looked up the way a client must —
+    /// by index, then checked against the identity it was introduced with.
+    fn pos_of(&self, id: EntityId) -> Option<DVec2> {
+        match self.entities.get(&id.index) {
+            Some((held, pos)) if *held == id => Some(*pos),
+            _ => None,
+        }
     }
 }
 
@@ -210,10 +250,15 @@ impl Server {
                 link.diff(&visible, &mut self.entered, &mut self.left);
                 self.entered.clone()
             };
-            entered
+            // Departures first. A recycled index can appear as both a
+            // `Left` (old tenant) and an `Entered` (new tenant) in one
+            // tick, and a client keyed by index — which is all an
+            // `Updated` lets it key by — would have the removal undo the
+            // arrival if these came the other way round.
+            self.left
                 .iter()
-                .map(|&id| self.item(id, ItemKind::Entered))
-                .chain(self.left.iter().map(|&id| EntityItem::left(id)))
+                .map(|&id| EntityItem::left(id))
+                .chain(entered.iter().map(|&id| self.item(id, ItemKind::Entered)))
                 .chain(
                     // Everything still visible and not newly arrived is an
                     // update: positions move every tick.
@@ -306,7 +351,7 @@ fn a_client_view_tracks_the_server_across_ticks() {
     client.apply(&wire.sent);
     assert!(!visible.contains(&traveller), "the traveller left");
     assert!(
-        !client.entities.contains_key(&traveller),
+        client.tenant(traveller.index).is_none(),
         "a departure must remove it, not leave a ghost at its last position",
     );
     assert_eq!(client.ids(), sorted(&visible));
@@ -335,7 +380,7 @@ fn positions_arrive_intact() {
     server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
 
-    let got = client.entities.get(&e).copied().expect("the entity must have arrived");
+    let got = client.pos_of(e).expect("the entity must have arrived");
     assert!(close(got, DVec2::new(37.5, -42.25)), "got {got:?}");
 }
 
@@ -485,7 +530,7 @@ fn a_recycled_index_does_not_confuse_the_client() {
     server.send_tick(1, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
     client.acknowledge(&mut link, 1);
-    assert!(client.entities.contains_key(&first));
+    assert_eq!(client.tenant(first.index), Some(first));
 
     // Despawn and immediately respawn: the index comes back with a new
     // generation.
@@ -498,12 +543,52 @@ fn a_recycled_index_does_not_confuse_the_client() {
     let visible = server.send_tick(2, eye, &mut link, &mut hint, &mut budget, &mut wire);
     client.apply(&wire.sent);
 
-    assert!(client.entities.contains_key(&second), "the new tenant must arrive");
-    assert!(
-        !client.entities.contains_key(&first),
-        "the old occupant must be gone, not silently updated in place",
+    // One index, one tenant: the new occupant, not the old one. Before
+    // `EntityItem::key` existed these were two `contains_key` calls on two
+    // different keys, which is precisely the fork this test now guards.
+    assert_eq!(
+        client.tenant(first.index),
+        Some(second),
+        "the recycled index must hold the new tenant, not the old occupant",
     );
     assert_eq!(client.ids(), sorted(&visible));
+
+    // Tick 3 is where this test used to stop being useful, and where the
+    // bug it was written for actually lived.
+    //
+    // At tick 2 the recycled entity arrives as `Entered`, which carries a
+    // generation, so every assertion above passes whatever the client keys
+    // by. At tick 3 the same entity is `Updated` — which carries the index
+    // only — and a client keying on the full `EntityId` files it under
+    // generation 0, a key no `Entered` ever created. It then holds *two*
+    // entries for one entity: the real one frozen where its keyframe left
+    // it, and a ghost that moves. When the entity finally leaves, `Left`
+    // carries the true generation and removes only the real one, so the
+    // ghost outlives the connection.
+    //
+    // Every generation in these tests was 0 until a despawn happened, which
+    // is why this survived: the two keys coincided.
+    server.move_to(second, 14.0, 0.0);
+    let mut wire = Wire::default();
+    let visible = server.send_tick(3, eye, &mut link, &mut hint, &mut budget, &mut wire);
+    client.apply(&wire.sent);
+
+    assert_eq!(
+        client.entities.len(),
+        1,
+        "an update must not fork the entity into a second entry",
+    );
+    assert_eq!(
+        client.tenant(first.index),
+        Some(second),
+        "the update must land on the tenant `Entered` introduced, generation intact",
+    );
+    assert_eq!(
+        client.pos_of(second).map(|p| p.x.round()),
+        Some(14.0),
+        "the update must move the entity the client actually holds",
+    );
+    assert_eq!(client.ids(), sorted(&visible), "views must still agree after an update");
 }
 
 fn sorted(ids: &[EntityId]) -> Vec<EntityId> {
@@ -514,9 +599,13 @@ fn sorted(ids: &[EntityId]) -> Vec<EntityId> {
 
 impl ClientView {
     /// The client tells the server what it has applied.
+    ///
+    /// A client can only have applied a tick the server already sent, so
+    /// `tick` doubles as the server's "now" here — the bound
+    /// `record_ack` checks against.
     fn acknowledge(&self, link: &mut ClientLink, tick: u32) {
         let bytes = Ack { tick }.encode();
         let ack = Ack::decode(&bytes).expect("an ack must survive its own encoding");
-        link.record_ack(ack);
+        link.record_ack(ack, tick);
     }
 }

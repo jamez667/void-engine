@@ -118,6 +118,57 @@ impl EntityItem {
             component: NameId(0),
         }
     }
+
+    /// Whether `entity.generation` came off the wire or was invented.
+    ///
+    /// `Updated` items carry the index only — see [`ItemKind::Updated`] —
+    /// so a decoded one has no generation to report and
+    /// [`SnapshotPacket::decode`] leaves the field at zero. That zero is
+    /// *not* a generation: it is the absence of one.
+    ///
+    /// [`SnapshotPacket::decode`]: SnapshotPacket::decode
+    pub fn generation_is_authoritative(&self) -> bool {
+        self.kind != ItemKind::Updated
+    }
+
+    /// What a client should key this item by.
+    ///
+    /// **Never key a client-side map on `entity` directly.** For `Updated`
+    /// the generation is absent rather than zero, so keying on the full
+    /// [`EntityId`] files an update under a *different* key than the
+    /// `Entered` that introduced the entity — and the client then holds
+    /// two entries for one entity, one of them frozen where its keyframe
+    /// left it. That is invisible while every generation happens to be 0,
+    /// which is why it survived a test written specifically for recycled
+    /// indices: the test never ran a third tick.
+    ///
+    /// The index alone is the stable identity *within* a client's view,
+    /// because `Entered` and `Left` bracket every change of tenant: a
+    /// recycled index always arrives as `Left` then `Entered`, so an
+    /// index cannot silently change meaning between updates. Use
+    /// [`generation_is_authoritative`] when the full id is genuinely
+    /// needed — deciding whether a recycled index is the same entity, for
+    /// instance, which is exactly what `Entered` and `Left` carry it for.
+    ///
+    /// # Two rules this places on the pair of ends
+    ///
+    /// **A sender must emit `Left` before `Entered` within a tick.** One
+    /// tick can carry a departure of an index's old tenant and an arrival
+    /// of its new one; the other order makes the removal undo the
+    /// arrival. Both reference drivers do this — see the `left.iter()`
+    /// chain in `examples/replication_server.rs` and
+    /// `tests/replication_e2e.rs`.
+    ///
+    /// **A receiver must check the generation before honouring a `Left`.**
+    /// `Left` carries an authoritative generation, so a client can and
+    /// should refuse to evict a tenant that is not the one departing. A
+    /// hostile or buggy peer is not bound by the ordering rule above, so
+    /// this is what actually makes an index-keyed client safe.
+    ///
+    /// [`generation_is_authoritative`]: EntityItem::generation_is_authoritative
+    pub fn key(&self) -> u32 {
+        self.entity.index
+    }
 }
 
 /// One entry of the name→id table.
@@ -285,6 +336,12 @@ impl SnapshotPacket {
                 _ => return Err(BitError::OutOfRange),
             };
             let index = r.read_varint()? as u32;
+            // An `Updated` carries no generation, so there is none to
+            // decode. Zero here is a placeholder for "absent", NOT a
+            // generation — see `EntityItem::generation_is_authoritative`,
+            // and key client-side maps with `EntityItem::key`. Treating
+            // this zero as real forks one entity into two client entries
+            // the moment any generation is non-zero.
             let generation = if kind != ItemKind::Updated {
                 r.read_varint()? as u32
             } else {

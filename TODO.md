@@ -992,6 +992,170 @@ unblocks the most downstream work.
 
 ---
 
+## Second audit (2026-09-11): what the first one never looked at
+
+The first audit's five items are closed. Three agents then swept the
+territory it never covered — sim/ECS/loop, netcode/robustness,
+persistence/ops/coverage — on the standing rule that a finding needs a
+file:line, a measured workload where it bites, and a stated workload
+where it does not.
+
+- [x] **N1 — `Updated` items forked every respawned entity on the client.**
+      Fixed. `encode_into` writes a generation only for `Entered`/`Left`
+      (`snapshot.rs:219-221`); `decode` filled the gap with `0`
+      (`:288-292`). Both reference clients keyed their map on the full
+      `EntityId`, so once any generation went non-zero an update was filed
+      under a key no `Entered` had ever created: the client held **two**
+      entries for one entity — the real one frozen at its keyframe
+      position, and a ghost that moved. `Left` carries the true
+      generation, so departure removed only the real one and the ghost
+      outlived the connection.
+
+      *Not hostile-input dependent. Any despawn/respawn in ordinary play
+      triggered it.* The encoder's premise is sound — a live entity's
+      generation cannot change, and sending it per-update would cost
+      1-2 bytes × 1834 entities × 500 clients × 30 Hz — so the fix is on
+      the receiving side: `EntityItem::key()` (the index) is what a client
+      keys by, and `generation_is_authoritative()` says when the full id is
+      real.
+
+      **The fix exposed a second defect underneath it.** Collapsing to an
+      index key made emission order load-bearing, and both drivers emitted
+      `Entered` before `Left` — so a recycled index had its arrival undone
+      by the old tenant's departure in the same tick. Two changes, because
+      one is not enough: the drivers now emit departures first, and a
+      client must check the generation before honouring a `Left` (which is
+      what actually makes it safe, since a hostile peer is not bound by
+      the ordering rule). Both rules are recorded on `EntityItem::key`.
+
+      *The existing test `a_recycled_index_does_not_confuse_the_client`
+      passed throughout, because it stopped at tick 2 — where the entity
+      arrives as `Entered`, which carries a generation. Tick 3 is the first
+      `Updated`. The test now runs that tick, and was **verified
+      load-bearing**: reverting the keying makes it fail at tick 3 with
+      `generation: 0` against the server's `1`, while the other five e2e
+      tests stay green. A test that would not have caught the bug is worth
+      nothing, so this check is the point.*
+
+- [x] **N2 — one forged ack permanently disabled a client's stall
+      detection.** Fixed. `Ack::decode` accepts any four bytes as a `u32`
+      (`replication.rs:124-127`), `record_ack` checked only monotonicity,
+      and `plan` computes `tick.saturating_sub(reference)` (`:342`). A
+      single `Ack { tick: u32::MAX }` pinned that difference at zero
+      forever: the stall check could never fire, the client was never
+      re-keyframed however far it drifted, and the server deltad against a
+      baseline it knew the client had not confirmed — holding that
+      baseline's memory for the life of the connection.
+
+      Measured before the fix: **0 keyframes over 10,000 ticks** against
+      109 for an honest silent client.
+
+      `record_ack` now takes `now: u32` and drops acks from the future.
+      Dropped, not clamped — clamping to `now` would let a peer pin the
+      watermark at the present tick every tick and never fall behind by
+      construction, the same exploit in better manners. The bound lives in
+      the method rather than at call sites because the example's net thread
+      already re-implemented a monotonic check and *still* would not have
+      caught this.
+
+      *Signature change: `record_ack(ack)` → `record_ack(ack, now)`. Nine
+      call sites updated. The unit tests pass a real tick rather than
+      `u32::MAX`, so the bound stays live in every test instead of being
+      bypassed by the tests that exist to check it.*
+
+### Still open from the second audit
+
+- [ ] **N3 — silent slow-motion under sustained tick overrun.** MEASURED,
+      not yet fixed. `app_headless.rs:87-134` has no instrumentation at
+      all: no timing around `fixed_update`, no count of steps requested
+      versus run, no overrun signal. When a tick overruns, the loop skips
+      its sleep, feeds true elapsed time to `advance`, and `MAX_ACCUM_S`
+      silently discards the excess.
+
+      | `fixed_update` cost | sim/wall | sim time lost per 3 s |
+      | --- | --- | --- |
+      | 20 ms | 98.5% | 0.04 s |
+      | 35 ms | 94.2% | 0.18 s |
+      | 50 ms | 66.0% | 1.07 s |
+      | 100 ms | 33.0% | 2.30 s |
+
+      Degradation is smooth, so there is no threshold anyone notices
+      crossing. The asymmetry is the point: the *windowed* loop measures
+      `update_ms`, rolls it into `PerfStats`, prints `[perf]` every second
+      and stores a `PerfSnapshot` for an overlay (`app.rs:393`, `:406`,
+      `:182`). The server — the one loop with no human watching it —
+      measures nothing. An operator's first evidence of overload is player
+      complaints. Fixing it touches `app_headless.rs` only.
+
+- [ ] **N4 — `!entered.contains(id)` is a linear scan per visible
+      entity.** MEASURED. Both drivers build the update list this way
+      (`replication_server.rs:285`, `replication_e2e.rs:254`). Steady
+      state is genuinely cheap — 0.31 ms at 500 clients with `entered`
+      empty — but it bites exactly on a mass-arrival tick: **271 ms at 500
+      clients** with 1834 entered, against a 33.3 ms budget. That is the
+      post-keyframe tick and any shard migration, restart or crowd event,
+      and `KeyframeBudget` deliberately staggers keyframes so those ticks
+      recur rather than passing once. Driver-side, small: a `HashSet`, or
+      exploit that both lists are already sorted.
+
+- [ ] **N5 — `diff` allocates a fresh `HashSet` per client per tick.**
+      MEASURED. `replication.rs:410` builds `seen` from the visible set on
+      every call: **55 µs per client, 27.5 ms for 500** — most of a tick,
+      on top of the ~12.5 ms R3 measured for AoI and encode. The
+      `entered`/`left` buffers are caller-owned precisely to avoid
+      allocation, and this line quietly undoes that. Fix mirrors
+      `AoiScratch`: hoist the set into caller-owned scratch.
+
+- [ ] **N6 — no timeout on the ack read path.** REASONED, not tested.
+      `read_msg` awaits `read_exact` on the 4-byte prefix with no timeout
+      (`framing.rs:46-62`), and the example accepts uni streams
+      sequentially (`replication_server.rs:382`). A client that opens a
+      stream and sends nothing parks that connection's ack loop forever.
+      Per-connection rather than server-wide, and quinn's stream limits
+      bound the rest — but it is a hazard in the driver games will copy.
+
+### Measured and deliberately NOT fixed
+
+*Recorded so nobody re-derives them. Each is real and each needs a
+workload nobody reaches.*
+
+- **Never-shrinking component columns.** `ComponentStorage::insert`
+  resizes to `index + 1` and nothing shrinks (`ecs/world.rs:47-52`,
+  `:70-74`). The watermark tracks **peak concurrency, not cumulative
+  spawns**: 600k spawns over 3,000 ticks left `next_index` at **700** —
+  the free list recycles perfectly. Only overlapping lifetimes raise it.
+  Needs millions of genuinely concurrent entities to matter; at 500
+  players it is a few hundred KiB.
+- **Sparse-component queries scan the whole index space.** `iter2` walks
+  A's entire column (`ecs/world.rs:416`). Measured 75x slower for 500
+  players spawned *after* 200k transients than before them — but the
+  absolute cost is 0.0376 ms. Twenty such systems need **~5M concurrent
+  entities** to threaten a tick. The ratio is alarming and the number is
+  not; reporting it as a defect at 500 players would be exactly the error
+  that killed four of the first audit's five items.
+- **`despawn` walks every registered storage** (`ecs/world.rs:150-152`):
+  13.6 ns at 2 component kinds, 20.9 ns at 10. Linear in kinds, trivial
+  constant. 10 µs per tick at 500 despawns.
+- **`physics::integrate` clones every mover into a fresh `Vec`**
+  (`physics.rs:34-36`): 0.0129 ms at 500 movers, 1.66 ms at 50k. Worth
+  revisiting only above ~50k movers.
+
+### Checked and found sound
+
+Ack replay and reordering; malformed-ack rejection; hostile length
+prefixes (`max_names`/`max_items` are checked before `with_capacity`, so a
+10-byte packet claiming 8192 items costs 170 ns and errors); `bits_remaining`
+underflow (unreachable — `read_bit` refuses before advancing); the name
+table leaking server-only components (filtered on `on_the_wire()`);
+`KeyframeBudget` (1000 clients drain in 77 ticks); chunking and `ChunkHint`
+termination; `SpatialGrid::remove`/`update` tripping the documented
+bare-index hazard (neither driver calls them); the spiral-of-death guard
+(`MAX_ACCUM_S` behaves as documented); entity-id generational safety and
+free-list recycling; the narrow-phase SAT helpers (allocation-free, no
+hidden quadratic); `tile_collide` (fixed 5×5 neighbourhood, bounded).
+
+---
+
 ## Downstream breakage owed
 
 The engine is kept clean in preference to backward compatibility, so a

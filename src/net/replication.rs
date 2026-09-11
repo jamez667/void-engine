@@ -290,12 +290,42 @@ impl ClientLink {
     /// Entities the client is believed to hold.
     pub fn baseline_len(&self) -> usize { self.baseline.len() }
 
-    /// Record a client's acknowledgement.
+    /// Record a client's acknowledgement of everything up to `ack.tick`,
+    /// as of server tick `now`.
     ///
     /// Out-of-order and replayed acks are ignored rather than rejected:
     /// they are normal on a lossy link, and an ack older than one already
     /// seen carries no information. Returns whether the watermark moved.
-    pub fn record_ack(&mut self, ack: Ack) -> bool {
+    ///
+    /// # An ack is peer input, not a fact
+    ///
+    /// `now` is what makes this safe, and it is a required argument for
+    /// that reason. An ack is four attacker-controlled bytes
+    /// ([`Ack::decode`] accepts any `u32`), and the watermark it sets is
+    /// what [`plan`] measures staleness against. A client that claims to
+    /// have applied a tick the server has not yet *sent* is either broken
+    /// or lying, and either way the claim cannot be true.
+    ///
+    /// Accepting it is not a small error. `plan` computes
+    /// `tick.saturating_sub(reference)`, so a single forged
+    /// `Ack { tick: u32::MAX }` pins that difference at zero forever: the
+    /// stall check can never fire again, the client is never re-keyframed
+    /// however far it drifts, and the server deltas against a baseline the
+    /// client never confirmed — while holding that baseline's memory for
+    /// the life of the connection. Measured before this bound existed: 0
+    /// keyframes over 10,000 ticks against 109 for an honest silent
+    /// client.
+    ///
+    /// Acks from the future are therefore dropped, not clamped. Clamping
+    /// to `now` would still let a peer pin the watermark at the present
+    /// tick every tick and never fall behind by construction, which is the
+    /// same exploit wearing a politer hat.
+    ///
+    /// [`plan`]: ClientLink::plan
+    pub fn record_ack(&mut self, ack: Ack, now: u32) -> bool {
+        if ack.tick > now {
+            return false;
+        }
         match self.acked_tick {
             Some(t) if ack.tick <= t => false,
             _ => {
@@ -536,15 +566,45 @@ mod tests {
     #[test]
     fn stale_and_replayed_acks_are_ignored() {
         let mut link = ClientLink::new(90);
-        assert!(link.record_ack(Ack { tick: 10 }), "first ack moves the watermark");
+        assert!(link.record_ack(Ack { tick: 10 }, 100), "first ack moves the watermark");
         assert_eq!(link.acked_tick(), Some(10));
 
-        assert!(!link.record_ack(Ack { tick: 10 }), "a replay moves nothing");
-        assert!(!link.record_ack(Ack { tick: 4 }), "an older ack moves nothing");
+        assert!(!link.record_ack(Ack { tick: 10 }, 100), "a replay moves nothing");
+        assert!(!link.record_ack(Ack { tick: 4 }, 100), "an older ack moves nothing");
         assert_eq!(link.acked_tick(), Some(10), "and the watermark holds");
 
-        assert!(link.record_ack(Ack { tick: 11 }));
+        assert!(link.record_ack(Ack { tick: 11 }, 100));
         assert_eq!(link.acked_tick(), Some(11));
+    }
+
+    /// An ack for a tick the server has not sent is a claim that cannot be
+    /// true, and accepting it disables the stall detector permanently:
+    /// `plan` measures `tick.saturating_sub(acked)`, so `u32::MAX` pins
+    /// that at zero for the life of the connection.
+    #[test]
+    fn an_ack_from_the_future_is_refused() {
+        let mut link = ClientLink::new(10);
+        link.plan(1, &mut budget());
+        link.commit_keyframe(1, [ent(1)]);
+
+        assert!(!link.record_ack(Ack { tick: u32::MAX }, 5), "a forged ack must not land");
+        assert!(!link.record_ack(Ack { tick: 6 }, 5), "one tick ahead is still ahead");
+        assert_eq!(link.acked_tick(), None, "nothing forged may reach the watermark");
+
+        // The stall detector must still work afterwards.
+        assert!(
+            matches!(link.plan(100, &mut budget()), Plan::Keyframe(_)),
+            "a client that never legitimately acked must still stall",
+        );
+    }
+
+    /// The bound is `<= now`, not `< now`: acking the tick just sent is
+    /// the normal case, not an attack.
+    #[test]
+    fn an_ack_for_the_current_tick_is_accepted() {
+        let mut link = ClientLink::new(90);
+        assert!(link.record_ack(Ack { tick: 7 }, 7), "acking the tick just sent is legitimate");
+        assert_eq!(link.acked_tick(), Some(7));
     }
 
     /// A client that stops acknowledging gets a keyframe rather than the
@@ -555,7 +615,7 @@ mod tests {
         let mut link = ClientLink::new(90);
         link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
-        link.record_ack(Ack { tick: 1 });
+        link.record_ack(Ack { tick: 1 }, 1);
 
         assert_eq!(link.plan(50, &mut budget()), Plan::Delta, "49 ticks behind is within the limit");
         assert_eq!(link.plan(91, &mut budget()), Plan::Delta, "90 behind is exactly the limit");
@@ -572,7 +632,7 @@ mod tests {
         let mut link = ClientLink::new(10);
         link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
-        link.record_ack(Ack { tick: 1 });
+        link.record_ack(Ack { tick: 1 }, 1);
 
         let Plan::Keyframe(owed) = link.plan(100, &mut budget()) else { panic!("stalled") };
         assert_eq!(link.plan(100, &mut budget()), Plan::Keyframe(owed), "asking again must not clear it");
@@ -597,7 +657,7 @@ mod tests {
         let mut link = ClientLink::new(window);
         link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
-        link.record_ack(Ack { tick: 1 });
+        link.record_ack(Ack { tick: 1 }, 1);
 
         // The client goes silent here: no further acks, ever.
         let mut keyframes = 0;
@@ -623,7 +683,7 @@ mod tests {
         let mut link = ClientLink::new(10);
         link.plan(1, &mut budget());
         link.commit_keyframe(1, [ent(1)]);
-        link.record_ack(Ack { tick: 5 });
+        link.record_ack(Ack { tick: 5 }, 5);
 
         link.plan(20, &mut budget());
         link.commit_keyframe(20, [ent(1)]);
@@ -705,7 +765,7 @@ mod tests {
 
         link.plan(1, &mut budget);
         link.commit_keyframe(1, [ent(1)]);
-        link.record_ack(Ack { tick: 1 });
+        link.record_ack(Ack { tick: 1 }, 1);
         budget.begin();
 
         assert_eq!(link.plan(2, &mut budget), Plan::Delta);

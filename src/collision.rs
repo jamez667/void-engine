@@ -82,8 +82,8 @@ pub struct SpatialGrid {
 /// Indices remain the currency *within* a tick: [`query_pairs`] and
 /// [`AoiScratch::hits`] both yield raw indices, because nothing is removed
 /// mid-query and resolving a generation per hit would cost more than it
-/// buys. Hold a `ColliderId` when a handle must survive a [`remove`];
-/// hold an index when it must not.
+/// buys. Hold a `ColliderId` when a handle must survive a
+/// [`SpatialGrid::remove`]; hold an index when it must not.
 ///
 /// [`EntityId`]: crate::ecs::EntityId
 /// [`query_pairs`]: SpatialGrid::query_pairs

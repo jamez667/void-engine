@@ -245,7 +245,10 @@ impl App for Server {
         // has landed since the last tick.
         let acked = self.acked.load(Ordering::Relaxed);
         if acked > 0 {
-            self.link.record_ack(Ack { tick: acked });
+            // `self.tick` is the bound: a client cannot have applied a
+            // tick this server has not sent. Without it a forged
+            // `u32::MAX` would pin the stall detector open forever.
+            self.link.record_ack(Ack { tick: acked }, self.tick);
         }
 
         self.rebuild_grid(ctx.world);
@@ -275,10 +278,13 @@ impl App for Server {
             self.link.diff(&visible, &mut self.entered, &mut self.left);
             let entered = self.entered.clone();
             let left = self.left.clone();
-            entered
-                .iter()
-                .map(|&id| self.item(ctx.world, id, ItemKind::Entered))
-                .chain(left.iter().map(|&id| EntityItem::left(id)))
+            // Departures first: a recycled index can be both a `Left` (old
+            // tenant) and an `Entered` (new one) in the same tick, and an
+            // index-keyed client would have the removal undo the arrival
+            // if these came the other way round. See `EntityItem::key`.
+            left.iter()
+                .map(|&id| EntityItem::left(id))
+                .chain(entered.iter().map(|&id| self.item(ctx.world, id, ItemKind::Entered)))
                 .chain(
                     visible
                         .iter()
@@ -453,7 +459,10 @@ async fn client_task(
         }
     };
 
-    let mut entities: HashMap<EntityId, DVec2> = HashMap::new();
+    // Keyed by entity index: an `Updated` carries no generation, so the
+    // full `EntityId` would file it under a different key than the
+    // `Entered` that introduced the entity. See `EntityItem::key`.
+    let mut entities: HashMap<u32, DVec2> = HashMap::new();
     let mut names: HashMap<NameId, String> = HashMap::new();
     let mut applied = 0u32;
 
@@ -492,12 +501,16 @@ async fn client_task(
             names.insert(entry.id, entry.name.clone());
         }
         for item in &packet.items {
+            // Keyed by index: an `Updated` carries no generation, so the
+            // full `EntityId` would file it under a different key than the
+            // `Entered` that introduced this entity. See
+            // `EntityItem::key`.
             match item.kind {
                 ItemKind::Entered | ItemKind::Updated => {
-                    entities.insert(item.entity, item.pos);
+                    entities.insert(item.key(), item.pos);
                 }
                 ItemKind::Left => {
-                    entities.remove(&item.entity);
+                    entities.remove(&item.key());
                 }
             }
         }
