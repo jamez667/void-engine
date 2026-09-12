@@ -35,6 +35,14 @@
 pub mod bitpack;
 pub mod chunk;
 pub mod framing;
+/// Client-to-server input: held state, one-shot commands, and the rule for
+/// reconciling frames that arrive out of order.
+///
+/// On the plain `net` axis deliberately. It needs no component registry,
+/// no entities and no snapshot — only the observation that input has a
+/// level half and an edge half that reconcile differently. A game doing
+/// its own replication over `chunk` and `quic` wants this too.
+pub mod input;
 pub mod interp;
 pub mod quic;
 #[cfg(feature = "replication")]

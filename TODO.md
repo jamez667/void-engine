@@ -1120,6 +1120,76 @@ where it does not.
       `from_store`: the in-memory tier is the one with no database to
       query, so if these audits are not on this page they are nowhere.*
 
+## Client input, lifted (2026-09-11)
+
+`net::input` — `InputFrame<H, C>`, `InputQueue<H, C>`, `Pending<H, C>`.
+On the plain `net` axis: it needs no registry, no entities and no
+snapshot, and mini-miner-2 builds with `["client", "net"]` only.
+
+**Input has two halves that reconcile differently, and encoding both as
+fields of a per-tick struct is the trap.** Held state (walk direction,
+throttle) is a *level* — newest wins, and applying an older frame walks
+the player backwards. One-shot commands are *events* — every one must
+apply exactly once. A 60 Hz client into a 30 Hz server sends a
+zero-valued packet between ticks, which overwrites a one-shot before the
+simulation reads it.
+
+Both games converged on this from opposite directions:
+
+| | mini-miner-2 | void-claim |
+| --- | --- | --- |
+| one-shots | `commands: Vec<WireCommand>` | flat fields on `InputPacket` |
+| edge detection | structural | **46** `let prev_x =` lines in `connection.rs` |
+
+void-claim's comments record three separate waves of the same bug —
+*"F sometimes needs many presses"*, *"Phase G one-shot terminal
+fields… same race that hit dock/sell_ore originally"*, *"Stranding
+one-shots. Same 60 Hz-erases-a-click race as every field above."*
+mini-miner-2's own comment cites it as the thing it was avoiding, and
+undercounted at "thirty-odd".
+
+**A defect found in the good implementation while lifting it.**
+`keep_newest` replaces the *whole frame* on a newer `seq`. Correct for
+held state; it silently discards the older frame's `commands`, which were
+never applied. `poll_inputs` drains once per host tick while the net
+thread accepts every datagram, so two frames between drains is routine at
+60 Hz into 30 Hz — and all three of its tests construct frames with
+`commands: Vec::new()`, so none would notice.
+
+*Not proven to be a live gameplay bug: that needs timing evidence from a
+real session, and "two frames between drains" may be rare enough that a
+dropped click has never been reported. The code path drops them.*
+
+So the engine version **merges commands and replaces held state**, with
+the `InputQueue` owning the rule rather than each game rediscovering it.
+Late frames contribute their commands but not their held state — a
+command that arrives out of order is old, not imaginary.
+
+**Flood cap**: `MAX_PENDING_COMMANDS = 32` per player per drain,
+oldest-dropped, with a `dropped` counter on `Pending`. An unbounded merge
+would let one client make the server do arbitrary work in a tick;
+dropping *oldest* keeps the press the player is watching for, which is
+the same bug both games already fixed once. A zero cap is legal and means
+"this game has no discrete actions" — and caught a `remove(0)`-on-empty
+panic in my own first draft.
+
+*The wire format stays game-owned: `H` and `C` are the game's types and
+the game encodes them. void-claim's vocabulary and mini-miner-2's have
+nothing in common. What is lifted is the reconciliation rule.*
+
+*An authority property worth preserving when games adopt it:
+mini-miner-2's `WireCommand` is deliberately not its local `Command` —
+that carries a `Vec2` computed from the client's own camera. Its `Act`
+sends a menu **row index**, so a client can only pick what it was
+offered; `GrabNearest` carries nothing, because "what is nearest" is the
+server's question to answer. `C` is whatever a game says, but a command
+type is a security boundary.*
+
+### Still to do
+
+- [ ] mini-miner-2 adopts `InputQueue`, which fixes the command-loss path.
+- [ ] void-claim migrates `InputPacket`, deleting the 46 latch lines.
+
 ## The single-node ceiling (2026-09-11)
 
 `examples/load_sweep.rs`, a permanent target. Drives the real pipeline —
