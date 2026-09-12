@@ -284,5 +284,11 @@ const BUDGET_AOI: f64 = 22.0; // measured 7.28 on this lattice
 // regression here is not a constant factor — 120 items per client instead
 // of 40 measures 16.4 ms, and a change that quietly tripled per-item cost
 // would still pass a looser budget while eating half the tick.
+// Retightened 2026-09-11 when `BitWriter::write_bits` stopped looping
+// over `write_bit`: this measured 5.77 ms, then 1.78 ms for identical
+// work. Leaving the budget at 15.0 would have silently accepted a full
+// regression back to the per-bit loop — the same trap the ECS budgets
+// were retightened for, and the reason a budget is ~3x a measurement
+// rather than whatever number was true when it was written.
 #[cfg(feature = "replication")]
-const BUDGET_ENCODE: f64 = 15.0; // measured 5.77 at 1000 x 40
+const BUDGET_ENCODE: f64 = 5.0; // measured 1.78 at 1000 x 40 (was 5.77)

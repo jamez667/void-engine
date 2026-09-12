@@ -97,10 +97,50 @@ impl BitWriter {
     ///
     /// `count` above 64 is a caller bug and panics; a wire format is
     /// fixed at compile time, so this cannot be driven by remote input.
+    ///
+    /// # Why this is not a loop over `write_bit`
+    ///
+    /// It was until 2026-09-11, and `write_varint` routes every byte
+    /// through here, so a ~94-bit snapshot item cost ~94 iterations of a
+    /// loop that per bit did a zero-check, a conditional `push`, a
+    /// bounds-checked index and a modulo. Measured at 500 clients, the
+    /// `BitWriter` was 87% of `SnapshotPacket::encode` and this loop was
+    /// 83% of the writer.
+    ///
+    /// The replacement moves whole chunks: as many bits as fit in the
+    /// current byte, then whole bytes, then the tail. Crucially it does
+    /// *not* special-case alignment — a packet's 2-bit `kind` field knocks
+    /// the stream off a byte boundary and it stays off for the rest of the
+    /// item, so a fast path conditioned on alignment would almost never
+    /// fire. Straddling is the common case, not the exception.
     pub fn write_bits(&mut self, value: u64, count: u32) {
         assert!(count <= 64, "cannot write {count} bits from a u64");
-        for i in (0..count).rev() {
-            self.write_bit((value >> i) & 1 == 1);
+        if count == 0 {
+            return;
+        }
+
+        // Bits still to place, most significant first.
+        let mut left = count;
+        while left > 0 {
+            // Room in the byte currently being filled. A fresh byte is
+            // pushed lazily so `byte_len` never counts a byte that holds
+            // nothing — the same invariant `write_bit` maintained.
+            if self.bits_in_last == 0 {
+                self.bytes.push(0);
+            }
+            let room = 8 - self.bits_in_last as u32;
+            let take = room.min(left);
+
+            // The `take` bits at the top of what remains.
+            let shift = left - take;
+            let chunk = ((value >> shift) & ((1u64 << take) - 1)) as u8;
+
+            // Land them immediately below the bits already present.
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= chunk << (room - take);
+
+            self.bits_in_last = (self.bits_in_last + take as u8) % 8;
+            left -= take;
         }
     }
 
@@ -192,11 +232,37 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `count` bits into the low bits of a `u64`.
+    ///
+    /// Mirrors [`BitWriter::write_bits`], chunk for chunk: as many bits as
+    /// remain in the current byte, then whole bytes, then the tail. The
+    /// bounds check happens once up front rather than once per bit, which
+    /// is what the old per-bit loop paid for.
     pub fn read_bits(&mut self, count: u32) -> Result<u64, BitError> {
         assert!(count <= 64, "cannot read {count} bits into a u64");
+        if count == 0 {
+            return Ok(0);
+        }
+        // One check for the whole read. `read_bit` checked per bit, which
+        // is the same answer arrived at `count` times.
+        if self.bit_pos + count as usize > self.bytes.len() * 8 {
+            return Err(BitError::Truncated);
+        }
+
         let mut out = 0u64;
-        for _ in 0..count {
-            out = (out << 1) | self.read_bit()? as u64;
+        let mut left = count;
+        while left > 0 {
+            let bit_in_byte = (self.bit_pos % 8) as u32;
+            let avail = 8 - bit_in_byte;
+            let take = avail.min(left);
+
+            let byte = self.bytes[self.bit_pos / 8];
+            // Drop the bits already consumed from this byte, then keep the
+            // `take` that follow.
+            let chunk = (byte >> (avail - take)) & (((1u16 << take) - 1) as u8);
+
+            out = (out << take) | chunk as u64;
+            self.bit_pos += take as usize;
+            left -= take;
         }
         Ok(out)
     }
@@ -239,6 +305,116 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every width the wire format uses, written at every possible bit
+    /// offset, round-tripping exactly.
+    ///
+    /// This is the contract a fast path has to preserve. `write_bits`
+    /// writes one bit at a time, so straddling a byte boundary is not a
+    /// special case for it — but it is the *only* interesting case for
+    /// any implementation that writes whole bytes, and nothing here
+    /// covered it. A 16-bit position at bit-offset 2 crosses two
+    /// boundaries; an off-by-one in the straddle would corrupt every
+    /// packet silently while the existing tests stayed green.
+    ///
+    /// Deliberately written and passed against the bit-at-a-time
+    /// implementation, so it encodes the format rather than whatever a
+    /// later rewrite happens to do.
+    #[test]
+    fn multi_bit_writes_straddle_byte_boundaries_at_every_offset() {
+        // The widths `snapshot.rs` actually writes: kind, name byte,
+        // rotation, position/velocity, tick.
+        for width in [2u32, 8, 12, 16, 32] {
+            for offset in 0..8u32 {
+                let value: u64 = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+                // A pattern with bits set at both ends and in the middle,
+                // so a shift in the wrong direction shows up.
+                let patterns = [0u64, 1, value, value >> 1, 0b1010_1010_1010_1010 & value];
+
+                for &pattern in &patterns {
+                    let mut w = BitWriter::new();
+                    // Push the stream to `offset` before the real write.
+                    for _ in 0..offset {
+                        w.write_bit(true);
+                    }
+                    w.write_bits(pattern, width);
+                    // And something after, so a write that overruns its
+                    // width corrupts a value we check rather than padding.
+                    w.write_bits(0b101, 3);
+
+                    let bytes = w.finish();
+                    let mut r = BitReader::new(&bytes);
+                    for i in 0..offset {
+                        assert!(r.read_bit().unwrap(), "lead-in bit {i} at offset {offset}");
+                    }
+                    assert_eq!(
+                        r.read_bits(width).unwrap(),
+                        pattern,
+                        "width {width} at offset {offset}, pattern {pattern:#x}",
+                    );
+                    assert_eq!(
+                        r.read_bits(3).unwrap(),
+                        0b101,
+                        "trailer after width {width} at offset {offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Varints are byte-shaped in value but land at arbitrary bit
+    /// offsets, which is the combination a byte-wise fast path is most
+    /// likely to get wrong.
+    #[test]
+    fn varints_round_trip_at_every_bit_offset() {
+        for offset in 0..8u32 {
+            for value in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+                let mut w = BitWriter::new();
+                for _ in 0..offset {
+                    w.write_bit(false);
+                }
+                w.write_varint(value);
+                w.write_bit(true);
+
+                let bytes = w.finish();
+                let mut r = BitReader::new(&bytes);
+                for _ in 0..offset {
+                    assert!(!r.read_bit().unwrap());
+                }
+                assert_eq!(r.read_varint().unwrap(), value, "value {value} at offset {offset}");
+                assert!(r.read_bit().unwrap(), "trailer after {value} at offset {offset}");
+            }
+        }
+    }
+
+    /// A long run of mixed-width writes, read back in the same order.
+    /// Catches state that drifts only after many operations — a
+    /// `bits_in_last` that is right for one write and wrong after twenty.
+    #[test]
+    fn a_long_mixed_sequence_round_trips() {
+        let widths = [1u32, 2, 3, 5, 8, 11, 13, 16, 17, 24, 32];
+        let mut expected = Vec::new();
+        let mut w = BitWriter::new();
+
+        for round in 0..40u64 {
+            for (i, &width) in widths.iter().enumerate() {
+                let max = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+                let value = (round.wrapping_mul(2_654_435_761).wrapping_add(i as u64)) & max;
+                w.write_bits(value, width);
+                expected.push((width, value));
+            }
+        }
+
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        for (n, (width, value)) in expected.iter().enumerate() {
+            assert_eq!(
+                r.read_bits(*width).unwrap(),
+                *value,
+                "operation {n}: {width} bits",
+            );
+        }
+    }
 
     #[test]
     fn bits_round_trip_in_order() {

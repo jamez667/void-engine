@@ -1167,6 +1167,49 @@ without its own controls reports whatever it was built to report.*
 loss, or 8,000 real sockets), no physics, no AI, no game logic. Every
 figure is a floor.*
 
+### `write_bits` rewritten — 4.6x on the column, ceiling ~4,400 clients
+
+Done. `write_bits` looped over `write_bit`, and `write_varint` routes
+every byte through it, so a ~94-bit item cost ~94 iterations of a loop
+doing a zero-check, a conditional `push`, a bounds-checked index and a
+modulo *per bit*. It now moves whole chunks: what fits in the current
+byte, then whole bytes, then the tail. `read_bits` mirrors it, and does
+its bounds check once instead of once per bit.
+
+Deliberately **not** conditioned on alignment: a packet's 2-bit `kind`
+field knocks the stream off a byte boundary and it stays off for the rest
+of the item, so a fast path that required alignment would almost never
+fire. Straddling is the common case.
+
+| clients | encode+send before | after | tick before | after |
+| --- | --- | --- | --- | --- |
+| 500 | 5.64 ms | **1.22 ms** | 7.8 ms | **3.2 ms** |
+| 1,000 | 13.25 | **2.61** | 18.1 | **6.9** |
+| 2,000 | 24.90 | **5.37** | 34.5 | **14.3** |
+| 4,000 | 54.59 | **11.21** | 77.1 | **30.5** |
+| 8,000 | 103.22 | **22.24** | 145.5 | **61.3** |
+
+**The single-node ceiling moves from ~1,500 to ~4,400 clients.** 2,000
+was 104% of budget and is now 43%; 4,000 is 91%.
+
+*Measured the way the entry below insisted: baseline captured from the
+same binary immediately before the change, then re-run after, comparing
+the same column of the same harness. Not a microbenchmark.*
+
+*The safety net came first. Three tests — every wire width at every bit
+offset, varints at every offset, and a 440-operation mixed-width sequence
+— were written and **passed against the old implementation**, so they
+encode the format rather than the rewrite. Plus the 13 existing bitpack
+tests, the 12 snapshot tests, and `replication_e2e`'s 6 tests driving
+real encode→decode across ticks with a client reconstructing server
+state. A silent corruption here would be invisible until packets were
+wrong on the wire.*
+
+*Still on the table: `encode` allocates a fresh `Vec` per call because
+`send_chunked` requires an owned buffer (7.4% of encode, measured), and
+`items`/`diff` are now the joint-largest phases at ~37% combined. AoI is
+no longer dominant anywhere in table A.*
+
 ### Inside `encode+send` — partial, and honest about which part
 
 `items/pkt` is **44.3 at 500 clients**, not the 17 that `seen` reports.
