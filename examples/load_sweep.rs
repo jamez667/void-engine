@@ -159,6 +159,16 @@ struct Phases {
     /// flatters itself. A first run showed 104 datagrams at 16,000
     /// clients, which is what prompted counting this.
     served: u64,
+    /// Items across every packet built this tick.
+    ///
+    /// `seen` reports one sampled client's *visible* set, which is not the
+    /// same as what a packet carries: a delta is `left` + `entered` +
+    /// updated, and on a moving world the first two are never empty. A
+    /// standalone profile that assumed packets were `seen`-sized
+    /// accounted for only a quarter of this column's measured cost, and
+    /// this counter is what distinguishes "the encoder is slow" from "the
+    /// packets are bigger than I assumed".
+    items_sent: u64,
 }
 
 impl Phases {
@@ -176,10 +186,11 @@ impl Phases {
         self.diff = self.diff.min(other.diff);
         self.items = self.items.min(other.items);
         self.send = self.send.min(other.send);
-        // Not a min: this is a count, and the *largest* number served in
-        // any sampled tick is the one that says whether the timings
-        // covered the population.
+        // Not a min: these are counts, and the *largest* seen in any
+        // sampled tick is what says whether the timings covered the
+        // population and how much work they covered.
         self.served = self.served.max(other.served);
+        self.items_sent = self.items_sent.max(other.items_sent);
     }
 
     fn worst() -> Self {
@@ -190,6 +201,7 @@ impl Phases {
             items: f64::MAX,
             send: f64::MAX,
             served: 0,
+            items_sent: 0,
         }
     }
 }
@@ -413,6 +425,7 @@ impl Sim {
                     .collect()
             };
             p.items += t.elapsed().as_secs_f64() * 1000.0;
+            p.items_sent += items.len() as u64;
 
             let packet = SnapshotPacket {
                 tick,
@@ -495,18 +508,19 @@ fn table(title: &str, note: &str, rows: &[(usize, usize, f64, f64)]) {
     println!("\n{title}");
     println!("{note}\n");
     println!(
-        "{:>7} {:>8} {:>7} {:>6} {:>5} | {:>7} {:>7} {:>6} {:>6} {:>9} | {:>9} {:>7}",
-        "clients", "entities", "served", "seen", "occ", "rebuild", "aoi", "diff", "items",
-        "encode+send", "total", "of tick",
+        "{:>7} {:>8} {:>7} {:>6} {:>7} {:>5} | {:>7} {:>7} {:>6} {:>6} {:>9} | {:>9} {:>7}",
+        "clients", "entities", "served", "seen", "items/pkt", "occ", "rebuild", "aoi", "diff",
+        "items", "encode+send", "total", "of tick",
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(122));
 
     for &(clients, entities, half, cell) in rows {
         let (p, datagrams, bytes, seen, occ) = run(entities, clients, half, cell);
         let total = p.total();
+        let per_pkt = if p.served > 0 { p.items_sent as f64 / p.served as f64 } else { 0.0 };
         println!(
-            "{:>7} {:>8} {:>7} {:>6} {:>5.1} | {:>7.2} {:>7.2} {:>6.2} {:>6.2} {:>9.2} | {:>8.1}ms {:>6.0}%",
-            clients, entities, p.served, seen, occ,
+            "{:>7} {:>8} {:>7} {:>6} {:>9.1} {:>5.1} | {:>7.2} {:>7.2} {:>6.2} {:>6.2} {:>9.2} | {:>8.1}ms {:>6.0}%",
+            clients, entities, p.served, seen, per_pkt, occ,
             p.rebuild, p.aoi, p.diff, p.items, p.send,
             total, total / TICK_BUDGET_MS * 100.0,
         );

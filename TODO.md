@@ -1167,6 +1167,39 @@ without its own controls reports whatever it was built to report.*
 loss, or 8,000 real sockets), no physics, no AI, no game logic. Every
 figure is a floor.*
 
+### Inside `encode+send` — partial, and honest about which part
+
+`items/pkt` is **44.3 at 500 clients**, not the 17 that `seen` reports.
+`seen` is the *visible* set; a delta carries `left` + `entered` +
+updated, and on a moving world arrivals and departures are never empty.
+So a steady-state delta is ~2.6x its minimum, which is real traffic
+rather than a harness artifact and is worth knowing before anyone tries
+to size bandwidth from `seen`.
+
+A standalone profile of `SnapshotPacket::encode` measured, at 500
+clients:
+
+| | share |
+| --- | --- |
+| `BitWriter` alone, no packet traversal | 87% of encode |
+| the per-bit loop inside that writer | 83% of writer |
+| fresh `Vec` per call vs a reused writer | 7.4% of encode |
+
+**`write_bits` loops one bit at a time** and `write_varint` routes every
+byte through it, so a ~94-bit item costs ~94 iterations of a branchy
+loop. Writing whole bytes when the buffer is aligned is the obvious fix
+and `bitpack.rs` has round-trip tests to catch a mistake.
+
+*The proportions above are trustworthy; the absolute numbers are not.
+That profile built flat 17-item packets and accounted for only ~23% of
+the measured column — because real packets are 44 items. Scaled for
+size it explains roughly 3,500 of 5,810 µs, with the remainder plausibly
+the per-client `Vec` the sink consumes plus cache behaviour across 500
+distinct item vectors rather than one hot one. **Anyone optimising
+`write_bit` should measure inside `load_sweep`, not beside it** — a
+scratch loop that approximates the real one is how four separate
+conflations happened in a single session.*
+
 ## Third audit (2026-09-11): the client, and everything unswept
 
 Three agents over territory the first two never entered: the render path
