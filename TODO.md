@@ -1261,10 +1261,88 @@ number where it bites, a statement of where it does not.
       covers only logfmt escaping and target filtering — **zero rotation
       coverage**.*
 
-### Still open from the third audit
+### Closed from the third audit
 
-- [ ] **T8 — `TileGrid` multiplies dimensions in `u32`.** MEASURED, not
-      fixed. `new_filled` does `vec![val; (w * h) as usize]` — the multiply
+- [x] **T3 — `Batch` capacity decays instead of ratcheting.** Fixed. A
+      windowed peak plus a lazy shrink: `clear` tracks the largest frame
+      within a `DECAY_FRAMES` window, and at the window boundary shrinks
+      to twice that peak, floored at the initial reserve. A scene in
+      constant or oscillating use keeps its buffer; a spike's memory comes
+      back.
+
+      *Recovery takes **two** windows, ~4 s at 60 fps, not one — the
+      spike's own frame lands inside the first window, so that window's
+      peak is the spike and shrinking to twice it is a no-op. Deliberate:
+      acting on the first window would shrink a scene that spiked on its
+      opening frame before it had shown what it steadily needs. Pinned by
+      `recovery_completes_within_two_windows`.*
+
+      *My first version made the peak an all-time high with no reset, so
+      after a 200k frame it stayed 200k forever and the slack test
+      compared `200000 > 400000` — permanently false. A high-water mark
+      that never falls is precisely the ratchet the fix exists to remove,
+      and I had rebuilt it inside the fix. Caught by the test failing, not
+      by reading.*
+
+      *Six tests, and they are the only ones in `batch.rs` — ~770 lines
+      holding the renderer's core geometry type, every primitive and the
+      vertex layout, previously covered only indirectly through
+      `materials_render`. The gap is narrowed, not closed.*
+
+      *The GPU-side caps in `upload_batch` still ratchet: the same spike
+      pins ~137 MB of buffers with no shrink path. Not fixed here —
+      recreating a GPU buffer on a decay schedule is a separate change
+      with its own failure mode, and the CPU half is where the 92 MB sat.*
+
+- [x] **T8 — `TileGrid` multiplied dimensions in `u32`.** Fixed.
+      `new_filled`, `rebuild_from_rows`, `tile_at` and `set` all widen to
+      `usize` before multiplying, and the two allocating paths use
+      `checked_mul` so an impossible grid fails loudly rather than
+      returning one that lies about itself.
+
+      *Four tests. The 65,536² case cannot be allocated in a test, so that
+      one asserts the arithmetic directly — `wrapping_mul` is 0, the
+      honest product is 4,294,967,296 — which is exactly the condition the
+      old code got wrong.*
+
+- [x] **T9 — a walker tunnelled through walls at one tile per tick.**
+      Fixed. `integrate_walker` now splits the move into sub-steps of at
+      most `MAX_COLLIDE_STEP` (0.5 world units) and resolves collision
+      after each, because an overlap-push resolver cannot see a wall the
+      walker jumped clean over.
+
+      *`collide` changed from `FnOnce` to `FnMut`, which is what made
+      substepping expressible at all. All four in-tree callers pass
+      non-capturing closures and are unaffected; void-claim's
+      `character::integrate` passes one calling its own tile collision,
+      which satisfies `FnMut` unless it moves a captured value.*
+
+      *Wobble is split along with forward motion rather than applied once
+      at the end — otherwise a substepped walker would take its whole
+      sideways lurch after the final collision check. A stationary walker
+      still resolves once, so a wall that moved onto it still pushes out.*
+
+      *Five tests. The load-bearing one drives 1.2 m/tick — 12 m/s
+      sprinting at the 30 Hz headless default — straight at a 1 m wall and
+      asserts the walker stays on its own side; against the old code it
+      ended up through it. One test's tolerance needed loosening from 1e-9
+      to 1e-6: ten summed `0.9/√2` steps differ from one `9.0/√2` step by
+      1.7e-7 in f64, which is accumulation order, not divergence.*
+
+- [x] **T10 / T11 — key releases are readable, and `key_pressed` says
+      what it means.** `key_released` and `mouse_released` added beside
+      the existing accessors. `keys_released` had been written and cleared
+      on the same one-step schedule as presses since edges existed, with
+      no way to read it — so hold-to-charge/release-to-fire could not be
+      expressed through this API at all, while the mouse half was readable
+      only by being a public field.
+
+      *`key_pressed`'s docs now record that a press may already be over: a
+      tap inside one frame sets the press edge and leaves `key_down`
+      false, so `if key_pressed { start_hold() }` + `while key_down` never
+      starts. Four tests, including that sub-frame tap.*
+
+### Still open from the third audit `new_filled` does `vec![val; (w * h) as usize]` — the multiply
       happens in `u32` before the widening, so it wraps in release. Two
       distinct failures, both measured:
 

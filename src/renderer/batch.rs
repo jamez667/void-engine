@@ -380,23 +380,125 @@ pub struct Batch {
     /// Centre and half-size of the tile being drawn, so each vertex can be
     /// given its position within it. Set by the primitives themselves.
     tile: Option<(Vec2, Vec2)>,
+    /// Largest vertex count seen since the last decay. See [`Batch::clear`].
+    recent_peak_verts: usize,
+    /// Largest index count seen since the last decay.
+    recent_peak_indices: usize,
+    /// Consecutive frames whose reserved capacity has dwarfed the recent
+    /// peak. Reset whenever a frame uses what is held.
+    quiet_frames: u32,
 }
+
+/// Frames of slack before [`Batch::clear`] shrinks. At 60 fps this is two
+/// seconds — long enough that a scene flicking between sizes keeps its
+/// buffer, short enough that a map screen's memory comes back promptly.
+const DECAY_FRAMES: u32 = 120;
+
+/// Floor for the vertex buffer, matching `Batch::new`'s initial reserve.
+/// Decaying below this would trade a large one-off allocation for a
+/// steady trickle of small ones.
+const MIN_VERTS: usize = 8192;
+
+/// Floor for the index buffer, matching `Batch::new`.
+const MIN_INDICES: usize = 32768;
 
 impl Batch {
     pub fn new() -> Self {
         Self {
-            vertices: Vec::with_capacity(8192),
-            indices: Vec::with_capacity(32768),
+            vertices: Vec::with_capacity(MIN_VERTS),
+            indices: Vec::with_capacity(MIN_INDICES),
             surface: None,
             tile: None,
+            recent_peak_verts: 0,
+            recent_peak_indices: 0,
+            quiet_frames: 0,
         }
     }
 
+    /// Drop this frame's geometry, keeping the buffers for the next one.
+    ///
+    /// # The capacity decays; it does not ratchet
+    ///
+    /// `clear` keeps capacity, which is the whole point — a steady scene
+    /// reuses the same allocation every frame and the vertex `Vec` never
+    /// calls the allocator again. But kept capacity with no way down meant
+    /// a *transient* spike became a permanent floor: measured, one
+    /// 200k-rect frame took the main batch from 0.7 MB to **92 MB**, and
+    /// 600 quiet frames afterwards left it at 92 MB. Across the three
+    /// batches a renderer owns, one spike pinned **264 MB** for the life
+    /// of the process. A player who opens a zoomed-out map once pays that
+    /// until they quit.
+    ///
+    /// So the high-water mark is tracked and the buffers shrink when the
+    /// recent peak has stayed well below what is held. Shrinking *every*
+    /// frame would reintroduce exactly the per-frame allocation capacity
+    /// exists to avoid, so the decay is deliberately lazy: it acts only at
+    /// the end of a `DECAY_FRAMES` window (120 frames, two seconds at
+    /// 60 fps), and shrinks to twice that window's peak rather than to the
+    /// peak itself, leaving headroom for the next frame's jitter.
+    ///
+    /// A spike therefore costs up to *two* windows before its memory
+    /// returns: the spike's own frame lands inside the first window, whose
+    /// peak is the spike, so shrinking to twice it is a no-op. Only the
+    /// second window sees quiet traffic and can pull the buffer down.
+    ///
+    /// A scene whose size genuinely oscillates therefore keeps its large
+    /// buffer, which is correct: it will need it again shortly.
     pub fn clear(&mut self) {
+        // Peak *within the current window*, not an all-time high. The
+        // first version of this took `len().max(recent_peak)` with no
+        // reset, which made the peak monotonic: after one 200k frame it
+        // stayed 200k forever, the "is there slack?" test compared
+        // 200000 > 400000, and the decay it gated could never fire. A
+        // high-water mark that never falls is exactly the ratchet this
+        // exists to remove.
+        self.recent_peak_verts = self.recent_peak_verts.max(self.vertices.len());
+        self.recent_peak_indices = self.recent_peak_indices.max(self.indices.len());
+        self.quiet_frames += 1;
+
+        if self.quiet_frames >= DECAY_FRAMES {
+            // Shrink to twice the window's peak, leaving headroom for the
+            // next frame's jitter — a scene that genuinely needs the space
+            // asked for it during the window and keeps it.
+            let want_v = self.recent_peak_verts.saturating_mul(2).max(MIN_VERTS);
+            let want_i = self.recent_peak_indices.saturating_mul(2).max(MIN_INDICES);
+            if self.vertices.capacity() > want_v {
+                self.vertices.shrink_to(want_v);
+            }
+            if self.indices.capacity() > want_i {
+                self.indices.shrink_to(want_i);
+            }
+            // Start the next window from nothing, so a quiet stretch can
+            // pull the buffer down step by step rather than being pinned
+            // by something that happened minutes ago.
+            self.quiet_frames = 0;
+            self.recent_peak_verts = 0;
+            self.recent_peak_indices = 0;
+        }
+
         self.vertices.clear();
         self.indices.clear();
         self.surface = None;
         self.tile = None;
+    }
+
+    /// Capacity currently reserved, in vertices. Exposed for tests and for
+    /// a game that wants to show its own memory use.
+    pub fn reserved_vertices(&self) -> usize { self.vertices.capacity() }
+
+    /// Capacity currently reserved, in indices.
+    pub fn reserved_indices(&self) -> usize { self.indices.capacity() }
+
+    /// Push `n` placeholder vertices, for tests that need a batch of a
+    /// given size without caring what is in it.
+    ///
+    /// `zeroed()` rather than `default()`: `Vertex` derives `Pod` and
+    /// `Zeroable` but not `Default`, and an all-zero vertex is a valid
+    /// one — material 0 is the plain solid-colour path.
+    #[cfg(test)]
+    fn fill_for_test(&mut self, n: usize) {
+        self.vertices.resize(n, bytemuck::Zeroable::zeroed());
+        self.indices.resize(n, 0u32);
     }
 
     /// Draw following geometry with a procedural surface.
@@ -679,5 +781,139 @@ impl Batch {
 impl Default for Batch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Capacity decay — the only tests in this file.
+///
+/// Worth noting that `batch.rs` had **no test module** before these: ~770
+/// lines holding the renderer's core geometry type, every primitive, and
+/// the vertex layout, covered only indirectly through `materials_render`.
+/// These cover the decay policy and nothing else, so the gap is narrowed
+/// rather than closed.
+#[cfg(test)]
+mod decay_tests {
+    use super::*;
+
+    const SPIKE: usize = 200_000;
+
+    /// The defect: one heavy frame made its own size the permanent floor.
+    /// Measured at 92 MB for the main batch alone, held for the life of
+    /// the process however quiet every later frame was.
+    ///
+    /// # Recovery takes two windows, not one
+    ///
+    /// The spike's own frame lands *inside* the first window, so that
+    /// window's peak is the spike itself and shrinking to twice it is a
+    /// no-op. Only the second window — whose peak is the quiet traffic —
+    /// can actually pull the buffer down. So a spike costs up to
+    /// `2 * DECAY_FRAMES` frames of held memory, about four seconds at
+    /// 60 fps, and this loops accordingly.
+    ///
+    /// That is a deliberate property rather than a rounding error: acting
+    /// on the first window would mean a scene that spikes on its opening
+    /// frame gets shrunk before it has shown what it steadily needs.
+    #[test]
+    fn a_spike_does_not_pin_capacity_forever() {
+        let mut b = Batch::new();
+        b.fill_for_test(SPIKE);
+        b.clear();
+        let after_spike = b.reserved_vertices();
+        assert!(after_spike >= SPIKE, "the spike must have grown the buffer");
+
+        for _ in 0..(DECAY_FRAMES * 2 + 2) {
+            b.fill_for_test(64);
+            b.clear();
+        }
+
+        assert!(
+            b.reserved_vertices() < after_spike,
+            "capacity never came down: {} still reserved",
+            b.reserved_vertices(),
+        );
+    }
+
+    /// And it comes down *promptly* once the second window closes —
+    /// pinning the bound so a future change cannot quietly make recovery
+    /// take minutes.
+    #[test]
+    fn recovery_completes_within_two_windows() {
+        let mut b = Batch::new();
+        b.fill_for_test(SPIKE);
+        b.clear();
+
+        for _ in 0..(DECAY_FRAMES * 2 + 2) {
+            b.fill_for_test(64);
+            b.clear();
+        }
+
+        // Twice the quiet peak (64), floored at MIN_VERTS.
+        assert!(
+            b.reserved_vertices() <= MIN_VERTS.max(128) * 2,
+            "expected to settle near the floor, got {}",
+            b.reserved_vertices(),
+        );
+    }
+
+    /// Decaying must not undercut the initial reserve, or a steady small
+    /// scene trades one big allocation for a trickle of little ones.
+    #[test]
+    fn decay_stops_at_the_floor() {
+        let mut b = Batch::new();
+        b.fill_for_test(SPIKE);
+        b.clear();
+        for _ in 0..(DECAY_FRAMES * 4) {
+            b.fill_for_test(8);
+            b.clear();
+        }
+        assert!(
+            b.reserved_vertices() >= MIN_VERTS,
+            "shrank below the floor to {}",
+            b.reserved_vertices(),
+        );
+        assert!(b.reserved_indices() >= MIN_INDICES);
+    }
+
+    /// A scene that keeps needing the space keeps it. This is the reason
+    /// the decay is lazy rather than shrinking on every `clear`.
+    #[test]
+    fn a_sustained_load_keeps_its_buffer() {
+        let mut b = Batch::new();
+        for _ in 0..(DECAY_FRAMES * 2) {
+            b.fill_for_test(SPIKE);
+            b.clear();
+        }
+        assert!(
+            b.reserved_vertices() >= SPIKE,
+            "a batch in constant use must not be shrunk out from under itself: {}",
+            b.reserved_vertices(),
+        );
+    }
+
+    /// An oscillating scene — heavy every other frame — must also keep its
+    /// buffer, since it will need it again next frame.
+    #[test]
+    fn an_alternating_load_keeps_its_buffer() {
+        let mut b = Batch::new();
+        for i in 0..(DECAY_FRAMES * 2) {
+            b.fill_for_test(if i % 2 == 0 { SPIKE } else { 32 });
+            b.clear();
+        }
+        assert!(
+            b.reserved_vertices() >= SPIKE,
+            "an alternating load should not decay: {}",
+            b.reserved_vertices(),
+        );
+    }
+
+    /// `clear` still does what it always did: the geometry goes.
+    #[test]
+    fn clear_still_empties_the_batch() {
+        let mut b = Batch::new();
+        b.fill_for_test(1000);
+        assert_eq!(b.vertices.len(), 1000);
+        b.clear();
+        assert!(b.vertices.is_empty());
+        assert!(b.indices.is_empty());
     }
 }

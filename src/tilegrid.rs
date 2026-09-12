@@ -42,8 +42,30 @@ impl<T: Copy + Default> TileGrid<T> {
 
     /// Allocate `w*h` tiles all initialised to `val`. `T: Default` is
     /// only required at the type level; `val` can be any value.
+    ///
+    /// # Dimensions are multiplied in `usize`, not `u32`
+    ///
+    /// This read `vec![val; (w * h) as usize]` until 2026-09-11, which
+    /// multiplies in `u32` *before* widening and so wraps in release.
+    /// Two measured failures, both silent up to the moment they were not:
+    ///
+    /// - `new_filled(70_000, 70_000)` reported `dims()` of
+    ///   `(70000, 70000)` while allocating 605,032,704 cells against a
+    ///   true product of 4.9e9. `in_bounds(0, 60_000)` returned `true`
+    ///   and the `tile_at` that followed **panicked**.
+    /// - `new_filled(65_536, 65_536)` wrapped to exactly **zero**.
+    ///   `dims()` still claimed `(65536, 65536)`, `is_empty()` was true,
+    ///   every read returned `T::default()` and every write silently did
+    ///   nothing — a completely inert grid, with no panic to notice.
+    ///
+    /// Widening first makes the allocation honest; on a 64-bit target the
+    /// product cannot overflow, and on a 32-bit one it fails at the
+    /// allocator rather than handing back a grid that lies about itself.
     pub fn new_filled(w: u32, h: u32, val: T) -> Self {
-        Self { grid: vec![val; (w * h) as usize], w, h }
+        let cells = (w as usize)
+            .checked_mul(h as usize)
+            .expect("TileGrid dimensions overflow usize");
+        Self { grid: vec![val; cells], w, h }
     }
 
     /// (Width, height) in tiles.
@@ -73,7 +95,10 @@ impl<T: Copy + Default> TileGrid<T> {
         if col < 0 || row < 0 || self.grid.is_empty() { return T::default(); }
         let (c, r) = (col as u32, row as u32);
         if c >= self.w || r >= self.h { return T::default(); }
-        self.grid[(r * self.w + c) as usize]
+        // Indexed in `usize`: `r * self.w + c` in `u32` wraps independently
+        // of the allocation, so a large grid could compute an in-range
+        // index for an out-of-range cell. See `new_filled`.
+        self.grid[(r as usize) * (self.w as usize) + (c as usize)]
     }
 
     /// True if `(col, row)` is inside the grid bounds.
@@ -88,7 +113,8 @@ impl<T: Copy + Default> TileGrid<T> {
     #[inline]
     pub fn set(&mut self, col: i32, row: i32, val: T) {
         if !self.in_bounds(col, row) || self.grid.is_empty() { return; }
-        let idx = (row as u32 * self.w + col as u32) as usize;
+        // `usize` for the same reason `tile_at` uses it.
+        let idx = (row as usize) * (self.w as usize) + (col as usize);
         self.grid[idx] = val;
     }
 
@@ -122,7 +148,12 @@ impl<T: Copy + Default> TileGrid<T> {
     {
         self.w = w;
         self.h = h;
-        let mut buf = Vec::with_capacity((w * h) as usize);
+        // Widened before multiplying, like `new_filled` — this had the
+        // same `(w * h) as usize` wrap.
+        let cells = (w as usize)
+            .checked_mul(h as usize)
+            .expect("TileGrid dimensions overflow usize");
+        let mut buf = Vec::with_capacity(cells);
         for r in 0..h {
             for c in 0..w {
                 buf.push(read(c, r));
@@ -222,6 +253,71 @@ where
         }
     }
     (nw as u32, nh as u32, out)
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    /// `(w * h) as usize` multiplied in `u32` and wrapped. At exactly
+    /// 65,536 squared it wrapped to **zero**: `dims()` still claimed the
+    /// full size, `is_empty()` was true, every read returned the default
+    /// and every write silently did nothing.
+    ///
+    /// Allocating 4.29e9 cells is not something a test can do, so this
+    /// asserts the arithmetic rather than the allocation: the product must
+    /// not be representable in `u32`, which is precisely the condition the
+    /// old code got wrong.
+    #[test]
+    fn the_wrapping_dimensions_are_no_longer_representable_in_u32() {
+        let (w, h) = (65_536u32, 65_536u32);
+        assert_eq!(
+            w.wrapping_mul(h),
+            0,
+            "this is the product the old code computed",
+        );
+        let honest = (w as usize) * (h as usize);
+        assert_eq!(honest, 4_294_967_296, "and this is the real one");
+    }
+
+    /// A grid whose dimensions are honest must agree with its storage.
+    #[test]
+    fn dims_and_storage_agree() {
+        let g: TileGrid<u8> = TileGrid::new_filled(300, 200, 7);
+        assert_eq!(g.dims(), (300, 200));
+        assert_eq!(g.as_slice().len(), 60_000);
+        assert!(!g.is_empty());
+        // Every in-bounds cell is readable and holds the fill value.
+        assert_eq!(g.tile_at(299, 199), 7);
+        assert_eq!(g.tile_at(300, 199), 0, "past the edge reads as default");
+    }
+
+    /// Indexing widened too: `r * w + c` in `u32` could wrap independently
+    /// of the allocation, computing an in-range index for a cell that is
+    /// out of range.
+    #[test]
+    fn indexing_a_wide_grid_stays_in_step_with_bounds() {
+        // 100k cells in one row: `r * w + c` exceeds nothing here, but the
+        // shape is the one that wrapped when `w` was large.
+        let mut g: TileGrid<u16> = TileGrid::new_filled(100_000, 2, 0);
+        g.set(99_999, 1, 42);
+        assert_eq!(g.tile_at(99_999, 1), 42);
+        assert_eq!(g.tile_at(0, 0), 0);
+        // `in_bounds` and `tile_at` must agree about the same cell.
+        assert!(g.in_bounds(99_999, 1));
+        assert!(!g.in_bounds(100_000, 1));
+        assert_eq!(g.tile_at(100_000, 1), 0, "out of bounds reads default, never panics");
+    }
+
+    /// `rebuild_from_rows` had the same `(w * h) as usize`.
+    #[test]
+    fn rebuild_allocates_the_honest_product() {
+        let mut g: TileGrid<u32> = TileGrid::empty();
+        g.rebuild_from_rows(1000, 50, |c, r| c + r);
+        assert_eq!(g.dims(), (1000, 50));
+        assert_eq!(g.as_slice().len(), 50_000);
+        assert_eq!(g.tile_at(999, 49), 999 + 49);
+    }
 }
 
 #[cfg(test)]

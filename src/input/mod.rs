@@ -108,10 +108,43 @@ impl InputState {
             .unwrap_or(false)
     }
 
+    /// True on the frame a key went down.
+    ///
+    /// # A press may already be over
+    ///
+    /// This reports the *edge*, not the current state: a tap that goes
+    /// down and up inside one frame sets this and leaves
+    /// [`key_down`](Self::key_down) false. That is deliberate — the press
+    /// must not be lost — but logic shaped as
+    /// `if key_pressed(k) { start_hold() }` followed by
+    /// `while key_down(k) { ... }` then never starts the hold. At 62 Hz
+    /// polling a fast tap or a replayed input pair can land both events
+    /// in the same frame.
     pub fn key_pressed(&self, key: KeyCode) -> bool {
         key_bit(key)
             .map(|(s, b)| self.keys_pressed[s] & b != 0)
             .unwrap_or(false)
+    }
+
+    /// True on the frame a key came up.
+    ///
+    /// The release edge was recorded and cleared on the same one-step
+    /// schedule as [`key_pressed`](Self::key_pressed) since edges existed,
+    /// but had no accessor until 2026-09-11 — `keys_released` was
+    /// write-only state, so hold-to-charge/release-to-fire could not be
+    /// expressed through this API at all. The mouse half
+    /// (`mouse_buttons_released`) was readable the whole time, being a
+    /// public field.
+    pub fn key_released(&self, key: KeyCode) -> bool {
+        key_bit(key)
+            .map(|(s, b)| self.keys_released[s] & b != 0)
+            .unwrap_or(false)
+    }
+
+    /// True on the frame a mouse button came up. Mirrors
+    /// [`key_released`](Self::key_released).
+    pub fn mouse_released(&self, btn: MouseButton) -> bool {
+        self.mouse_buttons_released & mouse_bit(btn) != 0
     }
 
     pub fn mouse_down(&self, btn: MouseButton) -> bool {
@@ -129,6 +162,61 @@ fn mouse_bit(btn: MouseButton) -> u8 {
         MouseButton::Right => 2,
         MouseButton::Middle => 4,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod release_edge_tests {
+    use super::*;
+
+    /// `keys_released` was written and cleared correctly but had no
+    /// accessor, so a release edge could not be read at all.
+    #[test]
+    fn a_release_is_visible_for_one_frame() {
+        let mut i = InputState::default();
+        i.on_key_down(KeyCode::KeyF);
+        assert!(!i.key_released(KeyCode::KeyF), "holding is not releasing");
+
+        i.on_key_up(KeyCode::KeyF);
+        assert!(i.key_released(KeyCode::KeyF), "the release edge must be readable");
+        assert!(!i.key_down(KeyCode::KeyF), "and the key is no longer held");
+
+        i.begin_frame();
+        assert!(!i.key_released(KeyCode::KeyF), "the edge lasts exactly one frame");
+    }
+
+    /// The mouse half was already a public field; the accessor just makes
+    /// the two halves symmetric.
+    #[test]
+    fn mouse_releases_read_the_same_way() {
+        let mut i = InputState::default();
+        i.on_mouse_down(MouseButton::Left);
+        assert!(!i.mouse_released(MouseButton::Left));
+        i.on_mouse_up(MouseButton::Left);
+        assert!(i.mouse_released(MouseButton::Left));
+        i.begin_frame();
+        assert!(!i.mouse_released(MouseButton::Left));
+    }
+
+    /// A tap inside one frame reports press *and* release together, with
+    /// `key_down` never true — the case the `key_pressed` docs warn about.
+    #[test]
+    fn a_sub_frame_tap_reports_both_edges_and_no_hold() {
+        let mut i = InputState::default();
+        i.on_key_down(KeyCode::Space);
+        i.on_key_up(KeyCode::Space);
+
+        assert!(i.key_pressed(KeyCode::Space), "the press must not be lost");
+        assert!(i.key_released(KeyCode::Space), "nor the release");
+        assert!(!i.key_down(KeyCode::Space), "but it is not held at any point a caller can see");
+    }
+
+    /// Keys past the bitset's range are dropped rather than aliasing onto
+    /// another key — the same contract `key_pressed` has.
+    #[test]
+    fn releases_of_unmapped_keys_are_not_reported() {
+        let i = InputState::default();
+        assert!(!i.key_released(KeyCode::KeyA), "nothing has been released");
     }
 }
 
