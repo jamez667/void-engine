@@ -337,6 +337,41 @@ impl SpatialGrid {
     /// array. With holes present it is larger than the live count.
     pub fn slot_count(&self) -> usize { self.bounds.len() }
 
+    /// How many cells currently hold at least one collider.
+    ///
+    /// Paired with [`len`](Self::len) this gives mean bucket occupancy,
+    /// which [`new`](Self::new) documents at length as *the* quantity to
+    /// tune cell size against — its cost grows with the sum of the squares
+    /// of bucket sizes, and a badly-chosen cell measured 64x worse than a
+    /// good one on the same world.
+    ///
+    /// Those docs tell a caller to "measure it for your own world rather
+    /// than copying a number", and until 2026-09-11 gave them no way to:
+    /// `cells` is private and nothing reported its size. A tuning target
+    /// nobody can observe is advice, not guidance.
+    ///
+    /// ```
+    /// # use void_engine::collision::SpatialGrid;
+    /// # use glam::DVec2;
+    /// let mut g = SpatialGrid::new(10.0);
+    /// for i in 0..100 {
+    ///     g.insert(DVec2::new(i as f64 * 5.0, 0.0), 1.0);
+    /// }
+    /// let occupancy = g.len() as f64 / g.occupied_cells().max(1) as f64;
+    /// assert!(occupancy > 0.0);
+    /// ```
+    ///
+    /// Counts cells across every partition: two partitions occupying the
+    /// same coordinates are two entries, because they are two buckets and
+    /// each is scanned separately.
+    ///
+    /// Note this counts cells that are *allocated*, which after
+    /// [`clear`](Self::clear) includes emptied buckets retained for reuse
+    /// — so read it after filling the grid, not before.
+    pub fn occupied_cells(&self) -> usize {
+        self.cells.values().filter(|b| !b.is_empty()).count()
+    }
+
     /// Whether a slot currently holds a collider.
     pub fn slot_alive(&self, index: u32) -> bool {
         self.alive.get(index as usize).copied().unwrap_or(false)

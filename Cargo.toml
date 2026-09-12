@@ -211,6 +211,15 @@ required-features = ["client"]
 name = "replication_server"
 required-features = ["replication"]
 
+# Drives the replication pipeline at escalating client counts and reports
+# where the tick went, phase by phase. A permanent target rather than a
+# scratch measurement: the single-node ceiling is a number that has to be
+# re-measured whenever the pipeline changes, and it is the input to any
+# multi-node design.
+[[example]]
+name = "load_sweep"
+required-features = ["replication"]
+
 # Both of these drive the renderer directly — one stands up a headless wgpu
 # device and reads pixels back, the other parses shader.wgsl through naga.
 # Neither can exist in a build without the GPU stack, so they are pinned to

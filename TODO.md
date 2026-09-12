@@ -1120,6 +1120,53 @@ where it does not.
       `from_store`: the in-memory tier is the one with no database to
       query, so if these audits are not on this page they are nowhere.*
 
+## The single-node ceiling (2026-09-11)
+
+`examples/load_sweep.rs`, a permanent target. Drives the real pipeline —
+`clear` + refill, `query_circle_into`, `diff`, item build, `send_chunked`
+— at rising client counts and reports where the tick went.
+
+**~1,500 clients on one process at 30 Hz.** Table A, density held fixed
+so the sector grows with the crowd:
+
+| clients | entities | rebuild | aoi | diff | items | encode+send | total |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 500 | 10k | 0.35 | 0.63 | 0.68 | 0.65 | 5.73 | **8.0 ms** |
+| 1,000 | 20k | 0.68 | 1.56 | 1.53 | 1.51 | 13.47 | **18.7 ms** |
+| 2,000 | 40k | 1.68 | 3.02 | 3.03 | 2.88 | 25.57 | **36.2 ms** |
+| 8,000 | 160k | 7.26 | 13.22 | 12.23 | 12.11 | 104.50 | 149.3 ms |
+
+Linear in population, and **encode+send is 69-72% of it at every size**.
+AoI is 11%. Two audits optimised AoI hard — the thing that actually
+constrains a shard was never measured until now.
+
+Table B, crowding into one fixed sector: 7.8 ms at 500 → 2,507 ms at
+8,000, with 226 entities visible per client and 87 MB of datagrams per
+tick. Quadratic, because each client's view grows with the crowd.
+
+**What that says about multi-node.** Region-splitting works for A — cost
+tracks entity count, so halving the entities per node halves rebuild and
+AoI. It cannot touch B: everyone is in one region by definition. That is
+why EVE has time dilation rather than more nodes for fleet fights, and it
+means a cluster design has to answer crowding separately from population.
+
+*Three corrections before these numbers held, each moving the headline an
+order of magnitude in a different direction. (1) The sector was fixed
+while entities scaled, so `seen` doubled every row — the first run
+measured density, not population, and reported a superlinear AoI curve
+that was entirely manufactured. (2) `KeyframeBudget::default()` is 13 per
+tick, so at 16,000 clients only ~39 were served by the sampled tick and
+the "ceiling" of 16,000 described a nearly-idle server; 104 datagrams per
+tick was the tell. (3) The harness called `encode_into` and then
+`send_chunked`, which encodes again through its closure — serialisation
+was double-counted and split across two columns. The `seen`, `occ` and
+`served` columns exist because each caught one of these; a load harness
+without its own controls reports whatever it was built to report.*
+
+*Not modelled: no network (a counting sink, so no bandwidth, latency,
+loss, or 8,000 real sockets), no physics, no AI, no game logic. Every
+figure is a floor.*
+
 ## Third audit (2026-09-11): the client, and everything unswept
 
 Three agents over territory the first two never entered: the render path
