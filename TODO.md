@@ -1120,6 +1120,249 @@ where it does not.
       `from_store`: the in-memory tier is the one with no database to
       query, so if these audits are not on this page they are nowhere.*
 
+## Third audit (2026-09-11): the client, and everything unswept
+
+Three agents over territory the first two never entered: the render path
+under load, terrain/pathfind/sector/rng with determinism as the headline,
+and input/walk/tilegrid/world/log. Same rule as before — file:line, a
+number where it bites, a statement of where it does not.
+
+- [x] **T1 — the draw cap was a stale literal, 2.5× the upload cap.**
+      Fixed. `upload_batch` truncates at `MAX_VERTS * 3`, which with an
+      84-byte `Vertex` is **9,586,980** indices. The main pass capped its
+      draw range at a hardcoded **24,000,000** (`frame.rs`), and its own
+      comment claimed the two matched. They disagreed by 14.4M.
+
+      A frame in that window would issue `draw_indexed` over indices past
+      what `queue.write_buffer` uploaded — reading buffer contents that
+      were never written. That is precisely the failure recorded in
+      `upload_batch`'s own header comment as having already happened once:
+      *"indices pointed past the sliced-off tail and draws produced
+      garbage (visible symptom: geometry vanished entirely on any
+      overflow)"*.
+
+      **Third instance of the same mistake.** TODO.md:37-38 records the
+      first: a cap sized "8M verts × 32B = 256MB" when the stride was
+      really 84 bytes. That fix made `MAX_VERTS` stride-derived
+      specifically so it "cannot drift out of step with `Vertex` again" —
+      and missed this copy. The draw cap is now derived from the same
+      expression, so there is no literal left to drift.
+
+      *Latent, not observed: it needs >1,597,830 quads in one frame, and
+      the vertex cap trips first for quad geometry. The reachable shape is
+      index-heavy fans (`circle`/`polygon`), which hit neither cap first.
+      Every real workload is four orders of magnitude below it — 1000
+      nameplates is 44,000 verts.*
+
+- [x] **T2 — `RedrawRequested` was a second, unaccounted render path.**
+      Fixed. `app.rs` handled OS repaints by calling
+      `begin_frame`/`render`/`end_frame` inline with `alpha = 1.0`, no
+      `PerfStats::record`, and no timestep advance — its comment said
+      "just render, no timing".
+
+      Two consequences. Frames drawn that way were invisible to `[perf]`
+      and to the `PerfSnapshot` overlay, so GPU work under-reported
+      exactly while a window was being dragged or uncovered. And it was a
+      real extra frame: the 62 Hz cap lives in `about_to_wait`, so a
+      repaint storm rendered on both paths at up to double rate.
+
+      The handler is now empty — `about_to_wait` runs unconditionally and
+      owns the only render path, so the repaint is honoured within ~16 ms.
+
+      *My first version of this called `window.request_redraw()` from
+      inside the `RedrawRequested` handler, which would have fed the
+      handler its own next event with nothing else driving it. It compiled
+      and all 195 tests passed, because no test drives a window event
+      loop. Caught by grepping for other `request_redraw` calls and
+      finding mine was the only one in the tree.*
+
+- [x] **T4 — A* truncated its path coordinates to `u16`.** Fixed.
+      `reconstruct` cast `i32` search coordinates with `as u16`, which
+      wraps silently. On a grid wider than 65,536 the search found the
+      *correct* route and then corrupted every coordinate on the way out:
+      measured on a 70,000×1 grid, a path from column 65,530 to 65,540
+      came back as `…(65534,0), (65535,0), (0,0), (1,0)…`, reporting its
+      final cell as column 4. No `None`, no error — a caller following it
+      walks backwards across the world.
+
+      Both public entry points now return `Vec<(i32, i32)>`, matching the
+      type the search already used internally. Two bytes per waypoint on
+      an already-heap-allocated path.
+
+      *Latent in this repo — no in-tree caller builds a grid that wide, and
+      void-claim's interiors are far below it. But `astar_bool_grid` is
+      re-exported by void-claim's own `pathfind` module and used by four
+      call sites there, so the type change will surface downstream at
+      compile time. Per the standing policy, the engine stays clean.*
+
+- [x] **T5 — `wrap_pos` was an unbounded loop that hung on infinity.**
+      Fixed. Four `while` loops subtracting one sector per iteration:
+      correct for the one-crossing case every caller has, unbounded for
+      anything else. Measured at sector size 1000, `pos.x = 1e9` cost
+      **0.368 ms** and `1e12` cost **381 ms** — one entity stalling a
+      60 Hz tick for twenty-three frames. An infinite coordinate never
+      terminated at all, since `inf - size` is still `inf`; a NaN exited
+      immediately instead and propagated into the sector address.
+
+      *Now three-case arithmetic, and it took **four attempts**. The two
+      loops run in sequence, so they are not symmetric halves of one
+      operation — a value below `-half` skips the first loop entirely, and
+      both `+half` and `-half` are fixed points, making the resting window
+      closed at both ends. Every single-expression form I tried
+      (`div_euclid` on a reversed shift, `ceil() - 1`, plain `floor`) was
+      off by one at a boundary or on the negative side, and each passed
+      some of the two existing tests. Six new tests now pin the exact loop
+      behaviour: both boundaries as fixed points, the positive/negative
+      asymmetry, a 1e9 wrap in one step, non-finite refusal, and a sweep
+      asserting every result lands in the window with the sector bump
+      accounting for the exact distance moved.*
+
+- [x] **T6 — `dist_to_nearest` skipped the rejection its sibling used.**
+      Fixed. It mapped `dist_to_center` over every river unconditionally,
+      while `signed_edge_dist` twenty lines above did the same work behind
+      a `bbox_dist2` early-out. Measured at 40 rivers × 300 vertices:
+      **10.9 µs** per call against 2.4 µs — 716 ms to ask "how far to
+      water?" across one 256×256 chunk, on the streaming path, per chunk.
+
+      *The early-out tracks a running minimum rather than a fixed radius,
+      so the threshold tightens as it goes and later rivers are rejected
+      against the best distance found so far.*
+
+- [x] **T7 — log rotation wrote into the rotated file, then disabled
+      itself permanently.** Fixed, and the worst finding of the three
+      sweeps. The logger holds one `File` opened at construction;
+      `rotate_logs` renamed paths and never touched it. An open handle
+      follows the inode, not the name.
+
+      Measured end to end: after `t.log` crossed 10 MB and was renamed to
+      `t.log.1`, every subsequent line went **into `t.log.1`** — the file
+      contained both the pre- and post-rotation lines, and `t.log` did not
+      exist. `check_rotate` then stat'd a missing path and returned early
+      on every line thereafter, so after 1000 more lines the directory held
+      exactly one file, no `t.log`, and no `t.log.2`.
+
+      Three consequences, all silent: the 10 MB cap fires **once per
+      process lifetime**, `MAX_LOGS = 5` is **never** enforced past the
+      first rotation, and an operator tailing `client.log` watches a file
+      frozen at the rotation moment while the server logs into `.1`.
+
+      `check_rotate` is now a method that asks the *handle* for its length,
+      drops it before renaming (Windows refuses to rename a file with an
+      open handle — so there this was the difference between rotating and
+      silently not rotating), and reopens under the same lock.
+
+      *That also removes a syscall per line, which the input auditor
+      measured separately at **0.0154 ms** — ~1.5% of a core at 1000
+      lines/s, on the render thread for a client. The file's own docs
+      record per-line open/close having been removed as "a measurable
+      stutter"; the per-line stat was the same waste, surviving.*
+
+      *Two audits missed this because `log.rs`'s 123-line test module
+      covers only logfmt escaping and target filtering — **zero rotation
+      coverage**.*
+
+### Still open from the third audit
+
+- [ ] **T8 — `TileGrid` multiplies dimensions in `u32`.** MEASURED, not
+      fixed. `new_filled` does `vec![val; (w * h) as usize]` — the multiply
+      happens in `u32` before the widening, so it wraps in release. Two
+      distinct failures, both measured:
+
+      - `new_filled(70_000, 70_000)` reports `dims() == (70000, 70000)` but
+        allocates 605,032,704 cells against a true product of 4.9e9.
+        `in_bounds(0, 60_000)` returns **true**, then `tile_at(0, 60_000)`
+        **panics** on the index.
+      - `new_filled(65_536, 65_536)` wraps to exactly **0**. `dims()` still
+        reports `(65536, 65536)`, `is_empty()` is true, every `tile_at`
+        returns `T::default()`, and `set` silently no-ops. A completely
+        inert grid with no panic and no error.
+
+      `tile_at` computes `r * self.w + c` in `u32` too, so the index wraps
+      independently of the allocation. `rebuild_from_rows` has the same
+      `(w * h) as usize`.
+
+      *Latent: no in-tree caller passes large dims, and void-claim's use is
+      authored rooms of a few thousand cells (R4). This is a trap for a
+      future procedural or streaming caller. Fixing it widens to `usize`
+      before multiplying and asserts; none of R4's ten preserved method
+      signatures change.*
+
+- [ ] **T9 — a walker tunnels through a wall at one tile per tick.**
+      MEASURED, not fixed. `tile_collide` resolves by overlap push, not by
+      sweeping the movement segment, and `integrate_walker` applies the
+      full step before handing the final position over. A step that lands
+      past the wall's far face overlaps nothing.
+
+      Threshold measured by bisection at exactly **displacement ≥ tile
+      size**. Through `SPRINT_MULT = 3.0`:
+
+      | tick rate | sprinting cutoff | walking cutoff |
+      | --- | --- | --- |
+      | 60 Hz (`run`) | 20.0 m/s | 60.0 m/s |
+      | 30 Hz (`run_headless`) | **10.0 m/s** | 30.0 m/s |
+
+      End-to-end through the real path: 12 m/s sprinting at 30 Hz went
+      **through** a solid wall; 5 m/s was blocked.
+
+      *A human-scale walker at 3-5 m/s has a wide margin at either rate. A
+      vehicle, dash, or knockback reusing this path at 30 Hz crosses it at
+      a plausible 10 m/s — and the engine's own headless default being
+      30 Hz halves the margin versus the windowed loop. No in-tree caller
+      constructs `WalkParams` at all. The smaller fix is substepping in
+      `walk.rs` when `step > tile_size`; the alternative needs
+      `tile_collide` to take the pre-move position, which is an API
+      change.*
+
+- [ ] **T10 — key release edges are recorded but unreadable.** `InputState`
+      maintains `keys_released`, writes it, and clears it on the same
+      one-step schedule as `keys_pressed` — but exposes **no accessor**.
+      `mouse_buttons_released` is at least a `pub` field; the keyboard half
+      is write-only dead state.
+
+      *A game wanting hold-to-charge/release-to-fire cannot read a key
+      release from this API. Three lines to add `key_released` beside
+      `key_pressed`. Relevant to the replay-driver case `Cargo.toml`
+      explicitly keeps `winit` unconditional for.*
+
+- [ ] **T11 — a sub-frame tap reports `key_pressed` but never
+      `key_down`.** Measured: press and release within one frame yields
+      `key_pressed == true`, `key_down == false`. This is *correct* — the
+      press is not lost — but logic shaped as
+      `if key_pressed(K) { start_hold() }` followed by `while key_down(K)`
+      silently never starts. At 62 Hz polling, a fast tap or a replayed
+      input pair can land both events in one frame.
+
+      *Documentation, not a code change: a note on `key_pressed` saying the
+      press may already be over.*
+
+- [ ] **T3 — `Batch` capacity ratchets to its high-water mark forever.**
+      MEASURED, not fixed. `Batch::clear` clears length but never
+      capacity, and nothing shrinks the three `Batch` instances the
+      renderer owns (`batch`, `offscreen_batch`, `mask_batch`).
+
+      | workload | CPU `Vec` retained |
+      | --- | --- |
+      | fresh `Batch::new()` | 0.7 MB |
+      | after one 200k-rect frame | **92.0 MB** |
+      | after 600 quiet frames (50 rects each) | 92.0 MB |
+      | one spike into all three | **264 MB**, retained |
+
+      The GPU side compounds it: `upload_batch` grows
+      `*vcap = (vlen*2).min(MAX_VERTS)` with no shrink path, so the same
+      spike pins ~137 MB of GPU buffers.
+
+      **Spike-shaped, not steady-state.** A game with a stable per-frame
+      vertex count settles and the retention is the intended amortisation.
+      It bites a session with a *transient* peak — a zoomed-out map, a
+      particle storm, a debug overlay — where the cost is paid once and
+      never returned.
+
+      *The fix is a decay policy, not an unconditional shrink: shrinking
+      every frame reintroduces exactly the per-frame allocation the
+      capacity exists to avoid. Track a rolling high-water mark and
+      `shrink_to_fit` when the peak has not been approached for N frames.
+      `clear()` is right for the common path; only the ratchet is wrong.*
+
 ### Still open from the second audit
 
 - [x] **N3 — silent slow-motion under sustained tick overrun.** Fixed.

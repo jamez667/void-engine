@@ -39,7 +39,7 @@ pub fn astar_tile_grid<T: TileSource>(
     start: (i32, i32),
     goal:  (i32, i32),
     extra_blocked: &HashSet<(i32, i32)>,
-) -> Option<Vec<(u16, u16)>> {
+) -> Option<Vec<(i32, i32)>> {
     if start == goal { return Some(Vec::new()); }
     if src.blocks(goal.0, goal.1) { return None; }
     let (w, h) = src.dims();
@@ -84,7 +84,7 @@ pub fn astar_bool_grid(
     blocked: &[bool],
     start:   (i32, i32),
     goal:    (i32, i32),
-) -> Option<Vec<(u16, u16)>> {
+) -> Option<Vec<(i32, i32)>> {
     if start == goal { return Some(Vec::new()); }
     let w = width as i32;
     let h = height as i32;
@@ -130,13 +130,29 @@ pub fn astar_bool_grid(
     None
 }
 
+/// Walk `came_from` back from the goal and hand the route out forwards.
+///
+/// # Why the coordinates are `i32`
+///
+/// This returned `(u16, u16)` until 2026-09-11, casting with `as` — which
+/// wraps silently. The search runs entirely on `i32`, so on a grid wider
+/// than 65,536 it found the *correct* route and then corrupted every
+/// coordinate on the way out: measured on a 70,000×1 grid, a path from
+/// column 65,530 to 65,540 came back as
+/// `…(65534,0), (65535,0), (0,0), (1,0)…` and reported its final cell as
+/// column 4. No `None`, no error — a caller following it walks backwards
+/// across the whole world.
+///
+/// `u16` was presumably chosen because a tile grid is small. The search's
+/// own coordinate type is the honest bound, and matching it costs two
+/// bytes per waypoint on a path that is already heap-allocated.
 fn reconstruct(
     came_from: &HashMap<(i32, i32), (i32, i32)>,
     mut cur: (i32, i32),
-) -> Vec<(u16, u16)> {
+) -> Vec<(i32, i32)> {
     let mut path = Vec::new();
     while let Some(&prev) = came_from.get(&cur) {
-        path.push((cur.0 as u16, cur.1 as u16));
+        path.push(cur);
         cur = prev;
     }
     path.reverse();
@@ -195,7 +211,7 @@ mod tests {
         assert_eq!(path.len(), 4);
         for w in path.windows(2) {
             let (a, b) = (w[0], w[1]);
-            let d = (a.0 as i32 - b.0 as i32).abs() + (a.1 as i32 - b.1 as i32).abs();
+            let d = (a.0 - b.0).abs() + (a.1 - b.1).abs();
             assert_eq!(d, 1, "orthogonal steps only, got {a:?} -> {b:?}");
         }
     }

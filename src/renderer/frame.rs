@@ -588,10 +588,27 @@ impl Renderer {
             }
             splits.sort_by_key(|(i, _)| *i);
 
-            // Cap the draw range to the same MAX_INDICES cap as
-            // upload_batch so we never issue a draw past the actual
-            // GPU buffer contents when the CPU-side batch overflowed.
-            const MAX_INDICES_DRAW: usize = 24_000_000;
+            // Cap the draw range to the same cap `upload_batch` applies,
+            // so a draw can never name indices past what was actually
+            // written to the GPU buffer.
+            //
+            // **Derived, not a literal.** This read `24_000_000` until
+            // 2026-09-11, while `upload_batch` truncates at
+            // `MAX_VERTS * 3` — which with an 84-byte `Vertex` is
+            // 9,586,980. The two disagreed by 14.4M indices, so a frame
+            // in that window would draw from buffer contents that were
+            // never uploaded: exactly the "indices point past the
+            // sliced-off tail, geometry turns to garbage" failure the
+            // comment at the top of `upload_batch` records as already
+            // having happened once.
+            //
+            // That earlier fix made `MAX_VERTS` stride-derived
+            // specifically so it "cannot drift out of step with `Vertex`
+            // again", and missed this copy. Third time the stride has
+            // been assumed rather than asked for — so this asks.
+            const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+            const MAX_INDICES_DRAW: usize =
+                (MAX_BUFFER_BYTES / std::mem::size_of::<Vertex>()) * 3;
             let total = (self.batch.indices.len().min(MAX_INDICES_DRAW)) as u32;
             let has_main = !self.batch.indices.is_empty();
 

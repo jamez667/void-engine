@@ -254,7 +254,7 @@ impl log::Log for RotatingLogger {
             }
         }
 
-        check_rotate(&self.cfg);
+        self.check_rotate();
     }
 
     fn flush(&self) {}
@@ -270,10 +270,61 @@ fn level_str(l: log::Level) -> &'static str {
     }
 }
 
-fn check_rotate(cfg: &LogConfig) {
-    let log_path = cfg.log_dir.join(&cfg.log_name);
-    let metadata = match fs::metadata(&log_path) { Ok(m) => m, Err(_) => return };
-    if metadata.len() > MAX_LOG_SIZE { rotate_logs(cfg); }
+impl RotatingLogger {
+    /// Rotate if the live file has outgrown [`MAX_LOG_SIZE`].
+    ///
+    /// # Why this is a method and asks the handle
+    ///
+    /// This was a free function that `fs::metadata`'d the *path*, and
+    /// `rotate_logs` renamed files without touching the open handle. An
+    /// open handle follows the inode, not the name, so after one rotation:
+    ///
+    /// 1. `t.log` becomes `t.log.1`, and nothing recreates `t.log`.
+    /// 2. Every later line is written **into `t.log.1`** through the stale
+    ///    handle — an operator tailing `t.log` sees a file frozen at the
+    ///    rotation moment while the server logs somewhere else.
+    /// 3. The path stat now fails, `check_rotate` returns early, and
+    ///    rotation is **permanently disabled**. `MAX_LOGS` is never
+    ///    enforced again and the surviving file grows without bound.
+    ///
+    /// So the size cap fired exactly once per process lifetime, and the
+    /// five-file retention never fired at all. Measured end to end: after
+    /// rotation plus 1000 further lines, the directory held one file
+    /// (`t.log.1`), no `t.log`, and no `t.log.2`.
+    ///
+    /// Asking the handle for its own length also removes a syscall per
+    /// line. The path stat measured **0.0154 ms**, which at 1000 lines/s
+    /// is ~1.5% of a core on whichever thread logged — for a client, the
+    /// render thread. The same file's own docs record that per-line
+    /// open/close was already removed as "a measurable stutter"; the stat
+    /// was the same waste, surviving.
+    fn check_rotate(&self) {
+        let mut guard = match self.file.lock() {
+            Ok(g) => g,
+            // A poisoned mutex means another thread panicked mid-write.
+            // Logging is not worth propagating that.
+            Err(e) => e.into_inner(),
+        };
+        let too_big = guard
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .is_some_and(|m| m.len() > MAX_LOG_SIZE);
+        if !too_big {
+            return;
+        }
+
+        // Drop the handle *before* renaming. Windows refuses to rename a
+        // file with an open handle, so on that platform this is not a
+        // tidiness point but the difference between rotating and silently
+        // not rotating.
+        *guard = None;
+        rotate_logs(&self.cfg);
+        *guard = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.cfg.log_dir.join(&self.cfg.log_name))
+            .ok();
+    }
 }
 
 fn rotate_logs(cfg: &LogConfig) {
@@ -411,6 +462,107 @@ fn push_json_escaped(out: &mut String, src: &str) {
 // Path is only used through PathBuf/Path already imported.
 #[allow(dead_code)]
 fn _path_marker(_: &Path) {}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use log::Log;
+
+    /// A logger writing into its own directory, so these can run in
+    /// parallel without fighting over a shared path.
+    fn logger(tag: &str) -> (RotatingLogger, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("void_log_rot_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = LogConfig {
+            log_dir: dir.clone(),
+            log_name: "t.log".to_string(),
+            noise: Vec::new(),
+            quiet_targets: Vec::new(),
+            boot_loki_url: None,
+            boot_service: "test",
+            format: LogFormat::Human,
+        };
+        (RotatingLogger::new(cfg), dir)
+    }
+
+    fn say(l: &RotatingLogger, msg: &str) {
+        l.log(
+            &log::Record::builder()
+                .args(format_args!("{msg}"))
+                .level(log::Level::Error)
+                .target("test")
+                .build(),
+        );
+    }
+
+    /// Push the live file past the cap without writing ten megabytes
+    /// through the logger. The handle is the logger's; this appends
+    /// underneath it, which is exactly what a real oversized log is.
+    fn inflate(dir: &std::path::Path) {
+        let path = dir.join("t.log");
+        let big = vec![b'x'; (MAX_LOG_SIZE as usize) + 1024];
+        fs::write(&path, big).expect("seed an oversized log");
+    }
+
+    /// The bug: an open handle follows the inode, so after a rename every
+    /// later line landed in the *rotated* file and the live name did not
+    /// exist at all.
+    #[test]
+    fn writes_land_in_the_live_file_after_rotation() {
+        let (l, dir) = logger("live");
+        say(&l, "before");
+        inflate(&dir);
+        // Triggers the size check, rotates, and must reopen.
+        say(&l, "trigger");
+        say(&l, "after-rotation");
+
+        let live = fs::read_to_string(dir.join("t.log")).expect("t.log must exist after rotating");
+        assert!(
+            live.contains("after-rotation"),
+            "a line written after rotation must land in the live file, got {live:?}",
+        );
+        assert!(
+            live.len() < MAX_LOG_SIZE as usize,
+            "the live file must be the fresh one, not the 10 MB original",
+        );
+        assert!(dir.join("t.log.1").exists(), "the old file must be kept as .1");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The second consequence: once the path stat failed, `check_rotate`
+    /// returned early forever, so rotation happened exactly once per
+    /// process and `MAX_LOGS` was never enforced again.
+    #[test]
+    fn rotation_still_works_a_second_time() {
+        let (l, dir) = logger("twice");
+        inflate(&dir);
+        say(&l, "first trigger");
+        assert!(dir.join("t.log.1").exists(), "first rotation");
+
+        inflate(&dir);
+        say(&l, "second trigger");
+        assert!(
+            dir.join("t.log.2").exists(),
+            "a second rotation must happen — this is what silently stopped before",
+        );
+        assert!(dir.join("t.log").exists(), "and the live file must still be there");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file under the cap must not rotate: the check reads the handle's
+    /// own length now, and an off-by-one there would rotate every line.
+    #[test]
+    fn a_small_file_does_not_rotate() {
+        let (l, dir) = logger("small");
+        for i in 0..50 {
+            say(&l, &format!("line {i}"));
+        }
+        assert!(!dir.join("t.log.1").exists(), "nothing should have rotated");
+        let live = fs::read_to_string(dir.join("t.log")).expect("t.log exists");
+        assert!(live.contains("line 49"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
 
 #[cfg(test)]
 mod filter_tests {

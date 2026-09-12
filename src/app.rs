@@ -302,12 +302,27 @@ impl<A: ClientApp> ApplicationHandler for Handler<A> {
                 self.input.on_scroll(y);
             }
             WindowEvent::RedrawRequested => {
-                // OS-requested repaint (window uncovered etc.) — just render, no timing
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.begin_frame();
-                    self.app.render(renderer, &self.world, &self.input, 1.0);
-                    renderer.end_frame();
-                }
+                // An OS-requested repaint — a window uncovered, a drag, a
+                // compositor asking for pixels. Deliberately *not* a
+                // second render path.
+                //
+                // It used to be one: `begin_frame` / `render` / `end_frame`
+                // inline, with `alpha = 1.0` and no `PerfStats::record`.
+                // Two things followed. Every frame drawn this way was
+                // invisible to `[perf]` and to the `PerfSnapshot` overlay,
+                // so GPU work under-reported exactly while a window was
+                // being dragged. And it was a genuine extra frame: the
+                // 62 Hz cap in `about_to_wait` governs only that path, so
+                // a repaint storm rendered on both at up to double rate.
+                //
+                // Letting `about_to_wait` own the frame keeps one
+                // accounted, capped render path. The repaint is honoured
+                // on the next wake, which is at most ~16 ms away.
+                //
+                // Deliberately empty rather than `request_redraw()`:
+                // `about_to_wait` runs unconditionally every frame and
+                // needs no prompting, so re-requesting here would just
+                // feed this handler its own next event.
             }
             _ => {}
         }
