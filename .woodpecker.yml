@@ -264,9 +264,8 @@ steps:
       # misconfigured environment would look like a pass. Assert they
       # actually ran.
       #
-      # These two counts could not be verified locally during the port (no
-      # database to hand); they are carried over from the Actions config
-      # unchanged. If the first run disagrees, trust the run.
+      # Both counts verified against a real postgres:17-alpine, not
+      # assumed: 8 and 4 as asserted.
       - |
         out=$(cargo test --test ledger_pg --no-default-features --features ledger-pg 2>&1)
         echo "$out"
@@ -353,9 +352,8 @@ steps:
         # They skip themselves when the env is unset, so a misconfigured
         # step would look like a pass. Assert they actually ran.
         #
-        # This count could not be verified locally during the port; it is
-        # carried over from the Actions config. If the first run disagrees,
-        # trust the run.
+        # Verified against a real container (3 as asserted), so a
+        # disagreement here means the cfg gate, not a stale number.
         echo "$out" | grep -q "3 passed" || {
           echo "expected 3 outage tests; they may have skipped"
           exit 1
