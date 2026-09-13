@@ -751,7 +751,7 @@ impl Renderer {
                 let row_start = (row * bpr) as usize;
                 let row_src = &raw[row_start..row_start + (w * 4) as usize];
                 if is_bgra {
-                    for px in row_src.chunks_exact(4) {
+                    for px in row_src.as_chunks::<4>().0 {
                         pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                     }
                 } else {

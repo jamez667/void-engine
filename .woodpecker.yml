@@ -16,7 +16,13 @@ when:
   - event: pull_request
 
 variables:
-  - &rust_image rust:1
+  # Pinned, not `rust:1`. A floating tag resolves to the newest stable,
+  # which drifted three minors ahead of the development machine and broke
+  # the first run on `chunks_exact_to_as_chunks` — a lint that did not
+  # exist locally, firing on code nobody had touched. Pinning means CI
+  # fails only on what can be reproduced locally; bump this deliberately
+  # to take a newer compiler and its new lints at a chosen moment.
+  - &rust_image rust:1.95
   # Warnings are failures in CI but not in a local `cargo build`, so a work
   # in progress stays comfortable while `main` stays clean.
   - &cargo_env
