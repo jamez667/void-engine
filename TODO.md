@@ -3,10 +3,20 @@
 Sorted by severity. Derived from the full-repo audit of `a1dbc30`; every
 number below was measured in release on a dev box, not estimated.
 
-**Status (2026-09-10):** every S1-S3 item is done, plus the ECS query-cost
-fix and **R1 (headless split)**. Tests 146 -> 187 across three feature axes,
-clippy clean on all of them, CI and hot-path budget guards in place.
-R2-R5 remain multi-week projects.
+**Status (2026-09-12):** every S1-S3 item is done, plus the ECS query-cost
+fix and all of **R1-R5**. The suite spans eight feature axes, clippy clean
+on all of them, CI and hot-path budget guards in place. (Per-axis test
+totals are not comparable to each other and the older counts in this file
+predate several axes — read them as history, not as a current figure.) CI runs on
+Woodpecker (`.woodpecker.yml`), not GitHub Actions.
+
+The engine-side residue is small and named: a second remembered size for
+continuation chunks, a per-call `Vec` in `SnapshotPacket::encode`, the
+GPU-side half of the `upload_batch` cap, and `replay_into` still untested.
+The larger open questions live outside this repo — two downstream game
+migrations, three compile breaks owed to void-claim — plus one design
+question nothing currently answers: multi-node crowding, which
+region-splitting cannot address.
 
 Severity key:
 - **S1** — correctness bug or missing safety net. Silent failure or no
@@ -49,9 +59,10 @@ Severity key:
 ## S3 — infrastructure
 
 - [x] **No CI.** 146 tests exist and pass. Nothing enforces that they keep
-      passing. Added `.github/workflows/ci.yml`: build, test and clippy across
-      all three feature axes (default / `net` / headless), plus the hot-path
-      budgets as a separate job.
+      passing. Added CI: build, test and clippy across every feature axis,
+      plus the hot-path budgets as a separate job. Originally
+      `.github/workflows/ci.yml`; migrated to `.woodpecker.yml` in `e15ff2f`,
+      which is the live config — the Actions workflow is deleted.
 
       No `cargo fmt --check` gate: rustfmt would rewrite ~586 sites and undo
       the hand-aligned style this codebase uses throughout. Adopting it is a
@@ -599,8 +610,10 @@ unblocks the most downstream work.
       a client calls `quinn::Endpoint::client` directly. An asymmetry in
       the engine's surface, not a blocker.*
 
-      *Known gap: CI never runs `cargo doc`, so a broken intra-doc link
-      goes unnoticed until someone runs it by hand. Two were found that
+      *Known gap, since closed: CI ran no `cargo doc`, so a broken
+      intra-doc link went unnoticed until someone ran it by hand. The
+      Woodpecker config now runs it across all eight axes with
+      `RUSTDOCFLAGS=-D warnings`. Two were found that
       way and both are fixed — one in `net/mod.rs` from `7ac5124`, and
       `renderer/mod.rs:257` from `a1dbc30`, where an inserted function had
       also split a doc comment away from the one it described. Every axis
@@ -1535,7 +1548,7 @@ number where it bites, a statement of where it does not.
       false, so `if key_pressed { start_hold() }` + `while key_down` never
       starts. Four tests, including that sub-frame tap.*
 
-### Still open from the third audit `new_filled` does `vec![val; (w * h) as usize]` — the multiply
+      `new_filled` does `vec![val; (w * h) as usize]` — the multiply
       happens in `u32` before the widening, so it wraps in release. Two
       distinct failures, both measured:
 
@@ -1634,7 +1647,7 @@ number where it bites, a statement of where it does not.
       `shrink_to_fit` when the peak has not been approached for N frames.
       `clear()` is right for the common path; only the ratchet is wrong.*
 
-### Still open from the second audit
+### Closed from the second audit
 
 - [x] **N3 — silent slow-motion under sustained tick overrun.** Fixed.
       `app_headless.rs` had no instrumentation at all: no timing around
