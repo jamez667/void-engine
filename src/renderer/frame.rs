@@ -545,7 +545,12 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                // Present whenever the depth texture allocated. The main
+                // pipeline's depth state is a no-op today, so this changes
+                // no pixel — it is here so a 3D pipeline has something to
+                // test against. `None` on a zero-size surface, matching
+                // the pipeline's tolerance for a missing buffer.
+                depth_stencil_attachment: self.depth.as_ref().map(|d| d.attachment()),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });

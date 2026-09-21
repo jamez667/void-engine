@@ -819,7 +819,9 @@ unblocks the most downstream work.
       ~~Glyph atlas~~ done; ~~clustered lights~~ measured and dropped;
       ~~instancing~~ inspected and dropped (no timing taken — the
       draw-site count settles it); ~~sprite atlas~~ deferred, its premise
-      does not hold yet; depth buffer deferred on a 14-pipeline blast
+      does not hold yet; ~~depth buffer~~ **done 2026-09-21**, on a blast
+      radius of 1 pipeline rather than the 14 this entry predicted — see
+      the entry below and `docs/3d-spec.md`. Was deferred on a 14-pipeline
       radius. Each is recorded below with the trigger that would reopen it.
 
       *Was framed as a rewrite of the draw path. Checking the five claims
@@ -987,13 +989,35 @@ unblocks the most downstream work.
       shape for it — the glyph atlas already proves the pattern, including
       the white texel that keeps untextured primitives working unchanged.*
 
-      **The depth buffer is confirmed and still unmeasured.** Every
-      `depth_stencil_attachment` is `None` and no pipeline sets
-      `depth_stencil: Some`, so ordering is painter's-algorithm only.
-      Adding one touches **14 pipelines across 6 files**
-      (`godray`, `init`, `lights`, `postprocess`, `shadow`, `sun`), which
-      is a far wider blast radius than any other R5 item — worth keeping
-      separate from the rest rather than folded in.
+      **The depth buffer is done (2026-09-21), and the blast radius that
+      deferred it was wrong.** The premise was right — every
+      `depth_stencil_attachment` was `None` and no pipeline set
+      `depth_stencil: Some`, so ordering was painter's-algorithm only —
+      but "**14 pipelines across 6 files**" counted every pipeline in the
+      renderer rather than the ones that needed changing.
+
+      Only **3** pipelines take `Vertex::desc()` and therefore draw
+      geometry: `main_pipeline` (`init.rs`), `offscreen_pipeline`
+      (`postprocess.rs`) and `shadow_mask_pipeline` (`shadow.rs`). The
+      other 11 are fullscreen triangles, for which depth is meaningless.
+      Of the three, only the main pass draws the scene 3D geometry would
+      join — the offscreen pass renders a 2D sub-scene that is then
+      blurred, and the wall mask is a flat binary occluder map. So the
+      real change was **1 pipeline, 1 new module, 49 lines across 4
+      files**, not a 14-pipeline surgery.
+
+      *The lesson is the one this file keeps relearning: a count taken
+      from `grep -c create_render_pipeline` is not a blast radius until
+      you ask which of the matches the change actually needs.*
+
+      Shipped as Phase 0 of the 3D work (`docs/3d-spec.md`). The state is
+      deliberately a **no-op** in 2D: `depth_compare: Always` with writes
+      off is the identity, so painter's ordering still decides every
+      pixel. `tests/depth_buffer.rs` asserts that by rendering the same
+      overlapping geometry with and without depth and requiring
+      byte-identical framebuffers — **verified load-bearing** by flipping
+      the compare to `Less`, which fails with the green quad winning where
+      blue should. All seven clippy axes and 225 tests pass.
 
       *Downstream surface, the same constraint `TileGrid` has: roughly
       2,100 `Batch` primitive call sites across void-claim and

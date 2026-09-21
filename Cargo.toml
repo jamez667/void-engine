@@ -231,3 +231,11 @@ required-features = ["client"]
 [[test]]
 name = "shader_compiles"
 required-features = ["client"]
+
+# Asserts the Phase-0 depth buffer is invisible in 2D by rendering the same
+# geometry with and without it. Needs the GPU stack for both the real
+# pipeline state and the headless device, so it is pinned to `client` like
+# the two above.
+[[test]]
+name = "depth_buffer"
+required-features = ["client"]

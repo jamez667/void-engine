@@ -16,6 +16,10 @@ pub mod context;
 pub mod camera;
 pub mod batch;
 mod postprocess;
+/// Public because the depth format and the main pipeline's depth state are
+/// what any future 3D pipeline must match to share the main pass. The
+/// buffer itself stays `pub(super)`.
+pub mod depth;
 mod shadow;
 mod lights;
 mod sun;
@@ -26,6 +30,7 @@ mod frame;
 use context::GpuContext;
 use camera::Camera2D;
 use batch::{Batch, Vertex};
+use depth::DepthBuffer;
 use postprocess::PostProcess;
 use shadow::ShadowPass;
 use lights::{LightPass, LightUniform, MAX_LIGHTS_PER_FRAME};
@@ -72,6 +77,13 @@ pub struct Renderer {
     // case `begin_offscreen_batch` returns a no-op batch and
     // `blur_and_composite` skips, so the main pass still renders.
     postprocess: Option<PostProcess>,
+
+    // Depth buffer for the main pass. `None` on a zero-size surface, in
+    // which case the main pass runs with no depth attachment exactly as it
+    // did before this existed. See `depth.rs` for why only the main pass
+    // has one, and why 2D rendering is unchanged by it.
+    depth: Option<DepthBuffer>,
+
     offscreen_batch: Batch,
     offscreen_vbuf: wgpu::Buffer,
     offscreen_ibuf: wgpu::Buffer,
@@ -167,6 +179,13 @@ impl Renderer {
             );
             if self.postprocess.is_none() {
                 log::warn!("[renderer] postprocess pipeline unavailable after resize");
+            }
+            // Depth is surface-sized, so it must be reallocated alongside
+            // the colour targets or the main pass would fail validation
+            // with a size mismatch against the swapchain view.
+            self.depth = DepthBuffer::new(&self.gpu.device, width, height);
+            if self.depth.is_none() {
+                log::warn!("[renderer] depth buffer unavailable after resize");
             }
             self.shadow = ShadowPass::new(
                 &self.gpu.device,

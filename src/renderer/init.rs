@@ -174,7 +174,12 @@ impl Renderer {
                         cull_mode: None,
                         ..Default::default()
                     },
-                    depth_stencil: None,
+                    // The one geometry pipeline that draws into the main
+                    // pass, and so the one that gets depth state. It is a
+                    // deliberate no-op today (`Always` + no writes); see
+                    // `depth.rs` for why, and why the composite pipelines
+                    // drawn into the same pass keep `None`.
+                    depth_stencil: super::depth::main_pipeline_state(),
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
                     cache: None,
@@ -223,6 +228,15 @@ impl Renderer {
         );
         if postprocess.is_none() {
             log::warn!("[renderer] postprocess pipeline unavailable — blur passes will be skipped");
+        }
+
+        let depth = super::depth::DepthBuffer::new(
+            &gpu.device,
+            gpu.surface_config.width,
+            gpu.surface_config.height,
+        );
+        if depth.is_none() {
+            log::warn!("[renderer] depth buffer unavailable — main pass will run without one");
         }
 
         let shadow = ShadowPass::new(
@@ -315,6 +329,7 @@ impl Renderer {
             last_perf: crate::perf::PerfSnapshot::default(),
             window,
             postprocess,
+            depth,
             offscreen_batch: Batch::new(),
             offscreen_vbuf,
             offscreen_ibuf,
