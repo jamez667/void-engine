@@ -328,8 +328,36 @@ down both paths and requires byte-identical framebuffers; it was verified
 load-bearing by flipping the compare to `Less`, which fails with the green
 quad winning where blue should.
 
-**Phase 1 — Camera.** `Camera3D` beside `Camera2D`: perspective matrix, view
-matrix from position+orientation. Uniform plumbing already exists. Small.
+**Phase 1 — Camera. ✅ Done 2026-09-21.** `Camera3D` beside `Camera2D` in
+`renderer/camera.rs`, plus `follow_3d` mirroring `follow`, and `DVec3` added
+to `math.rs`'s re-exports.
+
+As predicted, the uniform plumbing needed no change: both cameras fill the
+same `CameraUniform`, so they share the bind group layout, buffer and upload
+path. A test pins that layout-compatibility, since divergence would silently
+invalidate the shared `camera_bgl`.
+
+Two things the estimate did not anticipate, both now encoded in tests:
+
+- **`perspective_rh`, never `perspective_rh_gl`.** The `_gl` variant maps to
+  a −1..1 depth range, which would put the near plane *behind* the 1.0 the
+  main pass clears to — every fragment fails once a 3D pipeline turns on a
+  `Less` test, and the screen goes black with nothing to point at. Verified
+  load-bearing: swapping in `_gl` fails the test with the near plane at −1.0.
+- **The camera is camera-relative, like the 2D path.** `position` is `DVec3`
+  and the view matrix places the eye at the origin, subtracting in `f64`
+  before the `f32` cast. Verified load-bearing: casting before subtracting
+  loses a 1 m offset entirely at 1e9 m (`got 0`). Vertices fed to this matrix
+  must be in the same frame — the contract `world_to_screen_offset` already
+  implements for 2D.
+
+Degenerate cases guarded because both silently produce a NaN matrix and a
+blank frame rather than an error: a zero-height viewport (minimised window)
+and a target sitting on the eye (a follow rig settling).
+
+`Camera3D` is `client`-gated like the rest of `renderer`, but `DVec3` is
+exported unconditionally — checked against a headless build, so Phase 5's
+simulation work is not blocked by the gate.
 
 **Phase 2 — 3D vertex + pipeline.** A `Vertex3D` (`pos: [f32;3]`, normal, uv,
 color) and a *separate* pipeline and shader. **Do not widen `Vertex`** — it
