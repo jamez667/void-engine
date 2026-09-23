@@ -241,6 +241,95 @@ pub fn segment_vs_sphere(p0: DVec3, p1: DVec3, center: DVec3, radius: f64) -> bo
     segment_vs_sphere_t(p0, p1, center, radius).is_some()
 }
 
+/// Segment-vs-oriented-box, returning the entry parameter `t` along
+/// `p0..p1`.
+///
+/// The counterpart to [`segment_vs_sphere_t`], and what picking needs to
+/// stop treating boxes as their bounding spheres — which over-reports
+/// near the corners by up to the difference between a cube and the sphere
+/// around it, so a click just off a crate's edge still registers.
+///
+/// # The slab method
+///
+/// Transform the segment into the box's local frame, where the box is
+/// axis-aligned, then treat it as three pairs of parallel planes — the
+/// "slabs". For each axis, work out the interval of `t` during which the
+/// segment is between that axis's two planes. The segment is inside the
+/// box exactly while it is inside *all three* intervals at once, so the
+/// answer is the intersection: the largest entry and the smallest exit.
+/// If the largest entry is past the smallest exit, the segment misses.
+///
+/// # The axis-parallel case
+///
+/// A segment with no motion along an axis never crosses that axis's
+/// planes, so `1/d` is infinite and the usual arithmetic gives NaN. Such
+/// a segment is either inside that slab for its whole length or outside
+/// for all of it, which is a containment test rather than an
+/// intersection — and getting it wrong means a ray fired exactly along an
+/// axis, which is the common case for a top-down or side-on camera,
+/// silently misses everything.
+pub fn segment_vs_obb_t(
+    p0: DVec3,
+    p1: DVec3,
+    box_pos: DVec3,
+    box_half: [f64; 3],
+    box_rot: Quat,
+) -> Option<f64> {
+    let axes = obb_axes(box_rot);
+    let d = p1 - p0;
+
+    // Into the box's local frame, where it is axis-aligned.
+    let origin = p0 - box_pos;
+    let local_o = DVec3::new(origin.dot(axes[0]), origin.dot(axes[1]), origin.dot(axes[2]));
+    let local_d = DVec3::new(d.dot(axes[0]), d.dot(axes[1]), d.dot(axes[2]));
+
+    let half = DVec3::new(box_half[0].abs(), box_half[1].abs(), box_half[2].abs());
+
+    // The interval of `t` for which the segment is inside every slab.
+    let mut t_enter = 0.0f64;
+    let mut t_exit = 1.0f64;
+
+    for i in 0..3 {
+        let (o, dir, h) = (local_o[i], local_d[i], half[i]);
+        if dir.abs() < 1e-12 {
+            // Parallel to this slab: inside for the whole segment, or
+            // outside for all of it. No interval to intersect.
+            if o < -h || o > h {
+                return None;
+            }
+            continue;
+        }
+        let inv = 1.0 / dir;
+        let mut t0 = (-h - o) * inv;
+        let mut t1 = (h - o) * inv;
+        if t0 > t1 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        t_enter = t_enter.max(t0);
+        t_exit = t_exit.min(t1);
+        if t_enter > t_exit {
+            return None;
+        }
+    }
+
+    // `t_enter` is clamped at 0, so a segment starting *inside* the box
+    // reports an entry of 0 rather than a negative value behind its
+    // origin — which is what a caller wants when the camera is already
+    // within something.
+    Some(t_enter)
+}
+
+/// Whether a segment touches an oriented box at all.
+pub fn segment_vs_obb(
+    p0: DVec3,
+    p1: DVec3,
+    box_pos: DVec3,
+    box_half: [f64; 3],
+    box_rot: Quat,
+) -> bool {
+    segment_vs_obb_t(p0, p1, box_pos, box_half, box_rot).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +513,162 @@ mod tests {
             DVec3::new(5.0, 3.0, 0.0),
             DVec3::ZERO,
             1.0
+        ));
+    }
+
+    // ---- segment vs box -------------------------------------------------
+
+    /// A unit box at the origin, axis-aligned.
+    fn unit_box() -> ([f64; 3], Quat) {
+        ([1.0, 1.0, 1.0], Quat::IDENTITY)
+    }
+
+    #[test]
+    fn a_segment_through_a_box_reports_the_entry_point() {
+        let (half, rot) = unit_box();
+        let t = segment_vs_obb_t(
+            DVec3::new(-5.0, 0.0, 0.0),
+            DVec3::new(5.0, 0.0, 0.0),
+            DVec3::ZERO,
+            half,
+            rot,
+        )
+        .expect("a segment through the origin hits a unit box");
+        // Enters at x = -1, i.e. 4/10 along.
+        assert!((t - 0.4).abs() < 1e-9, "entry t should be 0.4, got {t}");
+    }
+
+    #[test]
+    fn a_segment_missing_the_box_reports_nothing() {
+        let (half, rot) = unit_box();
+        assert!(!segment_vs_obb(
+            DVec3::new(-5.0, 3.0, 0.0),
+            DVec3::new(5.0, 3.0, 0.0),
+            DVec3::ZERO,
+            half,
+            rot,
+        ));
+    }
+
+    /// The corner case this whole function exists for. A segment passing
+    /// diagonally past a box's corner misses the box but *hits its
+    /// bounding sphere*, which has radius sqrt(3) here. Picking with the
+    /// sphere fallback therefore registers a click on empty space just
+    /// off the crate's edge.
+    #[test]
+    fn a_segment_past_a_corner_misses_the_box_but_hits_its_bounding_sphere() {
+        let (half, rot) = unit_box();
+        // A segment along y at x = 1.2. Its closest approach to the
+        // origin is 1.2 — outside the box's half-extent of 1, inside the
+        // bounding sphere's radius of sqrt(3) = 1.73. That gap is the
+        // over-reporting, and it is widest at the corners.
+        let a = DVec3::new(1.2, -5.0, 0.0);
+        let b = DVec3::new(1.2, 5.0, 0.0);
+
+        assert!(
+            !segment_vs_obb(a, b, DVec3::ZERO, half, rot),
+            "x = 1.2 is outside a half-extent of 1, so the box is missed",
+        );
+        assert!(
+            segment_vs_sphere(a, b, DVec3::ZERO, 3.0f64.sqrt()),
+            "precondition: the bounding sphere *is* hit, which is exactly \
+             the over-reporting the box test removes",
+        );
+    }
+
+    /// A segment fired exactly along an axis has zero motion on the other
+    /// two, where `1/d` is infinite. Getting that wrong makes a top-down
+    /// or side-on camera — the common case — silently pick nothing.
+    #[test]
+    fn an_axis_parallel_segment_is_handled_without_nan() {
+        let (half, rot) = unit_box();
+        // Straight down +Z through the middle: no motion on x or y.
+        let t = segment_vs_obb_t(
+            DVec3::new(0.0, 0.0, -5.0),
+            DVec3::new(0.0, 0.0, 5.0),
+            DVec3::ZERO,
+            half,
+            rot,
+        )
+        .expect("an axis-parallel segment through the box should hit");
+        assert!(t.is_finite(), "got {t}");
+        assert!((t - 0.4).abs() < 1e-9, "entry t should be 0.4, got {t}");
+
+        // And one that is parallel but outside must miss rather than
+        // sneak through on a NaN comparison.
+        assert!(!segment_vs_obb(
+            DVec3::new(9.0, 0.0, -5.0),
+            DVec3::new(9.0, 0.0, 5.0),
+            DVec3::ZERO,
+            half,
+            rot,
+        ));
+    }
+
+    /// Rotation must be respected: a segment that misses an axis-aligned
+    /// box can hit the same box turned 45 degrees, and vice versa. A slab
+    /// test that forgot to transform into the box's frame would give the
+    /// same answer either way.
+    #[test]
+    fn a_rotated_box_is_hit_where_an_axis_aligned_one_is_not() {
+        // A thin slab, long in x and narrow in y.
+        let half = [3.0, 0.2, 3.0];
+        // A segment along y, offset well out in x: misses the thin slab
+        // when it lies along x...
+        let a = DVec3::new(2.5, -5.0, 0.0);
+        let b = DVec3::new(2.5, 5.0, 0.0);
+        assert!(
+            segment_vs_obb(a, b, DVec3::ZERO, half, Quat::IDENTITY),
+            "precondition: the segment crosses the unrotated slab",
+        );
+
+        // ...and misses once the slab is turned a quarter turn about z,
+        // which swaps its long and short axes.
+        let turned = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        assert!(
+            !segment_vs_obb(a, b, DVec3::ZERO, half, turned),
+            "the rotated slab is narrow where the segment passes, so it \
+             should be missed — the rotation is not being applied",
+        );
+    }
+
+    /// A segment starting inside the box reports an entry of 0 rather
+    /// than a negative value behind its own origin. That is what a caller
+    /// wants when the camera is already within something.
+    #[test]
+    fn a_segment_starting_inside_the_box_enters_at_zero() {
+        let (half, rot) = unit_box();
+        let t = segment_vs_obb_t(DVec3::ZERO, DVec3::new(5.0, 0.0, 0.0), DVec3::ZERO, half, rot)
+            .expect("a segment from inside the box hits it");
+        assert_eq!(t, 0.0);
+    }
+
+    /// A box entirely beyond the segment's far end is not hit. The slab
+    /// test works in the segment's own 0..1 parameter, so this is the
+    /// check that it is a *segment* and not an infinite ray.
+    #[test]
+    fn a_box_beyond_the_end_of_the_segment_is_not_hit() {
+        let (half, rot) = unit_box();
+        assert!(!segment_vs_obb(
+            DVec3::ZERO,
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(50.0, 0.0, 0.0),
+            half,
+            rot,
+        ));
+    }
+
+    /// And one behind the start is not hit either — the failure that
+    /// would let a click select something behind the camera.
+    #[test]
+    fn a_box_behind_the_segment_is_not_hit() {
+        let (half, rot) = unit_box();
+        assert!(!segment_vs_obb(
+            DVec3::ZERO,
+            DVec3::new(0.0, 10.0, 0.0),
+            DVec3::new(0.0, -20.0, 0.0),
+            half,
+            rot,
         ));
     }
 

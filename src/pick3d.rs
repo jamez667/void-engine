@@ -25,7 +25,7 @@
 //! vector for a perspective camera, and collider positions fed to
 //! [`crate::pick3d::cast`] must be in the same frame.
 
-use glam::{DVec3, Mat4, Vec2};
+use glam::{DVec3, Mat4, Quat, Vec2};
 
 use crate::collision::grid3d::SpatialGrid3D;
 use crate::collision::narrow3d;
@@ -119,6 +119,64 @@ pub struct Hit {
     pub point: DVec3,
 }
 
+/// What shape a slot has, for the purposes of a ray test.
+///
+/// Mirrors [`crate::components::Collider3D`]'s two cases. A caller that
+/// only has spheres can build these with [`PickShape::sphere`] and never
+/// think about it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PickShape {
+    Sphere { centre: DVec3, radius: f64 },
+    /// An oriented box. Tested exactly rather than through its bounding
+    /// sphere, which over-reports near the corners — a click just off a
+    /// crate's edge would otherwise register.
+    Obb { centre: DVec3, half_extents: [f64; 3], rot: Quat },
+}
+
+impl PickShape {
+    pub fn sphere(centre: DVec3, radius: f64) -> Self {
+        Self::Sphere { centre, radius }
+    }
+
+    pub fn obb(centre: DVec3, half_extents: [f64; 3], rot: Quat) -> Self {
+        Self::Obb { centre, half_extents, rot }
+    }
+
+    /// Build from a [`crate::components::Collider3D`] and a pose, using
+    /// the same sphere-or-box discriminator the collider itself uses.
+    pub fn from_collider(
+        collider: &crate::components::Collider3D,
+        centre: DVec3,
+        rot: Quat,
+    ) -> Self {
+        if collider.is_box() {
+            Self::Obb {
+                centre,
+                half_extents: [
+                    collider.half_extents[0] as f64,
+                    collider.half_extents[1] as f64,
+                    collider.half_extents[2] as f64,
+                ],
+                rot,
+            }
+        } else {
+            Self::Sphere { centre, radius: collider.radius as f64 }
+        }
+    }
+
+    /// Entry parameter along `p0..p1`, or `None` for a miss.
+    fn segment_t(&self, p0: DVec3, p1: DVec3) -> Option<f64> {
+        match *self {
+            PickShape::Sphere { centre, radius } => {
+                narrow3d::segment_vs_sphere_t(p0, p1, centre, radius)
+            }
+            PickShape::Obb { centre, half_extents, rot } => {
+                narrow3d::segment_vs_obb_t(p0, p1, centre, half_extents, rot)
+            }
+        }
+    }
+}
+
 /// Cast a ray through a grid and return every hit, **nearest first**.
 ///
 /// `max_distance` bounds the search: a ray is infinite, the grid is not,
@@ -130,15 +188,15 @@ pub struct Hit {
 /// trigger volume, a corpse. Filtering here rather than after the fact
 /// means a skipped collider cannot occlude one behind it.
 ///
-/// Only spheres are tested. Box colliders use their bounding sphere,
-/// which over-reports near the corners; a ray-vs-OBB test is the obvious
-/// next step and is not here yet.
+/// Boxes are tested exactly, not through their bounding sphere. The grid
+/// still *finds* candidates by bounding sphere — that is what it stores —
+/// so a box near the ray is considered and then correctly rejected.
 pub fn cast(
     grid: &SpatialGrid3D,
     ray: Ray3D,
     max_distance: f64,
     partition: u32,
-    shape_of: impl Fn(u32) -> Option<(DVec3, f64)>,
+    shape_of: impl Fn(u32) -> Option<PickShape>,
 ) -> Vec<Hit> {
     if !max_distance.is_finite() || max_distance <= 0.0 {
         return Vec::new();
@@ -149,13 +207,12 @@ pub fn cast(
 
     let mut hits: Vec<Hit> = Vec::new();
     for index in candidates {
-        let Some((centre, radius)) = shape_of(index) else {
+        let Some(shape) = shape_of(index) else {
             continue;
         };
-        // `segment_vs_sphere_t` returns the *entry* parameter along the
-        // segment, which is exactly what sorting by nearest needs — and
-        // is why this reuses it rather than writing a ray test.
-        let Some(t) = narrow3d::segment_vs_sphere_t(ray.origin, end, centre, radius) else {
+        // Both narrowphase tests return the *entry* parameter along the
+        // segment, which is exactly what sorting by nearest needs.
+        let Some(t) = shape.segment_t(ray.origin, end) else {
             continue;
         };
         // `t` is a fraction of the segment; scale to metres.
@@ -179,7 +236,7 @@ pub fn cast_nearest(
     ray: Ray3D,
     max_distance: f64,
     partition: u32,
-    shape_of: impl Fn(u32) -> Option<(DVec3, f64)>,
+    shape_of: impl Fn(u32) -> Option<PickShape>,
 ) -> Option<Hit> {
     cast(grid, ray, max_distance, partition, shape_of)
         .into_iter()
@@ -199,8 +256,8 @@ mod tests {
         g
     }
 
-    fn lookup(spheres: Vec<(DVec3, f64)>) -> impl Fn(u32) -> Option<(DVec3, f64)> {
-        move |i| spheres.get(i as usize).copied()
+    fn lookup(spheres: Vec<(DVec3, f64)>) -> impl Fn(u32) -> Option<PickShape> {
+        move |i| spheres.get(i as usize).map(|&(c, r)| PickShape::sphere(c, r))
     }
 
     #[test]
@@ -303,7 +360,7 @@ mod tests {
         let ray = Ray3D::new(DVec3::ZERO, DVec3::Y).unwrap();
 
         let hit = cast_nearest(&g, ray, 100.0, 0, |i| {
-            if i == 0 { None } else { spheres.get(i as usize).copied() }
+            if i == 0 { None } else { spheres.get(i as usize).map(|&(c, r)| PickShape::sphere(c, r)) }
         })
         .expect("the far sphere should be picked");
         assert_eq!(hit.index, 1);
@@ -347,7 +404,7 @@ mod tests {
         g.insert_partitioned(DVec3::new(0.0, 10.0, 0.0), 1.0, 1);
         let ray = Ray3D::new(DVec3::ZERO, DVec3::Y).unwrap();
 
-        let shape = |_| Some((DVec3::new(0.0, 10.0, 0.0), 1.0));
+        let shape = |_| Some(PickShape::sphere(DVec3::new(0.0, 10.0, 0.0), 1.0));
         assert!(cast_nearest(&g, ray, 100.0, 0, shape).is_none());
         assert!(cast_nearest(&g, ray, 100.0, 1, shape).is_some());
     }
@@ -361,6 +418,119 @@ mod tests {
         let ray = Ray3D::new(DVec3::ZERO, DVec3::Y).unwrap();
         for d in [0.0, -5.0, f64::NAN, f64::INFINITY] {
             assert!(cast(&g, ray, d, 0, lookup(spheres.clone())).is_empty(), "d = {d}");
+        }
+    }
+
+    // ---- boxes ----------------------------------------------------------
+
+    /// The reason box support exists. A ray passing just outside a box's
+    /// face hits its bounding sphere but not the box, so picking by
+    /// sphere registers a click on empty space beside a crate.
+    #[test]
+    fn a_box_is_tested_exactly_rather_than_by_its_bounding_sphere() {
+        // A unit box: half-extent 1, bounding sphere radius sqrt(3).
+        let centre = DVec3::new(0.0, 10.0, 0.0);
+        let mut g = SpatialGrid3D::new(4.0);
+        // Inserted by bounding sphere, which is what the grid stores —
+        // so the candidate is found either way and the difference is
+        // entirely in the narrowphase.
+        g.insert(centre, 3.0f64.sqrt());
+
+        // Offset 1.2 in x: outside the box, inside the sphere.
+        let ray = Ray3D::new(DVec3::new(1.2, 0.0, 0.0), DVec3::Y).unwrap();
+
+        let as_sphere = cast_nearest(&g, ray, 100.0, 0, |_| {
+            Some(PickShape::sphere(centre, 3.0f64.sqrt()))
+        });
+        assert!(
+            as_sphere.is_some(),
+            "precondition: the bounding sphere is hit, which is the \
+             over-reporting being removed",
+        );
+
+        let as_box = cast_nearest(&g, ray, 100.0, 0, |_| {
+            Some(PickShape::obb(centre, [1.0, 1.0, 1.0], Quat::IDENTITY))
+        });
+        assert!(
+            as_box.is_none(),
+            "the box itself is missed at x = 1.2, so picking it as a box \
+             must report nothing — got {as_box:?}",
+        );
+    }
+
+    /// And a ray that does hit the box reports a sensible entry distance,
+    /// not just a boolean.
+    #[test]
+    fn a_box_hit_reports_its_entry_distance() {
+        let centre = DVec3::new(0.0, 10.0, 0.0);
+        let mut g = SpatialGrid3D::new(4.0);
+        g.insert(centre, 3.0f64.sqrt());
+        let ray = Ray3D::new(DVec3::ZERO, DVec3::Y).unwrap();
+
+        let hit = cast_nearest(&g, ray, 100.0, 0, |_| {
+            Some(PickShape::obb(centre, [1.0, 1.0, 1.0], Quat::IDENTITY))
+        })
+        .expect("a ray through the middle should hit the box");
+        // Enters the near face at y = 9.
+        assert!(
+            (hit.distance - 9.0).abs() < 0.01,
+            "expected entry at 9 m, got {}",
+            hit.distance,
+        );
+    }
+
+    /// A rotated box must be picked in its rotated position. Picking that
+    /// ignored orientation would select a crate by where it used to be.
+    #[test]
+    fn a_rotated_box_is_picked_in_its_rotated_orientation() {
+        // A slab: long in x, thin in y.
+        let centre = DVec3::new(0.0, 10.0, 0.0);
+        let half = [4.0, 0.2, 4.0];
+        let mut g = SpatialGrid3D::new(8.0);
+        g.insert(centre, 6.0);
+
+        // A ray straight up +Z through x = 3: inside the slab's long
+        // axis while it lies along x.
+        let ray = Ray3D::new(DVec3::new(3.0, 10.0, -20.0), DVec3::Z).unwrap();
+
+        let flat = cast_nearest(&g, ray, 100.0, 0, |_| {
+            Some(PickShape::obb(centre, half, Quat::IDENTITY))
+        });
+        assert!(flat.is_some(), "precondition: the unrotated slab is hit");
+
+        // Turned a quarter turn about z, its long axis becomes y and it
+        // is now thin where the ray passes.
+        let turned = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let spun = cast_nearest(&g, ray, 100.0, 0, |_| {
+            Some(PickShape::obb(centre, half, turned))
+        });
+        assert!(
+            spun.is_none(),
+            "the rotated slab no longer covers the ray, so it should be \
+             missed — orientation is being ignored",
+        );
+    }
+
+    /// `PickShape::from_collider` must pick the same sphere-or-box branch
+    /// the collider itself reports, or a box would be picked as a sphere
+    /// and the exact test silently skipped.
+    #[test]
+    fn from_collider_follows_the_colliders_own_shape() {
+        use crate::components::Collider3D;
+
+        let s = PickShape::from_collider(&Collider3D::sphere(2.0), DVec3::ZERO, Quat::IDENTITY);
+        assert!(matches!(s, PickShape::Sphere { radius, .. } if (radius - 2.0).abs() < 1e-9));
+
+        let b = PickShape::from_collider(
+            &Collider3D::box3d(1.0, 2.0, 3.0),
+            DVec3::ZERO,
+            Quat::IDENTITY,
+        );
+        match b {
+            PickShape::Obb { half_extents, .. } => {
+                assert_eq!(half_extents, [1.0, 2.0, 3.0]);
+            }
+            other => panic!("a box collider should pick as a box, got {other:?}"),
         }
     }
 

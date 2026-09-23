@@ -187,8 +187,15 @@ steps:
       - |
         out=$(cargo test --lib pick3d:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "18 passed" || {
-          echo "expected 18 picking tests"
+        echo "$out" | grep -q "22 passed" || {
+          echo "expected 22 picking tests"
+          exit 1
+        }
+      - |
+        out=$(cargo test --lib collision::narrow3d:: 2>&1)
+        echo "$out"
+        echo "$out" | grep -q "21 passed" || {
+          echo "expected 21 3D narrowphase tests"
           exit 1
         }
       - |
