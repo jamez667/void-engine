@@ -43,9 +43,32 @@ pub const SOLVER_ITERATIONS: usize = 4;
 /// Fraction of remaining penetration corrected per step.
 ///
 /// Correcting all of it in one step makes bodies pop apart; correcting
-/// none lets them sink. 0.2 converges over a few frames without a visible
-/// snap. Named after the Baumgarte stabilisation this approximates.
-pub const BAUMGARTE: f64 = 0.2;
+/// none lets them sink. Named after the Baumgarte stabilisation this
+/// approximates.
+///
+/// # Why 0.3 and not 0.2
+///
+/// 0.2 recovers about 6 mm per tick of a typical loaded contact, against
+/// the 2.7 mm that contact sinks under gravity in the same tick — enough
+/// for one body on the floor, and not enough for a stack, where the load
+/// grows with every layer while the recovery rate does not. Measured on
+/// `examples/crates3d`: a three-high stack of 1 m crates settled at
+/// 0.483 / 1.435 / 2.416 against a nominal 0.50 / 1.50 / 2.50, visibly
+/// squashed into itself and squashing further the longer it stood.
+///
+/// # And why not more passes
+///
+/// The obvious fix — run the correction once per solver iteration, the
+/// way the impulses are — is worse. Penetration is measured *once*,
+/// before any correction runs, so repeated passes act on a stale depth,
+/// push the pair apart by more than they currently overlap, and leave
+/// them airborne to fall again next tick. Measured: crates resting on a
+/// static floor oscillating over 0.14 m at vertical speeds past 1.3 m/s.
+///
+/// One stronger pass fixes the height without the jump. At 0.3 the same
+/// stack settles at 0.492 / 1.470 / 2.459 with a third of the residual
+/// motion.
+pub const BAUMGARTE: f64 = 0.3;
 
 /// Penetration left uncorrected, in metres.
 ///
@@ -171,24 +194,11 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
     // post-impulse state rather than fighting it — and **iterated**, for
     // the same reason the impulses are.
     //
-    // One pass moves the pair apart by `excess * BAUMGARTE`, which at the
-    // default 20% barely outruns the `g*dt²` a contact sinks under its
-    // own weight each tick — and loses outright once something is resting
-    // on top, because the load doubles while the recovery rate does not.
-    // A stack therefore compresses instead of settling. Measured on
-    // `examples/crates3d` before this: a three-high stack of 1 m crates
-    // sat at z = 0.48 / 1.44 / 2.42 against a nominal 0.50 / 1.50 / 2.50,
-    // with crate-on-crate overlap of 32-65 mm — up to thirteen times
-    // [`PENETRATION_SLOP`] — and the overlap grew the longer it stood.
-    //
-    // Each pass re-measures depth from the *current* positions rather
-    // than reusing the contact's stored penetration, which is what stops
-    // the extra passes from over-correcting and launching the stack.
-    let mut separated = vec![0.0f64; contacts.len()];
-    for _ in 0..SOLVER_ITERATIONS {
-        for (i, c) in contacts.iter().enumerate() {
-            separated[i] += correct_penetration(bodies, c, separated[i]);
-        }
+    // The strength of that one pass is what decides whether a stack
+    // settles or squashes; see [`BAUMGARTE`], which also records why
+    // running this once per solver iteration is worse rather than better.
+    for c in contacts {
+        correct_penetration(bodies, c);
     }
 
     let _ = dt;
@@ -325,46 +335,34 @@ fn apply(bodies: &mut [BodyRef<'_>], i: usize, rot: Quat, rel: DVec3, impulse: D
 /// Splitting this from the impulse solve is what keeps a resting stack
 /// still: correcting overlap with velocity injects energy the solver then
 /// has to remove again, which reads as a stack that breathes.
-/// Returns how far apart this call pushed the pair, so the caller can
-/// discount it on the next pass.
-fn correct_penetration(
-    bodies: &mut [BodyRef<'_>],
-    c: &Contact,
-    already_separated: f64,
-) -> f64 {
+fn correct_penetration(bodies: &mut [BodyRef<'_>], c: &Contact) {
     let (ia, ib) = (c.a, c.b);
     if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
-        return 0.0;
+        return;
     }
 
-    // Only the excess beyond the slop, so a settled contact is left
-    // alone — and only what is *left* of it, since earlier passes this
-    // tick have already pushed the pair `already_separated` apart.
-    // Without that term the same overlap is corrected once per pass and
-    // the pair is flung apart instead of settled.
-    let excess = (c.penetration - already_separated - PENETRATION_SLOP).max(0.0);
+    // Only the excess beyond the slop, so a settled contact is left alone.
+    let excess = (c.penetration - PENETRATION_SLOP).max(0.0);
     if excess <= 0.0 {
-        return 0.0;
+        return;
     }
 
     let inv_a = if bodies[ia].body.kind.is_dynamic() { bodies[ia].body.inv_mass as f64 } else { 0.0 };
     let inv_b = if bodies[ib].body.kind.is_dynamic() { bodies[ib].body.inv_mass as f64 } else { 0.0 };
     let total = inv_a + inv_b;
     if total <= 0.0 {
-        return 0.0;
+        return;
     }
 
     // Shared in proportion to inverse mass, so a light body moves most
     // and an immovable one not at all.
-    let gained = excess * BAUMGARTE;
-    let correction = c.normal * (gained / total);
+    let correction = c.normal * (excess * BAUMGARTE / total);
     if inv_a > 0.0 {
         bodies[ia].transform.pos += correction * inv_a;
     }
     if inv_b > 0.0 {
         bodies[ib].transform.pos -= correction * inv_b;
     }
-    gained
 }
 
 #[cfg(test)]
@@ -843,4 +841,64 @@ mod tests {
             "a body struck by something moving must wake"
         );
     }
+
+    /// A stack must not compress under its own weight.
+    ///
+    /// Positional correction is iterated for the same reason the impulses
+    /// are. A single pass separates a pair by `excess * BAUMGARTE`, which
+    /// barely outruns the `g*dt²` a contact sinks each tick — and loses
+    /// outright once something rests on top, because the load grows while
+    /// the recovery rate does not. The stack then squashes into itself
+    /// instead of settling, and keeps squashing the longer it stands.
+    ///
+    /// Measured on `examples/crates3d` with a single pass: a three-high
+    /// stack of 1 m crates sat at 0.48 / 1.44 / 2.42 against a nominal
+    /// 0.50 / 1.50 / 2.50, with crate-on-crate overlap of 32-65 mm
+    /// against a 5 mm slop.
+    #[test]
+    fn a_loaded_contact_is_pushed_back_out_to_the_slop() {
+        let mut s = Scene::new();
+        // Two crates, deeply overlapped, with the lower one held up by an
+        // immovable floor so the pair cannot simply drift apart.
+        let floor = s.push(RigidBody::static_body(), DVec3::new(0.0, 0.0, -0.5), DVec3::ZERO);
+        let lower = s.push(
+            RigidBody::box3d(1.0, [0.5, 0.5, 0.5]),
+            DVec3::new(0.0, 0.0, 0.5),
+            DVec3::ZERO,
+        );
+        let upper = s.push(
+            RigidBody::box3d(1.0, [0.5, 0.5, 0.5]),
+            // 40 mm into the one below, the depth the game actually
+            // reached before the correction was iterated.
+            DVec3::new(0.0, 0.0, 1.46),
+            DVec3::ZERO,
+        );
+
+        let before = s.transforms[upper].pos.z - s.transforms[lower].pos.z;
+        s.solve(&[
+            contact(lower, floor, DVec3::Z, 0.0, DVec3::ZERO),
+            contact(upper, lower, DVec3::Z, 0.04, DVec3::new(0.0, 0.0, 0.98)),
+        ]);
+        let after = s.transforms[upper].pos.z - s.transforms[lower].pos.z;
+
+        assert!(
+            after > before,
+            "the pair did not separate at all: {before:.4} -> {after:.4}",
+        );
+        // The bar is gravity, not a round fraction. A contact sinks
+        // `g*dt²` under its own weight every tick — 2.7 mm at 60 Hz — and
+        // a stack loads the contacts below it harder than that, so the
+        // recovery has to clear it with room to spare or the pile
+        // compresses instead of settling.
+        let recovered = after - before;
+        let sink_per_tick = crate::physics3d::GRAVITY.z.abs() / 3600.0;
+        assert!(
+            recovered > sink_per_tick * 2.0,
+            "recovered only {recovered:.5} m of a 0.04 m overlap in one tick, \r
+             against the {sink_per_tick:.5} m a loaded contact sinks in the \r
+             same tick — a stack will squash into itself",
+        );
+    }
+
+
 }

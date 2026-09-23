@@ -198,8 +198,8 @@ steps:
       - |
         out=$(cargo test --lib ai3d:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "40 passed" || {
-          echo "expected 40 walking-agent tests"
+        echo "$out" | grep -q "58 passed" || {
+          echo "expected 58 walking-agent tests"
           exit 1
         }
       - |
@@ -225,8 +225,8 @@ steps:
       - |
         out=$(cargo test --lib physics3d:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "40 passed" || {
-          echo "expected 40 rigid-body tests"
+        echo "$out" | grep -q "41 passed" || {
+          echo "expected 41 rigid-body tests"
           exit 1
         }
 

@@ -357,7 +357,28 @@ impl StackTask {
         //
         // Chaining asks the question that matters: is this crate resting
         // on that one?
-        let mut column = plane.tile_center(site.0, site.1);
+        // The base layer is found by height alone, not by position.
+        //
+        // A settled tower creeps as it beds in — measured at 0.43 m from
+        // the tile it was started on, against a 0.375 m tolerance — and
+        // anchoring the chain to that tile reports a perfectly good
+        // three-high stack as zero layers. Which tile the stack began on
+        // stops being interesting the moment the first crate lands; what
+        // matters from then on is that each crate is on the one below.
+        let mut column = crates
+            .iter()
+            .filter(|c| {
+                !c.carried_by_other
+                    && (c.pos.z - (plane.floor_z + h * 0.5)).abs()
+                        <= self.tuning.settle_z_tolerance
+            })
+            .min_by(|a, b| {
+                let da = plane.flatten(a.pos - plane.tile_center(site.0, site.1)).length();
+                let db = plane.flatten(b.pos - plane.tile_center(site.0, site.1)).length();
+                da.total_cmp(&db)
+            })
+            .map(|c| DVec3::new(c.pos.x, c.pos.y, 0.0))
+            .unwrap_or_else(|| plane.tile_center(site.0, site.1));
         let mut n = 0u32;
         while n < self.tuning.target_layers {
             let expect = plane.floor_z + n as f64 * h + h * 0.5;
@@ -471,7 +492,8 @@ pub fn hold_pose(
 /// Derived from the nominal crate height and the layer index, **not**
 /// from the measured top of the pile. A crate that settled two
 /// millimetres into its neighbour — which the solver leaves on purpose,
-/// up to [`PENETRATION_SLOP`] — would drag the next drop two millimetres
+/// up to [`crate::physics3d::solver::PENETRATION_SLOP`] — would drag the
+/// next drop two millimetres
 /// low, and the error would compound up the stack. Measuring is used only
 /// to decide whether a layer has settled, never to place the next one.
 pub fn drop_height_for_layer(
