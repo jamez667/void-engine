@@ -47,6 +47,14 @@ pub mod perf;
 #[cfg(feature = "persist")]
 pub mod persist;
 pub mod physics;
+/// Rigid-body dynamics for the 3D path: gravity, contact resolution,
+/// friction, restitution and sleeping.
+///
+/// Separate from [`physics`], which is a bare integrator for both
+/// dimensions. This is the collision *response* the engine has never had
+/// — `collision`'s docs say it hands back a pair list and leaves
+/// resolution to the caller, and for 2D that stays true.
+pub mod physics3d;
 pub mod render_math;
 /// wgpu renderer — client-only.
 #[cfg(feature = "client")]

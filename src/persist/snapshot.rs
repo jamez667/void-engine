@@ -270,6 +270,11 @@ pub fn register_engine_components(registry: &mut Registry) -> Result<(), super::
     registry.register::<Transform3D>("transform3d", Persist::Volatile)?;
     registry.register::<Velocity3D>("velocity3d", Persist::Volatile)?;
     registry.register::<Collider3D>("collider3d", Persist::Volatile)?;
+    // The rigid body's *state* is volatile like the rest: a restored
+    // world re-derives contacts on its next step. `sleeping` rides along
+    // deliberately — a settled stack that woke on every load would spend
+    // a second resettling, visibly, every time a checkpoint is restored.
+    registry.register::<crate::physics3d::RigidBody>("rigidbody3d", Persist::Volatile)?;
     // Particles are cosmetic and short-lived; restoring mid-flight sparks
     // is worse than letting them lapse.
     registry.register_transient::<Particle>("particle")?;
