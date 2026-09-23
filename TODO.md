@@ -1233,8 +1233,14 @@ type is a security boundary.*
 `clear` + refill, `query_circle_into`, `diff`, item build, `send_chunked`
 — at rising client counts and reports where the tick went.
 
-**~1,500 clients on one process at 30 Hz.** Table A, density held fixed
-so the sector grows with the crowd:
+**~1,500 clients on one process at 30 Hz** — as first measured. Twice
+superseded since: the bitpack rewrite below took it to ~4,400, and the 3D
+wire widening (2026-09-22) brought it back to **~3,800**. The current
+number is the one in the boxed note further down; the table immediately
+below is the original baseline and is kept because the later measurements
+are stated as deltas against it.
+
+Table A, density held fixed so the sector grows with the crowd:
 
 | clients | entities | rebuild | aoi | diff | items | encode+send | total |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1298,6 +1304,37 @@ fire. Straddling is the common case.
 
 **The single-node ceiling moves from ~1,500 to ~4,400 clients.** 2,000
 was 104% of budget and is now 43%; 4,000 is 91%.
+
+> **Superseded 2026-09-22 by the 3D wire widening — the ceiling fell back
+> to ~3,800.** `EntityItem` gained a third position axis, a third
+> velocity axis and a quaternion in place of a scalar angle
+> (`docs/3d-spec.md` Phase 5). Re-run of the same harness, same columns:
+>
+> | clients | tick after bitpack | tick after 3D | of budget |
+> | --- | --- | --- | --- |
+> | 500 | 3.2 ms | 3.9 ms | 12% |
+> | 1,000 | 6.9 | 8.6 | 26% |
+> | 2,000 | 14.3 | 16.9 | 51% |
+> | 4,000 | 30.5 | **35.8** | **107%** |
+> | 8,000 | 61.3 | 73.1 | 219% |
+>
+> So 4,000 clients went from 91% of budget to 107% — over. The ceiling is
+> now a little under 4,000 rather than ~4,400, a **~14% loss** that is
+> uniform across the table, which is what a per-item size increase should
+> look like.
+>
+> `items/pkt` fell from 93 to **44-49** in the same run. Both numbers are
+> real and they do not contradict: 93 was the *maximum* items that fit a
+> datagram with no name table, measured by growing a packet; 44-49 is what
+> a steady-state delta actually carries in this workload. The per-item
+> cost is 18 B and the measured ceiling on a bare datagram is 63 items
+> (`measure_item_cost_and_items_per_datagram` in `snapshot.rs`).
+>
+> *Cost of the decision, not a defect.* One wire format was chosen over
+> two deliberately, so a 2D game pays for axes it leaves at zero. The
+> trigger to revisit is a deployment that actually wants those clients
+> back: a 2D-only packet kind would recover roughly this 14%, at the price
+> of two encoders and two decoders to keep in step.
 
 *Measured the way the entry below insisted: baseline captured from the
 same binary immediately before the change, then re-run after, comparing

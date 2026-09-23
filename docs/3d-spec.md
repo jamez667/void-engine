@@ -518,8 +518,19 @@ sum of the new fields suggests — quantised fields are bit-packed) and **63
 items** fit the conservative datagram floor (not the ~74 estimated, because
 the floor is shared with a scalar core that did not shrink). §4's earlier
 "+7 bytes, ~74 items" figures were wrong in both directions and are corrected
-in `snapshot.rs`. The end-to-end keyframe figures have **not** been
-re-measured; `examples/load_sweep.rs` exists for that.
+in `snapshot.rs`.
+
+**The end-to-end cost is now measured too** (`examples/load_sweep.rs`, run
+2026-09-22): the single-node ceiling fell from ~4,400 clients to **~3,800**.
+4,000 clients went from 91% of the 30 Hz budget to **107%** — over. The loss
+is ~14% and uniform across the table, which is the shape a per-item size
+increase should have. Full before/after is recorded in `TODO.md` under "The
+single-node ceiling".
+
+That is the price of one wire format instead of two, paid by 2D games for
+axes they leave at zero. It was chosen knowingly; the trigger to revisit is a
+deployment that wants those clients back, and the fix would be a 2D-only
+packet kind at the cost of a second encoder and decoder.
 
 Still absent, and still not costed: gravity, forces, constraints and a
 contact solver. None exist in 2D either. A 3D game needing them is asking for

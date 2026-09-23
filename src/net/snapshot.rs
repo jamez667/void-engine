@@ -64,9 +64,17 @@
 //! Both numbers are measured, not estimated; an earlier revision of this
 //! comment guessed "~74 items" and was wrong.
 //!
-//! The end-to-end figures (a 40-item delta at 484 B, a 1834-item keyframe
-//! in 34 datagrams) have *not* been re-measured. `examples/load_sweep.rs`
-//! exists for that and should be run before anyone plans around them.
+//! End-to-end, `examples/load_sweep.rs` (2026-09-22) puts a steady-state
+//! delta at **44-49 items per packet** in its workload, and the
+//! single-node ceiling at ~3,800 clients rather than the ~4,400 it was
+//! before the widening — a ~14% loss, uniform across the table. `TODO.md`
+//! records the full before/after under "The single-node ceiling".
+//!
+//! The 93-items figure above and the 44-49 here are both real and do not
+//! contradict: 93 was the *maximum* that fits a bare datagram, measured
+//! by growing a packet one item at a time; 44-49 is what a delta actually
+//! carries under load. The post-3D maximum is 63.
+//!
 //! What has not changed is the shape: a steady-state delta is still one
 //! datagram and a full keyframe still chunks, which is what
 //! `send_chunked` is for.
