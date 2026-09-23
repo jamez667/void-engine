@@ -178,6 +178,27 @@ steps:
           exit 1
         }
 
+      # Ray picking and the 3D grid traversal it drives. Neither is
+      # feature-gated; the risk is the same as physics3d's — a shrinking
+      # suite. Both encode properties that are wrong invisibly: an
+      # unprojection missing its Y flip picks a vertically mirrored
+      # world, and a DDA missing its third branch simply never reaches
+      # diagonal targets.
+      - |
+        out=$(cargo test --lib pick3d:: 2>&1)
+        echo "$out"
+        echo "$out" | grep -q "18 passed" || {
+          echo "expected 18 picking tests"
+          exit 1
+        }
+      - |
+        out=$(cargo test --lib collision::grid3d:: 2>&1)
+        echo "$out"
+        echo "$out" | grep -q "19 passed" || {
+          echo "expected 19 3D grid tests"
+          exit 1
+        }
+
       # The rigid-body solver. Not feature-gated, so a broken cfg is not
       # the risk here — the risk is the suite quietly shrinking, because
       # almost every test in it encodes a physical property that is wrong

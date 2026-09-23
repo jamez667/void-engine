@@ -309,6 +309,141 @@ impl SpatialGrid3D {
         std::mem::take(&mut scratch.hits)
     }
 
+    /// Slots in any cell the segment `a`..`b` passes through.
+    ///
+    /// The 3D counterpart to `SpatialGrid::query_segment_in`, and the
+    /// piece a raycast needs: a sphere query cannot answer "what is along
+    /// this line" without testing a sphere big enough to contain the whole
+    /// ray, which is most of the world.
+    ///
+    /// # The traversal
+    ///
+    /// A 3D grid-DDA (Amanatides–Woo). The 2D version keeps a `t_max` per
+    /// axis and repeatedly steps whichever is smaller; this keeps three
+    /// and steps whichever is smallest, which is the whole structural
+    /// difference. `t_max` is the parametric distance at which the ray
+    /// crosses the next cell boundary on that axis, and `t_delta` is how
+    /// far it travels to cross one full cell.
+    ///
+    /// # Why the 3x3x3 pad
+    ///
+    /// Cells hold colliders whose *centre* lies elsewhere — a large
+    /// sphere spans many cells and is filed in all of them, but a small
+    /// one near a boundary can still overlap a ray passing through the
+    /// neighbouring cell. Visiting the 26 neighbours costs a hash lookup
+    /// each and is what keeps the query from missing grazing hits. The 2D
+    /// version pads 3x3 for the same reason.
+    ///
+    /// Returns *candidates*, not hits: the caller still runs a real
+    /// ray-vs-shape test. See [`crate::collision::narrow3d`].
+    pub fn query_segment(&self, a: DVec3, b: DVec3) -> Vec<u32> {
+        self.query_segment_in(a, b, 0)
+    }
+
+    /// [`Self::query_segment`] restricted to one partition.
+    pub fn query_segment_in(&self, a: DVec3, b: DVec3, partition: u32) -> Vec<u32> {
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut out: Vec<u32> = Vec::new();
+
+        let visit_cell = |cx: i32, cy: i32, cz: i32,
+                              seen: &mut std::collections::HashSet<u32>,
+                              out: &mut Vec<u32>| {
+            for pz in -1..=1 {
+                for py in -1..=1 {
+                    for px in -1..=1 {
+                        let Some(bucket) =
+                            self.cells.get(&(partition, cx + px, cy + py, cz + pz))
+                        else {
+                            continue;
+                        };
+                        for &idx in bucket {
+                            if seen.insert(idx) {
+                                out.push(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let (ax, ay, az) = self.cell(a);
+        let (bx, by, bz) = self.cell(b);
+        // A segment inside one cell needs no traversal. Also the
+        // degenerate zero-length case, which would otherwise divide by a
+        // zero direction below.
+        if (ax, ay, az) == (bx, by, bz) {
+            visit_cell(ax, ay, az, &mut seen, &mut out);
+            return out;
+        }
+
+        let dir = b - a;
+        let step_x = if dir.x > 0.0 { 1 } else if dir.x < 0.0 { -1 } else { 0 };
+        let step_y = if dir.y > 0.0 { 1 } else if dir.y < 0.0 { -1 } else { 0 };
+        let step_z = if dir.z > 0.0 { 1 } else if dir.z < 0.0 { -1 } else { 0 };
+
+        // World coordinate of the next cell boundary on one axis.
+        // `INFINITY` when the ray does not move on that axis at all,
+        // which makes its `t_max` never win the comparison below.
+        let next_bound = |v: f64, step: i32| -> f64 {
+            let cell_f = (v / self.cell_size).floor();
+            if step > 0 {
+                (cell_f + 1.0) * self.cell_size
+            } else if step < 0 {
+                cell_f * self.cell_size
+            } else {
+                f64::INFINITY
+            }
+        };
+        let mut t_max_x = if step_x != 0 {
+            (next_bound(a.x, step_x) - a.x) / dir.x
+        } else {
+            f64::INFINITY
+        };
+        let mut t_max_y = if step_y != 0 {
+            (next_bound(a.y, step_y) - a.y) / dir.y
+        } else {
+            f64::INFINITY
+        };
+        let mut t_max_z = if step_z != 0 {
+            (next_bound(a.z, step_z) - a.z) / dir.z
+        } else {
+            f64::INFINITY
+        };
+        let t_delta_x = if step_x != 0 { (self.cell_size / dir.x).abs() } else { f64::INFINITY };
+        let t_delta_y = if step_y != 0 { (self.cell_size / dir.y).abs() } else { f64::INFINITY };
+        let t_delta_z = if step_z != 0 { (self.cell_size / dir.z).abs() } else { f64::INFINITY };
+
+        let (mut cx, mut cy, mut cz) = (ax, ay, az);
+        visit_cell(cx, cy, cz, &mut seen, &mut out);
+
+        // A well-formed segment crosses at most |dx| + |dy| + |dz| + 1
+        // cells; the slack absorbs the pad and any boundary rounding. The
+        // cap is a safety net, not the termination condition — a NaN
+        // direction would otherwise loop forever.
+        let max_steps = (bx - ax).unsigned_abs() as usize
+            + (by - ay).unsigned_abs() as usize
+            + (bz - az).unsigned_abs() as usize
+            + 6;
+        for _ in 0..max_steps {
+            if (cx, cy, cz) == (bx, by, bz) {
+                break;
+            }
+            // Step along whichever axis reaches its next boundary first.
+            if t_max_x < t_max_y && t_max_x < t_max_z {
+                cx += step_x;
+                t_max_x += t_delta_x;
+            } else if t_max_y < t_max_z {
+                cy += step_y;
+                t_max_y += t_delta_y;
+            } else {
+                cz += step_z;
+                t_max_z += t_delta_z;
+            }
+            visit_cell(cx, cy, cz, &mut seen, &mut out);
+        }
+        out
+    }
+
     /// The bounding sphere of a live slot.
     pub fn bounds_of(&self, idx: u32) -> Option<(DVec3, f64)> {
         if self.alive.get(idx as usize).copied().unwrap_or(false) {
@@ -471,6 +606,80 @@ mod tests {
         assert!(g.cell_size > 0.0);
         let g = SpatialGrid3D::new(-5.0);
         assert!(g.cell_size > 0.0);
+    }
+
+    // ---- segment traversal ---------------------------------------------
+
+    #[test]
+    fn a_segment_finds_what_lies_along_it() {
+        let mut g = SpatialGrid3D::new(4.0);
+        let near = g.insert(DVec3::new(0.0, 10.0, 0.0), 1.0);
+        let far = g.insert(DVec3::new(0.0, 40.0, 0.0), 1.0);
+        let _aside = g.insert(DVec3::new(100.0, 0.0, 0.0), 1.0);
+
+        let mut hits = g.query_segment(DVec3::ZERO, DVec3::new(0.0, 50.0, 0.0));
+        hits.sort_unstable();
+        assert!(hits.contains(&near) && hits.contains(&far));
+        assert!(
+            !hits.contains(&_aside),
+            "a collider nowhere near the segment should not be a candidate",
+        );
+    }
+
+    /// The case the third DDA branch exists for. A segment that changes
+    /// on all three axes must still reach its far end; a traversal
+    /// missing the z branch stalls and never arrives.
+    #[test]
+    fn a_diagonal_segment_traverses_all_three_axes() {
+        let mut g = SpatialGrid3D::new(2.0);
+        let target = g.insert(DVec3::new(30.0, 30.0, 30.0), 1.0);
+        let hits = g.query_segment(DVec3::ZERO, DVec3::new(31.0, 31.0, 31.0));
+        assert!(
+            hits.contains(&target),
+            "a fully diagonal segment did not reach its far end — the DDA \
+             is not stepping on every axis",
+        );
+    }
+
+    /// A segment wholly inside one cell is the fast path, and also the
+    /// zero-length case: computing a direction there would divide by
+    /// zero.
+    #[test]
+    fn a_degenerate_segment_is_handled_without_dividing_by_zero() {
+        let mut g = SpatialGrid3D::new(10.0);
+        let a = g.insert(DVec3::new(1.0, 1.0, 1.0), 0.5);
+        let hits = g.query_segment(DVec3::new(1.0, 1.0, 1.0), DVec3::new(1.0, 1.0, 1.0));
+        assert!(hits.contains(&a), "a zero-length segment should still find its own cell");
+    }
+
+    /// Each candidate comes back once however many cells it spans —
+    /// otherwise a caller raycasting would test the same collider
+    /// repeatedly and could report duplicate hits.
+    #[test]
+    fn a_segment_does_not_return_the_same_collider_twice() {
+        let mut g = SpatialGrid3D::new(1.0);
+        g.insert(DVec3::new(0.0, 10.0, 0.0), 5.0);
+        let hits = g.query_segment(DVec3::ZERO, DVec3::new(0.0, 20.0, 0.0));
+        assert_eq!(hits.len(), 1, "a large collider spans many cells but is one candidate");
+    }
+
+    #[test]
+    fn a_segment_does_not_cross_partitions() {
+        let mut g = SpatialGrid3D::new(4.0);
+        g.insert_partitioned(DVec3::new(0.0, 10.0, 0.0), 1.0, 1);
+        assert!(g.query_segment_in(DVec3::ZERO, DVec3::new(0.0, 20.0, 0.0), 0).is_empty());
+        assert!(!g.query_segment_in(DVec3::ZERO, DVec3::new(0.0, 20.0, 0.0), 1).is_empty());
+    }
+
+    /// An axis-aligned segment leaves two of the three `t_max` values at
+    /// infinity, which must not stall the traversal or spin it to the
+    /// step cap.
+    #[test]
+    fn an_axis_aligned_segment_reaches_its_far_end() {
+        let mut g = SpatialGrid3D::new(2.0);
+        let target = g.insert(DVec3::new(0.0, 0.0, 40.0), 1.0);
+        let hits = g.query_segment(DVec3::ZERO, DVec3::new(0.0, 0.0, 41.0));
+        assert!(hits.contains(&target), "a pure +Z segment should reach 40 m");
     }
 
     #[test]

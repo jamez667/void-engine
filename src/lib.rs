@@ -55,6 +55,13 @@ pub mod physics;
 /// — `collision`'s docs say it hands back a pair list and leaves
 /// resolution to the caller, and for 2D that stays true.
 pub mod physics3d;
+/// Turning a screen pixel into "what did the player click on" — ray
+/// unprojection and raycasting against the 3D grid.
+///
+/// Not `client`-gated: a server validating a client's claimed hit runs
+/// exactly the same cast, and that is the half that must not be trusted
+/// to the client.
+pub mod pick3d;
 pub mod render_math;
 /// wgpu renderer — client-only.
 #[cfg(feature = "client")]
