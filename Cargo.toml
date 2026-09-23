@@ -239,6 +239,14 @@ required-features = ["replication"]
 name = "load_sweep"
 required-features = ["replication"]
 
+# The 3D path assembled into something playable: physics, meshes,
+# shadows, picking and a 2D HUD in one window. Exists because every
+# other 3D test renders one or two boxes to an offscreen buffer — this
+# is the only place the pieces meet.
+[[example]]
+name = "crates3d"
+required-features = ["render3d"]
+
 # Both of these drive the renderer directly — one stands up a headless wgpu
 # device and reads pixels back, the other parses shader.wgsl through naga.
 # Neither can exist in a build without the GPU stack, so they are pinned to
