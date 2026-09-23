@@ -29,8 +29,15 @@ pub mod narrow;
 /// games already call or fail to compile. Reach for these as
 /// `collision::narrow3d::obb_vs_obb`.
 pub mod narrow3d;
+/// 3D broadphase: a uniform grid keyed on `(partition, cx, cy, cz)`.
+///
+/// `SpatialGrid3D` and `ColliderId3D` are re-exported below; the module
+/// is public so `grid3d::` also names them.
+pub mod grid3d;
 
 pub use grid::{AoiScratch, ColliderId, SpatialGrid};
+// Distinct names, so these are safe to flatten where `narrow3d`'s are not.
+pub use grid3d::{ColliderId3D, SpatialGrid3D};
 pub use narrow::{
     circle_vs_circle, circle_vs_obb, obb_axes, obb_vs_obb, segment_vs_circle,
     segment_vs_circle_t,

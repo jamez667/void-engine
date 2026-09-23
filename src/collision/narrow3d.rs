@@ -1,6 +1,6 @@
 //! Stateless 3D narrowphase: sphere and oriented-box overlap tests.
 //!
-//! The 3D counterpart to [`super::narrow`], and like it a pure-geometry
+//! The 3D counterpart to [`crate::collision::narrow`], and like it a pure-geometry
 //! half with no state and no knowledge of the grid. Every function returns
 //! `Option<(normal, overlap)>` with the **normal pointing from B toward
 //! A**, matching the 2D convention so a caller porting between them does

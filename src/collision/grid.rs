@@ -706,7 +706,11 @@ impl AoiScratch {
     pub fn new() -> Self { Self::default() }
 
     /// Ready the buffers for one query over `len` colliders.
-    fn begin(&mut self, len: usize) {
+    ///
+    /// `pub(super)` rather than private so `grid3d` can drive the same
+    /// scratch: the dedupe machinery is dimension-free, and duplicating it
+    /// would mean two copies of the generation-stamp logic to keep in step.
+    pub(super) fn begin(&mut self, len: usize) {
         self.hits.clear();
         // `u32::MAX` is the "never visited" sentinel, so a fresh or
         // grown region must start there rather than at 0 — which is a
@@ -727,8 +731,10 @@ impl AoiScratch {
     }
 
     /// Claim `idx` for this query, returning false if already claimed.
+    ///
+    /// `pub(super)` for the same reason as [`Self::begin`].
     #[inline]
-    fn first_visit(&mut self, idx: u32) -> bool {
+    pub(super) fn first_visit(&mut self, idx: u32) -> bool {
         let slot = &mut self.stamp[idx as usize];
         if *slot == self.generation { return false }
         *slot = self.generation;
