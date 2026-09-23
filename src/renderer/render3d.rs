@@ -33,6 +33,59 @@ use super::mesh3d::{Mesh3D, Vertex3D};
 /// zero and drawing every remaining mesh on top of each other.
 pub const MAX_MESH_INSTANCES_PER_FRAME: usize = 4096;
 
+/// Maximum point lights in one frame. Must match `MAX_POINT_LIGHTS` in
+/// `shader3d.wgsl`; a test asserts the two agree, since a silent
+/// disagreement reads past the end of the uniform array.
+pub const MAX_POINT_LIGHTS: usize = 16;
+
+/// A point light in the 3D scene.
+///
+/// Position is **camera-relative**, like all 3D geometry — see
+/// [`crate::renderer::camera::Camera3D`].
+#[derive(Copy, Clone, Debug)]
+pub struct PointLight3D {
+    pub position: glam::Vec3,
+    pub radius: f32,
+    pub color: [f32; 3],
+    pub intensity: f32,
+}
+
+impl PointLight3D {
+    pub fn new(position: glam::Vec3, radius: f32, color: [f32; 3], intensity: f32) -> Self {
+        Self { position, radius, color, intensity }
+    }
+}
+
+/// GPU form of [`PointLight3D`]. Two `vec4`s, so std140 needs no padding.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(super) struct PointLightGpu {
+    pub pos_radius: [f32; 4],
+    pub color_intensity: [f32; 4],
+}
+
+/// The whole point-light block. Must match `PointLights` in the shader.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(super) struct PointLightsUniform {
+    /// Live count in `.x`; the rest pads the block to 16 bytes, which
+    /// std140 requires before the array that follows.
+    pub count: [u32; 4],
+    pub lights: [PointLightGpu; MAX_POINT_LIGHTS],
+}
+
+impl Default for PointLightsUniform {
+    fn default() -> Self {
+        Self {
+            count: [0; 4],
+            lights: [PointLightGpu {
+                pos_radius: [0.0; 4],
+                color_intensity: [0.0; 4],
+            }; MAX_POINT_LIGHTS],
+        }
+    }
+}
+
 /// Per-instance transform and tint. Must match `InstanceUniform` in
 /// `shader3d.wgsl`.
 ///
@@ -116,6 +169,9 @@ pub(super) struct Render3D {
     pub instance_bg: wgpu::BindGroup,
     /// Slot size, rounded up to the device's uniform offset alignment.
     pub instance_stride: u64,
+    /// Point lights for the frame, uploaded once in `end_frame`.
+    pub lights_buffer: wgpu::Buffer,
+    pub lights_bg: wgpu::BindGroup,
 }
 
 impl Render3D {
@@ -127,7 +183,7 @@ impl Render3D {
         device: &wgpu::Device,
         camera_bgl: &wgpu::BindGroupLayout,
         format: wgpu::TextureFormat,
-    ) -> Self {
+    ) -> (Self, super::shadow3d::Shadow3D) {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader3d.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader3d.wgsl").into()),
@@ -173,13 +229,46 @@ impl Render3D {
             }],
         });
 
+        // Shadow map and its light, built here because the pipeline
+        // layout needs its bind group layout and the shadow pass needs
+        // the instance layout this function owns.
+        let shadow = super::shadow3d::Shadow3D::new(device, camera_bgl, &instance_bgl);
+
+        let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render3d_point_lights"),
+            size: std::mem::size_of::<PointLightsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("render3d_lights_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let lights_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render3d_lights_bg"),
+            layout: &lights_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lights_buffer.as_entire_binding(),
+            }],
+        });
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("render3d_pl"),
-            // Camera at 0, per-instance transform at 1. The 2D path's
-            // second group is the glyph atlas, which this shader does not
-            // sample: `uv` rides along for a future textured path but
-            // nothing binds a texture yet.
-            bind_group_layouts: &[camera_bgl, &instance_bgl],
+            // Camera at 0, per-instance transform at 1, shadow map at 2,
+            // point lights at 3. The 2D path's second group is the glyph
+            // atlas, which this shader does not sample: `uv` rides along
+            // for a future textured path but nothing binds a texture yet.
+            bind_group_layouts: &[camera_bgl, &instance_bgl, &shadow.sample_bgl, &lights_bgl],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -217,12 +306,17 @@ impl Render3D {
             multiview: None,
             cache: None,
         });
-        Self {
-            pipeline,
-            instance_buffer,
-            instance_bg,
-            instance_stride,
-        }
+        (
+            Self {
+                pipeline,
+                instance_buffer,
+                instance_bg,
+                instance_stride,
+                lights_buffer,
+                lights_bg,
+            },
+            shadow,
+        )
     }
 }
 

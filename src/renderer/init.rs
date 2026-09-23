@@ -244,11 +244,11 @@ impl Renderer {
         // buys. Unconditional under the feature: unlike the effect passes
         // it allocates no textures, so there is nothing to fail.
         #[cfg(feature = "render3d")]
-        let render3d = Some(super::render3d::Render3D::new(
-            &gpu.device,
-            &camera_bgl,
-            gpu.format,
-        ));
+        let (render3d, shadow3d) = {
+            let (r, s) =
+                super::render3d::Render3D::new(&gpu.device, &camera_bgl, gpu.format);
+            (Some(r), Some(s))
+        };
 
         let shadow = ShadowPass::new(
             &gpu.device,
@@ -343,6 +343,17 @@ impl Renderer {
             depth,
             #[cfg(feature = "render3d")]
             render3d,
+            #[cfg(feature = "render3d")]
+            shadow3d,
+            #[cfg(feature = "render3d")]
+            sun_3d: None,
+            #[cfg(feature = "render3d")]
+            point_lights_3d: Vec::new(),
+            // Matches the 2D ambient clear's spirit: dark enough that
+            // shadow reads as shadow, light enough that a shadowed
+            // surface is still legible.
+            #[cfg(feature = "render3d")]
+            ambient_3d: 0.25,
             #[cfg(feature = "render3d")]
             meshes: super::mesh_store::MeshStore::new(),
             #[cfg(feature = "render3d")]

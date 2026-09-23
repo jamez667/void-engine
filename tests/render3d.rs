@@ -159,11 +159,21 @@ fn render_with_model(
         }],
     });
 
+    // Groups 2 and 3: the shadow map and the point-light block. This test
+    // is about geometry, so it supplies a *neutral* lighting setup — an
+    // empty shadow map (everything lit) and zero point lights — rather
+    // than exercising Phase 4's lighting, which `tests/shadow3d.rs` does.
+    //
+    // The layouts must mirror `Render3D::new`'s exactly. A unit test in
+    // `render3d.rs` pins the group count so this cannot drift unnoticed.
+    let (shadow_bgl, shadow_bg) = neutral_shadow_binding(gpu);
+    let (lights_bgl, lights_bg) = neutral_lights_binding(gpu);
+
     let layout = gpu
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&camera_bgl, &instance_bgl],
+            bind_group_layouts: &[&camera_bgl, &instance_bgl, &shadow_bgl, &lights_bgl],
             push_constant_ranges: &[],
         });
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -277,6 +287,8 @@ fn render_with_model(
         rpass.set_pipeline(&pipeline);
         rpass.set_bind_group(0, &camera_bg, &[]);
         rpass.set_bind_group(1, &instance_bg, &[]);
+        rpass.set_bind_group(2, &shadow_bg, &[]);
+        rpass.set_bind_group(3, &lights_bg, &[]);
         rpass.set_vertex_buffer(0, vbuf.slice(..));
         rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
@@ -312,6 +324,158 @@ fn render_with_model(
     drop(mapped);
     readback.unmap();
     out
+}
+
+/// An empty shadow map with an overhead sun: nothing occludes anything, so
+/// `shadow_factor` returns 1 everywhere and geometry is lit by the
+/// directional term alone. Mirrors `Shadow3D`'s bind group layout.
+fn neutral_shadow_binding(gpu: &Gpu) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    use wgpu::util::DeviceExt;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct ShadowUniform {
+        light_view_proj: [[f32; 4]; 4],
+        light_dir_ambient: [f32; 4],
+    }
+    // The light direction the fragment shader shades against. Matches the
+    // constant the pre-Phase-4 shader used, so the brightness figures the
+    // geometry tests assert against are unchanged.
+    let u = ShadowUniform {
+        light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        light_dir_ambient: [0.32, 0.43, 0.84, 0.25],
+    };
+    let buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("neutral_shadow_uniform"),
+            contents: bytemuck::bytes_of(&u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+    // A 1x1 depth texture cleared to the far plane. Every comparison
+    // against it passes, which is "fully lit".
+    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("neutral_shadow_map"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    // Clear it, or it is undefined rather than "far".
+    {
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &tex.create_view(&Default::default()),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        gpu.queue.submit([enc.finish()]);
+    }
+    let view = tex.create_view(&Default::default());
+    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("neutral_shadow_sampler"),
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+
+    let bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+    let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (bgl, bg)
+}
+
+/// Zero point lights, so the geometry tests measure the directional term
+/// alone.
+fn neutral_lights_binding(gpu: &Gpu) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    use wgpu::util::DeviceExt;
+    // count (vec4<u32>) + 16 * (2 * vec4<f32>)
+    let zeros = vec![0u8; 16 + 16 * 32];
+    let buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("neutral_lights"),
+            contents: &zeros,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+    });
+    (bgl, bg)
 }
 
 fn centre_pixel(px: &[u8]) -> [u8; 4] {

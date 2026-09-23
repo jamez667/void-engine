@@ -266,3 +266,11 @@ required-features = ["client"]
 [[test]]
 name = "render3d"
 required-features = ["render3d"]
+
+# Runs the real two-pass shadow sequence (depth from the light, then the
+# scene sampling it) on a headless device. The unit tests beside shadow3d
+# check the light's projection in isolation and never render, so this is
+# what catches flipped UVs, an inverted comparison, or acne.
+[[test]]
+name = "shadow3d"
+required-features = ["render3d"]

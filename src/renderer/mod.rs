@@ -24,6 +24,9 @@ pub mod render3d;
 /// Retained meshes addressed by handle. Feature `render3d`.
 #[cfg(feature = "render3d")]
 pub mod mesh_store;
+/// Directional shadow mapping for the 3D path. Feature `render3d`.
+#[cfg(feature = "render3d")]
+pub mod shadow3d;
 mod postprocess;
 /// Public because the depth format and the main pipeline's depth state are
 /// what any future 3D pipeline must match to share the main pass. The
@@ -99,6 +102,22 @@ pub struct Renderer {
     // and a frame is one or the other.
     #[cfg(feature = "render3d")]
     render3d: Option<render3d::Render3D>,
+    /// Shadow map for the directional light. Built alongside the 3D
+    /// pipeline, since the two share bind group layouts.
+    #[cfg(feature = "render3d")]
+    shadow3d: Option<shadow3d::Shadow3D>,
+    /// The directional light: direction toward it, and how much of the
+    /// scene the shadow map covers. Set by `set_sun_3d`.
+    #[cfg(feature = "render3d")]
+    sun_3d: Option<(glam::Vec3, f32)>,
+    /// Point lights for this frame. Cleared in `begin_frame`.
+    #[cfg(feature = "render3d")]
+    point_lights_3d: Vec<render3d::PointLight3D>,
+    /// Ambient floor for the 3D path, kept apart from the 2D `ambient`
+    /// clear colour because one is a light level and the other is a
+    /// render-pass clear.
+    #[cfg(feature = "render3d")]
+    ambient_3d: f32,
     /// Meshes retained on the GPU, addressed by handle. Uploaded once and
     /// drawn every frame after — see `mesh_store.rs` on why this is not
     /// the immediate-mode shape `Batch` uses.
@@ -321,6 +340,60 @@ impl Renderer {
     #[cfg(feature = "render3d")]
     pub fn clear_camera_3d(&mut self) {
         self.camera_3d = None;
+    }
+
+    /// Set the directional light that casts shadows in the 3D path.
+    ///
+    /// `direction` points **toward** the light (so a sun overhead is
+    /// roughly `+Z`), and `radius` is the half-extent of the scene the
+    /// shadow map covers, centred on the camera. Geometry beyond that
+    /// radius is drawn unshadowed rather than dark — see `shadow_factor`
+    /// in `shader3d.wgsl` on why unlit is the wrong default there.
+    ///
+    /// Pick `radius` to fit the visible scene: too large spends shadow
+    /// resolution on empty space and makes edges chunky, too small leaves
+    /// visible geometry uncast.
+    #[cfg(feature = "render3d")]
+    pub fn set_sun_3d(&mut self, direction: glam::Vec3, radius: f32) {
+        self.sun_3d = Some((direction, radius.max(0.001)));
+    }
+
+    /// Stop casting directional shadows. Geometry stays lit by ambient
+    /// and any point lights.
+    #[cfg(feature = "render3d")]
+    pub fn clear_sun_3d(&mut self) {
+        self.sun_3d = None;
+    }
+
+    /// Ambient light level for the 3D path, 0..1.
+    ///
+    /// The floor a surface keeps when it faces away from every light or
+    /// sits in shadow. Separate from [`Self::set_ambient_light`], which
+    /// is the 2D light map's clear colour.
+    #[cfg(feature = "render3d")]
+    pub fn set_ambient_3d(&mut self, ambient: f32) {
+        self.ambient_3d = ambient.clamp(0.0, 1.0);
+    }
+
+    /// Add a point light for this frame.
+    ///
+    /// Per-frame like the 2D `push_light`, and capped at
+    /// [`render3d::MAX_POINT_LIGHTS`]; lights past the cap are dropped
+    /// with a warning rather than silently displacing earlier ones.
+    ///
+    /// Point lights do **not** cast shadows: only the directional light
+    /// has a shadow map. Giving each point light one means a cube map per
+    /// light and a pass per face, which is a different project.
+    #[cfg(feature = "render3d")]
+    pub fn push_point_light_3d(&mut self, light: render3d::PointLight3D) {
+        if self.point_lights_3d.len() >= render3d::MAX_POINT_LIGHTS {
+            log::warn!(
+                "[renderer] point light cap ({}) reached; dropping further lights this frame",
+                render3d::MAX_POINT_LIGHTS,
+            );
+            return;
+        }
+        self.point_lights_3d.push(light);
     }
 
     /// Upload a mesh, keeping it on the GPU until removed.

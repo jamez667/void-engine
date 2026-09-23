@@ -433,9 +433,44 @@ one authored face-up and rotated into place — and requiring identical pixels.
 Two earlier revisions were verified worthless before this one was verified
 load-bearing (241 vs 137 at the centre pixel with the transform deleted).
 
-**Phase 4 — Lighting/shadows.** Shadow mapping, and a shading model to replace
-the per-light fullscreen pass. **The largest and least certain phase.** The
-existing light/godray/sun/shadow passes remain for the 2D path.
+**Phase 4 — Lighting/shadows. ✅ Done 2026-09-22.** Directional shadow
+mapping (`shadow3d.rs`, `shadow3d.wgsl`) plus up to 16 point lights, built to
+the "shadow mapping + multiple lights" bar. The 2D light/godray/sun/shadow
+passes are untouched and still serve the 2D path.
+
+As predicted, **none of the 2D lighting was reusable.** The 2D shadow pass
+marches screen pixels across a flat binary `wall_mask`; this renders the scene
+from the light's viewpoint into a depth texture and compares. No shared code,
+as §3 said.
+
+Two departures from the 2D path's shape, both deliberate:
+
+- **Point lights loop inside the fragment shader** rather than taking a
+  fullscreen pass each. 3D geometry is not fullscreen, so a pass per light
+  would re-rasterise every mesh per light. This also sidesteps the 25.1 ms
+  384-light measurement in TODO R5, which was a property of the fullscreen
+  approach.
+- **Only the directional light casts.** Point-light shadows need a cube map
+  and six passes each — a different project.
+
+**A real bug was found by the test, not by inspection.** `light_view_proj`
+placed the light's eye at `center - dir * radius * 2.0`. Since `dir` points
+*toward* the light, that put the eye underneath the scene looking up: the
+floor recorded a smaller depth than the box above it, `LessEqual` found the
+floor nearer the light, and **nothing was ever shadowed**. The code read
+plausibly and the scene looked lit-but-shadowless — the failure mode with no
+error message.
+
+**The test caught that only after being fixed itself.** Its first revision
+probed the frame *above* the box, which darkens because the box occludes the
+floor there whether or not shadows work — it passed against a completely
+disabled `textureSampleCompare`. Both the probe location and the eye sign are
+now verified load-bearing: disabling the lookup, or flipping the sign back,
+fails the test with its intended message.
+
+Acne is handled by front-face culling in the shadow pass (recording back faces
+moves the comparison depth away from the lit surface) plus a slope-scaled
+bias, and `an_unoccluded_floor_shows_no_self_shadowing` asserts the result.
 
 **Phase 5 — Sim (only if 3D gameplay, not just 3D rendering).** `Transform3D`,
 `Velocity3D`, 3D collider shapes (sphere/AABB/capsule), a 3D grid key and DDA,

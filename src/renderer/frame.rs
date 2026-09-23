@@ -127,6 +127,7 @@ impl Renderer {
         #[cfg(feature = "render3d")]
         {
             self.pending_draws.clear();
+            self.point_lights_3d.clear();
             for h in std::mem::take(&mut self.transient_handles) {
                 self.meshes.remove(h);
             }
@@ -220,6 +221,52 @@ impl Renderer {
             }
             order
         };
+
+        // Upload the 3D lighting: the sun's matrix (shared by the shadow
+        // pass and the main pass's lookup) and the point-light block.
+        #[cfg(feature = "render3d")]
+        {
+            if let (Some(r3d), Some(sh)) = (self.render3d.as_ref(), self.shadow3d.as_ref()) {
+                // The shadow frustum is centred on the camera, in the
+                // camera-relative frame everything else uses — so the
+                // origin is where the eye is.
+                let (dir, radius) = self.sun_3d.unwrap_or((glam::Vec3::Z, 1.0));
+                let m = super::shadow3d::light_view_proj(dir, glam::Vec3::ZERO, radius);
+
+                let cam = super::camera::CameraUniform {
+                    view_proj: m.to_cols_array_2d(),
+                };
+                self.gpu.queue.write_buffer(
+                    &sh.light_camera_buffer,
+                    0,
+                    bytemuck::bytes_of(&cam),
+                );
+
+                let d = dir.normalize_or_zero();
+                let u = super::shadow3d::ShadowUniform {
+                    light_view_proj: m.to_cols_array_2d(),
+                    light_dir_ambient: [d.x, d.y, d.z, self.ambient_3d],
+                };
+                self.gpu
+                    .queue
+                    .write_buffer(&sh.uniform_buffer, 0, bytemuck::bytes_of(&u));
+
+                let mut lights = super::render3d::PointLightsUniform::default();
+                lights.count[0] = self.point_lights_3d.len() as u32;
+                for (i, l) in self.point_lights_3d.iter().enumerate() {
+                    lights.lights[i] = super::render3d::PointLightGpu {
+                        pos_radius: [l.position.x, l.position.y, l.position.z, l.radius],
+                        color_intensity: [l.color[0], l.color[1], l.color[2], l.intensity],
+                    };
+                }
+                self.gpu.queue.write_buffer(
+                    &r3d.lights_buffer,
+                    0,
+                    bytemuck::bytes_of(&lights),
+                );
+
+            }
+        }
 
         // Grow + upload the main batch's vertex/index buffers. Same pattern
         // used for the offscreen batch below.
@@ -580,6 +627,53 @@ impl Renderer {
             }
         }
 
+        // Shadow pass: the same geometry from the light's point of view,
+        // depth only. Must precede the main pass, which samples what this
+        // writes. Skipped entirely when no sun is set or nothing is
+        // queued — an empty shadow map reads as "everything lit", which
+        // is the right answer for a scene with no caster.
+        #[cfg(feature = "render3d")]
+        if let (Some(r3d), Some(sh)) = (self.render3d.as_ref(), self.shadow3d.as_ref()) {
+            if self.sun_3d.is_some() && !self.pending_draws.is_empty() {
+                let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shadow3d_pass"),
+                    // No colour target: the pipeline has no fragment
+                    // stage, so there is nothing to write but depth.
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(sh.attachment()),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                spass.set_pipeline(&sh.pipeline);
+                // The light's matrix stands in for the camera's, through
+                // the same bind group layout.
+                spass.set_bind_group(0, &sh.light_camera_bg, &[]);
+
+                let mut slot = 0u32;
+                for (handle, count) in &mesh_order {
+                    let Some(mesh) = self.meshes.get(*handle) else {
+                        slot += *count;
+                        continue;
+                    };
+                    spass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    spass.set_index_buffer(
+                        mesh.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    for _ in 0..*count {
+                        let offset = slot as u64 * r3d.instance_stride;
+                        spass.set_bind_group(
+                            1,
+                            &r3d.instance_bg,
+                            &[offset as wgpu::DynamicOffset],
+                        );
+                        spass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        slot += 1;
+                    }
+                }
+            }
+        }
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -617,6 +711,12 @@ impl Renderer {
                 if !self.pending_draws.is_empty() {
                     rpass.set_pipeline(&r3d.pipeline);
                     rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    // Shadow map at 2, point lights at 3. Both are
+                    // frame-constant, so they bind once outside the loop.
+                    if let Some(sh) = self.shadow3d.as_ref() {
+                        rpass.set_bind_group(2, &sh.sample_bg, &[]);
+                    }
+                    rpass.set_bind_group(3, &r3d.lights_bg, &[]);
 
                     // `mesh_order` was produced by the same grouping that
                     // filled the instance ring above, so walking it here
