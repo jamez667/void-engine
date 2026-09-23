@@ -23,6 +23,23 @@ struct CameraUniform {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
+// Per-instance transform, supplied through a dynamic-offset uniform so one
+// bind group serves every instance in the frame — the same trick the 2D
+// light pass uses for its per-light uniforms.
+//
+// This is what the 2D path has no equivalent for: `Batch` pre-transforms
+// every primitive on the CPU into one monolithic buffer, so there is
+// nowhere to hang a model matrix. A retained mesh is uploaded once and
+// drawn at many places, so the transform has to arrive separately.
+struct InstanceUniform {
+    model: mat4x4<f32>,
+    // Multiplied into the vertex colour, so one grey mesh can be drawn as
+    // many differently tinted objects without re-uploading its vertices.
+    tint: vec4<f32>,
+};
+
+@group(1) @binding(0) var<uniform> instance: InstanceUniform;
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
@@ -40,12 +57,25 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
+    let world = instance.model * vec4<f32>(in.position, 1.0);
     // The 2D path writes `vec4(in.position, 0.0, 1.0)` here, pinning every
-    // vertex to z = 0. This is that line with a real z.
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
-    out.normal = in.normal;
+    // vertex to z = 0. This is that line with a real z and a model
+    // transform in front of it.
+    out.clip_position = camera.view_proj * world;
+
+    // Normals take the model's rotation but not its translation, hence
+    // mat3. This is correct for the rigid and uniformly-scaled transforms
+    // `MeshDraw` builds; a *non-uniform* scale would need the inverse
+    // transpose, which is not computed here because nothing produces one
+    // yet and doing it per vertex is the wrong place to pay for it.
+    let rot = mat3x3<f32>(
+        instance.model[0].xyz,
+        instance.model[1].xyz,
+        instance.model[2].xyz,
+    );
+    out.normal = rot * in.normal;
     out.uv = in.uv;
-    out.color = in.color;
+    out.color = in.color * instance.tint;
     return out;
 }
 

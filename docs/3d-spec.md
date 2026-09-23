@@ -395,10 +395,43 @@ drawn (swapping `look_at_rh`→`look_at_lh` draws 1.98% of the frame and fails
 all three); and the nearer of two boxes occludes the farther one drawn after
 it (`Less`→`Always` shows blue and fails).
 
-**Phase 3 — Mesh path.** `Mesh` (vertex+index buffers, retained on GPU, not
-rebuilt per frame like `Batch`) and a draw API. This is genuinely new
-architecture: `Batch` is immediate-mode and rebuilt every frame, which is
-wrong for static 3D geometry. Plus a loader (glTF) if meshes come from disk.
+**Phase 3 — Mesh path. ✅ Done 2026-09-22 (retained meshes; glTF skipped).**
+`MeshStore` holds uploaded meshes behind a generation-checked `MeshHandle`;
+`MeshDraw` carries a per-instance model matrix and tint. Upload once at load
+time, draw by handle every frame.
+
+**The glTF half was deliberately skipped.** It is the only part of this plan
+that would add a dependency, and there are no assets to load yet. The trigger
+to revisit is a game that actually has meshes on disk; `Mesh3D`'s procedural
+builders cover the current need.
+
+Two things this phase settled that the estimate did not anticipate:
+
+- **Per-instance transforms needed a second bind group**, supplied through a
+  dynamic-offset uniform ring — the same trick `lights.rs` uses for its
+  per-light uniforms. This is the concrete answer to §4's "there is no
+  per-object transform anywhere in the pipeline to hang a model matrix on",
+  which was flagged as *the* load-bearing 2D assumption. It is now hung on
+  the instance uniform rather than on the vertex.
+- **Draws group by mesh before submission.** Binding a vertex buffer is
+  per-mesh work, so 500 trees sharing one mesh cost one bind and 500 draws.
+  The grouping happens once, at upload time, and the draw loop replays that
+  order — regrouping would be a bug, since `HashMap` iteration order is not
+  stable across two traversals.
+
+**Handles carry a generation**, matching `EntityId` and `ColliderId`. A game
+that despawns an entity and loads a new mesh into the freed slot is ordinary,
+not exotic, and an index alone would silently draw the new mesh through the
+old handle.
+
+Testing note worth recording: **the normal-transform test took three
+revisions to become load-bearing.** A model matrix moves geometry and normals
+together, so "rotate it and see if the shading changed" passes even with the
+normal transform deleted. What works is rendering the *same* screen-space
+quad from two differently-authored meshes — one facing the camera already,
+one authored face-up and rotated into place — and requiring identical pixels.
+Two earlier revisions were verified worthless before this one was verified
+load-bearing (241 vs 137 at the centre pixel with the transform deleted).
 
 **Phase 4 — Lighting/shadows.** Shadow mapping, and a shading model to replace
 the per-light fullscreen pass. **The largest and least certain phase.** The

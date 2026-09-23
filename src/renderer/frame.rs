@@ -120,11 +120,17 @@ impl Renderer {
         self.sun_split_index = None;
         self.pending_godray = None;
         self.godray_split_index = None;
-        // Queued meshes are per-frame like every other pending list above.
-        // Dropping them here also releases last frame's GPU buffers, which
-        // is what keeps `draw_mesh_3d`'s upload-per-call from leaking.
+        // The draw list is per-frame like every other pending list above.
+        // Retained meshes themselves are NOT cleared — that is the whole
+        // point of the store. Transients are, which is what keeps
+        // `draw_mesh_transient`'s upload-per-call from leaking.
         #[cfg(feature = "render3d")]
-        self.pending_meshes.clear();
+        {
+            self.pending_draws.clear();
+            for h in std::mem::take(&mut self.transient_handles) {
+                self.meshes.remove(h);
+            }
+        }
         self.shake_trauma = (self.shake_trauma - 0.02).max(0.0);
         let shake_amount = self.shake_trauma * self.shake_trauma * 8.0;
         self.shake_offset = Vec2::new(
@@ -184,6 +190,36 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        // Fill the per-instance ring, grouped by mesh, and record the
+        // order so the draw loop can walk the same slots. The grouping
+        // happens exactly once: `HashMap` iteration order is not stable
+        // across two traversals, so regrouping at draw time would pair
+        // instances with the wrong transforms.
+        #[cfg(feature = "render3d")]
+        let mesh_order: Vec<(super::mesh_store::MeshHandle, u32)> = {
+            let mut order = Vec::new();
+            if let Some(r3d) = self.render3d.as_ref() {
+                let grouped = super::mesh_store::group_by_mesh(&self.pending_draws);
+                let mut slot = 0u64;
+                for (handle, instances) in grouped {
+                    order.push((handle, instances.len() as u32));
+                    for d in instances {
+                        let u = super::render3d::InstanceUniform {
+                            model: d.model.to_cols_array_2d(),
+                            tint: d.color,
+                        };
+                        self.gpu.queue.write_buffer(
+                            &r3d.instance_buffer,
+                            slot * r3d.instance_stride,
+                            bytemuck::bytes_of(&u),
+                        );
+                        slot += 1;
+                    }
+                }
+            }
+            order
+        };
 
         // Grow + upload the main batch's vertex/index buffers. Same pattern
         // used for the offscreen batch below.
@@ -578,16 +614,39 @@ impl Renderer {
             // to be queued.
             #[cfg(feature = "render3d")]
             if let Some(r3d) = self.render3d.as_ref() {
-                if !self.pending_meshes.is_empty() {
+                if !self.pending_draws.is_empty() {
                     rpass.set_pipeline(&r3d.pipeline);
                     rpass.set_bind_group(0, &self.camera_bind_group, &[]);
-                    for mesh in &self.pending_meshes {
+
+                    // `mesh_order` was produced by the same grouping that
+                    // filled the instance ring above, so walking it here
+                    // keeps slot N holding instance N. Regrouping instead
+                    // of reusing it would be a bug: `HashMap` iteration
+                    // order is not stable between two traversals.
+                    let mut slot = 0u32;
+                    for (handle, count) in &mesh_order {
+                        let Some(mesh) = self.meshes.get(*handle) else {
+                            // A stale handle draws nothing. Still advance
+                            // the ring, or every later instance would read
+                            // the wrong slot.
+                            slot += *count;
+                            continue;
+                        };
                         rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         rpass.set_index_buffer(
                             mesh.index_buffer.slice(..),
                             wgpu::IndexFormat::Uint32,
                         );
-                        rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        for _ in 0..*count {
+                            let offset = slot as u64 * r3d.instance_stride;
+                            rpass.set_bind_group(
+                                1,
+                                &r3d.instance_bg,
+                                &[offset as wgpu::DynamicOffset],
+                            );
+                            rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                            slot += 1;
+                        }
                     }
                 }
             }

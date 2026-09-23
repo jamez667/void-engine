@@ -21,6 +21,9 @@ pub mod mesh3d;
 /// The 3D pipeline and GPU-resident meshes. Feature `render3d`.
 #[cfg(feature = "render3d")]
 pub mod render3d;
+/// Retained meshes addressed by handle. Feature `render3d`.
+#[cfg(feature = "render3d")]
+pub mod mesh_store;
 mod postprocess;
 /// Public because the depth format and the main pipeline's depth state are
 /// what any future 3D pipeline must match to share the main pass. The
@@ -96,8 +99,19 @@ pub struct Renderer {
     // and a frame is one or the other.
     #[cfg(feature = "render3d")]
     render3d: Option<render3d::Render3D>,
+    /// Meshes retained on the GPU, addressed by handle. Uploaded once and
+    /// drawn every frame after — see `mesh_store.rs` on why this is not
+    /// the immediate-mode shape `Batch` uses.
     #[cfg(feature = "render3d")]
-    pending_meshes: Vec<render3d::GpuMesh3D>,
+    meshes: mesh_store::MeshStore,
+    /// Per-frame draw list: which retained meshes to draw, and where.
+    #[cfg(feature = "render3d")]
+    pending_draws: Vec<mesh_store::MeshDraw>,
+    /// Handles issued by `draw_mesh_transient`, freed in `begin_frame`.
+    /// They live in `meshes` like any other so there is one draw path,
+    /// but they do not survive the frame that made them.
+    #[cfg(feature = "render3d")]
+    transient_handles: Vec<mesh_store::MeshHandle>,
     /// Set by `set_camera_3d`. `None` means this is a 2D frame.
     #[cfg(feature = "render3d")]
     pub camera_3d: Option<camera::Camera3D>,
@@ -309,31 +323,89 @@ impl Renderer {
         self.camera_3d = None;
     }
 
-    /// Upload a mesh and queue it for this frame's main pass.
+    /// Upload a mesh, keeping it on the GPU until removed.
     ///
-    /// Uploads on every call, which is the honest thing for a
-    /// per-frame API and the wrong thing for static geometry. A game with
-    /// a fixed world should hold its own [`render3d::GpuMesh3D`] and call
-    /// [`Self::draw_gpu_mesh_3d`] instead; this exists so the path can be
-    /// exercised without an asset pipeline. Phase 3 is where retained
-    /// meshes get a real home.
+    /// **This is the normal way to get 3D geometry onto the GPU.** Call it
+    /// once at load time, keep the handle, and draw through it every frame
+    /// with [`Self::draw_mesh`]. A `MeshHandle` is `Copy` and 8 bytes, so
+    /// it belongs in a component beside a transform.
     #[cfg(feature = "render3d")]
-    pub fn draw_mesh_3d(&mut self, mesh: &mesh3d::Mesh3D) {
-        if self.render3d.is_none() {
-            return;
-        }
-        if let Some(gpu) = render3d::GpuMesh3D::upload(&self.gpu.device, mesh) {
-            self.pending_meshes.push(gpu);
-        }
+    pub fn upload_mesh(
+        &mut self,
+        mesh: &mesh3d::Mesh3D,
+    ) -> Result<mesh_store::MeshHandle, mesh_store::MeshError> {
+        self.meshes.insert(&self.gpu.device, mesh)
     }
 
-    /// Queue an already-uploaded mesh for this frame's main pass.
+    /// Replace the geometry behind a handle, keeping the handle valid.
     #[cfg(feature = "render3d")]
-    pub fn draw_gpu_mesh_3d(&mut self, mesh: render3d::GpuMesh3D) {
+    pub fn replace_mesh(
+        &mut self,
+        handle: mesh_store::MeshHandle,
+        mesh: &mesh3d::Mesh3D,
+    ) -> Result<(), mesh_store::MeshError> {
+        self.meshes.replace(&self.gpu.device, handle, mesh)
+    }
+
+    /// Free a retained mesh. Handles to it stop resolving.
+    #[cfg(feature = "render3d")]
+    pub fn remove_mesh(&mut self, handle: mesh_store::MeshHandle) -> bool {
+        self.meshes.remove(handle)
+    }
+
+    /// The retained mesh store, for callers wanting `len`/`contains`.
+    #[cfg(feature = "render3d")]
+    pub fn meshes(&self) -> &mesh_store::MeshStore {
+        &self.meshes
+    }
+
+    /// Draw a retained mesh this frame at a camera-relative offset.
+    ///
+    /// A stale handle draws nothing rather than drawing whatever occupies
+    /// its slot now — see `mesh_store` on why that matters.
+    #[cfg(feature = "render3d")]
+    pub fn draw_mesh(&mut self, handle: mesh_store::MeshHandle, offset: glam::Vec3) {
+        self.draw_mesh_with(mesh_store::MeshDraw::at(handle, offset));
+    }
+
+    /// Draw a retained mesh with a full model matrix and tint.
+    #[cfg(feature = "render3d")]
+    pub fn draw_mesh_with(&mut self, draw: mesh_store::MeshDraw) {
         if self.render3d.is_none() {
             return;
         }
-        self.pending_meshes.push(mesh);
+        if self.pending_draws.len() >= render3d::MAX_MESH_INSTANCES_PER_FRAME {
+            // Dropping is the lesser evil: the ring would otherwise wrap
+            // onto slot zero and draw every remaining mesh stacked at the
+            // first instance's transform, which looks like corruption
+            // rather than like a budget being hit.
+            log::warn!(
+                "[renderer] mesh instance cap ({}) reached; dropping further draws this frame",
+                render3d::MAX_MESH_INSTANCES_PER_FRAME,
+            );
+            return;
+        }
+        self.pending_draws.push(draw);
+    }
+
+    /// Upload a mesh for this frame only and draw it at an offset.
+    ///
+    /// Re-uploads on every call, so it is the wrong tool for anything
+    /// static — [`Self::upload_mesh`] is. It exists for genuinely
+    /// one-frame geometry (a debug overlay, a gizmo rebuilt each tick)
+    /// where retaining a handle would be bookkeeping for nothing.
+    #[cfg(feature = "render3d")]
+    pub fn draw_mesh_transient(&mut self, mesh: &mesh3d::Mesh3D, offset: glam::Vec3) {
+        if self.render3d.is_none() {
+            return;
+        }
+        // Transients get a slot in the retained store for the frame, then
+        // are removed in `begin_frame`. That keeps one draw path rather
+        // than two, at the cost of a generation bump per transient.
+        if let Ok(handle) = self.meshes.insert(&self.gpu.device, mesh) {
+            self.transient_handles.push(handle);
+            self.draw_mesh(handle, offset);
+        }
     }
 
     /// Set what an unlit pixel keeps, overriding the default ambient clear.

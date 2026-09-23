@@ -19,8 +19,32 @@
 //! culling halves its fragment
 //! work.
 
+use bytemuck::{Pod, Zeroable};
+
 use super::depth::DEPTH_FORMAT;
 use super::mesh3d::{Mesh3D, Vertex3D};
+
+/// Ceiling on mesh instances submitted in one frame.
+///
+/// The instance ring is allocated up front at this size, matching how
+/// `lights.rs` sizes its per-light ring. At 80 bytes rounded to a 256-byte
+/// alignment slot that is 1 MB, which is cheap for the headroom; draws past
+/// the cap are dropped with a warning rather than silently overwriting slot
+/// zero and drawing every remaining mesh on top of each other.
+pub const MAX_MESH_INSTANCES_PER_FRAME: usize = 4096;
+
+/// Per-instance transform and tint. Must match `InstanceUniform` in
+/// `shader3d.wgsl`.
+///
+/// 80 bytes: a 64-byte matrix and a 16-byte tint, both naturally aligned,
+/// so unlike `LightUniform` this needs no explicit tail padding to satisfy
+/// std140.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(super) struct InstanceUniform {
+    pub model: [[f32; 4]; 4],
+    pub tint: [f32; 4],
+}
 
 /// A mesh that lives on the GPU.
 ///
@@ -86,6 +110,12 @@ pub fn depth_state() -> Option<wgpu::DepthStencilState> {
 
 pub(super) struct Render3D {
     pub pipeline: wgpu::RenderPipeline,
+    /// Ring of per-instance uniforms, read at a dynamic offset. One bind
+    /// group serves every instance in the frame.
+    pub instance_buffer: wgpu::Buffer,
+    pub instance_bg: wgpu::BindGroup,
+    /// Slot size, rounded up to the device's uniform offset alignment.
+    pub instance_stride: u64,
 }
 
 impl Render3D {
@@ -102,12 +132,54 @@ impl Render3D {
             label: Some("shader3d.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader3d.wgsl").into()),
         });
+        // Slot size for the instance ring, rounded to the device's
+        // alignment — nearly always 256 bytes against an 80-byte struct.
+        // Same shape as the per-light ring in `lights.rs`.
+        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let raw = std::mem::size_of::<InstanceUniform>() as u64;
+        let instance_stride = raw.div_ceil(align) * align;
+
+        let instance_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("render3d_instance_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(raw),
+                },
+                count: None,
+            }],
+        });
+
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render3d_instance_ring"),
+            size: instance_stride * MAX_MESH_INSTANCES_PER_FRAME as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let instance_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render3d_instance_bg"),
+            layout: &instance_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &instance_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(raw),
+                }),
+            }],
+        });
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("render3d_pl"),
-            // Camera only. The 2D path's second group is the glyph atlas,
-            // which this shader does not sample: `uv` rides along for a
-            // future textured path but nothing binds a texture yet.
-            bind_group_layouts: &[camera_bgl],
+            // Camera at 0, per-instance transform at 1. The 2D path's
+            // second group is the glyph atlas, which this shader does not
+            // sample: `uv` rides along for a future textured path but
+            // nothing binds a texture yet.
+            bind_group_layouts: &[camera_bgl, &instance_bgl],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -145,7 +217,12 @@ impl Render3D {
             multiview: None,
             cache: None,
         });
-        Self { pipeline }
+        Self {
+            pipeline,
+            instance_buffer,
+            instance_bg,
+            instance_stride,
+        }
     }
 }
 

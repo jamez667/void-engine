@@ -62,6 +62,17 @@ fn camera() -> Camera3D {
 /// Vertices are camera-relative, matching `Camera3D`'s contract — the
 /// caller subtracts the eye before handing geometry over.
 fn render(gpu: &Gpu, mesh: &Mesh3D, cam: &Camera3D) -> Vec<u8> {
+    render_with_model(gpu, mesh, cam, glam::Mat4::IDENTITY)
+}
+
+/// As [`render`], but with an explicit per-instance model matrix — the
+/// transform Phase 3 added, which the 2D path has no equivalent for.
+fn render_with_model(
+    gpu: &Gpu,
+    mesh: &Mesh3D,
+    cam: &Camera3D,
+    model: glam::Mat4,
+) -> Vec<u8> {
     use wgpu::util::DeviceExt;
 
     let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -103,11 +114,56 @@ fn render(gpu: &Gpu, mesh: &Mesh3D, cam: &Camera3D) -> Vec<u8> {
         }],
     });
 
+    // Per-instance transform + tint, at group 1. Mirrors what
+    // `Render3D::new` builds; the test supplies a single identity
+    // instance, since what it is checking is the geometry path rather
+    // than instancing.
+    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Instance {
+        model: [[f32; 4]; 4],
+        tint: [f32; 4],
+    }
+    let instance = Instance {
+        model: model.to_cols_array_2d(),
+        tint: [1.0; 4],
+    };
+    let instance_buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("instance"),
+            contents: bytemuck::bytes_of(&instance),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let instance_bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let instance_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &instance_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: instance_buffer.as_entire_binding(),
+        }],
+    });
+
     let layout = gpu
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&camera_bgl],
+            bind_group_layouts: &[&camera_bgl, &instance_bgl],
             push_constant_ranges: &[],
         });
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -220,6 +276,7 @@ fn render(gpu: &Gpu, mesh: &Mesh3D, cam: &Camera3D) -> Vec<u8> {
         });
         rpass.set_pipeline(&pipeline);
         rpass.set_bind_group(0, &camera_bg, &[]);
+        rpass.set_bind_group(1, &instance_bg, &[]);
         rpass.set_vertex_buffer(0, vbuf.slice(..));
         rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
@@ -340,6 +397,135 @@ fn a_box_behind_the_camera_is_not_visible() {
         0.0,
         "geometry behind the camera was drawn — the projection or view \
          matrix has the wrong handedness",
+    );
+}
+
+/// The per-instance model matrix must actually move geometry.
+///
+/// This is the capability Phase 3 added and the one the 2D path has no
+/// equivalent for: `Batch` pre-transforms on the CPU into one buffer, so
+/// there is nowhere to hang a model matrix. A mesh built at the origin,
+/// translated far off-screen by its instance transform, must disappear —
+/// if the shader ignored `instance.model` it would still be centred.
+#[test]
+fn the_instance_model_matrix_moves_the_mesh() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let cam = camera();
+
+    // Built at the eye-relative origin of the camera's gaze, so untouched
+    // it sits in the middle of frame.
+    let mut mesh = Mesh3D::new();
+    mesh.push_box(
+        cam.world_to_camera_offset(DVec3::ZERO),
+        Vec3::splat(2.0),
+        [1.0, 1.0, 1.0, 1.0],
+    );
+
+    let centred = render_with_model(&gpu, &mesh, &cam, glam::Mat4::IDENTITY);
+    assert!(
+        lit_fraction(&centred) > 0.05,
+        "precondition: the untransformed mesh should be visible",
+    );
+
+    // Same mesh, shoved far to the side by the instance transform alone.
+    let moved = render_with_model(
+        &gpu,
+        &mesh,
+        &cam,
+        glam::Mat4::from_translation(Vec3::new(500.0, 0.0, 0.0)),
+    );
+    assert_eq!(
+        lit_fraction(&moved),
+        0.0,
+        "the model matrix did not move the mesh — the shader is ignoring \
+         instance.model, so every instance would draw at the same place",
+    );
+}
+
+/// An instance's normals must be rotated by its model matrix.
+///
+/// Skipping that leaves a rotated object lit as though it had never
+/// turned — a bug that reads as "the lighting is a bit off" rather than
+/// as a broken transform, which is exactly why it wants a test.
+#[test]
+fn an_instances_normals_are_rotated_by_its_model_matrix() {
+    let Some(gpu) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let cam = camera();
+
+    // A quad facing the camera (-Y), so it stays visible and keeps the
+    // same silhouette under a rotation *about the view axis*. That is the
+    // point: spinning it around Y does not change which pixels it covers,
+    // so any brightness difference is attributable to the normals alone.
+    //
+    // Rotating a box instead would change which faces are visible, and
+    // the brightness would differ whether or not normals were transformed
+    // — an earlier revision did exactly that and failed to catch the bug.
+    // Isolating the normal transform takes care, because a model matrix
+    // moves geometry and normals together: tilt a surface and it both
+    // covers different pixels *and* catches different light, so a plain
+    // "rotate it and see if shading changed" test passes even with the
+    // normal transform deleted. Two earlier revisions of this test did
+    // exactly that and were verified worthless.
+    //
+    // What separates them: build the *same* screen-space quad twice, from
+    // geometry that differs only in how it was rotated into place. Both
+    // renders cover identical pixels; only the normals differ. Concretely,
+    // a quad authored face-up (+Z normal) and then rotated to face the
+    // camera has a rotated normal, while one authored facing the camera
+    // already has an untouched one. If `instance.model` is not applied to
+    // normals, the first is lit as though it were still face-up, and the
+    // two disagree.
+    let o = cam.world_to_camera_offset(DVec3::ZERO);
+
+    // Authored facing the camera (-Y): identity transform, normal -Y.
+    let mut facing = Mesh3D::new();
+    facing.push_quad(
+        o + Vec3::new(-2.0, 0.0, -2.0),
+        o + Vec3::new(2.0, 0.0, -2.0),
+        o + Vec3::new(2.0, 0.0, 2.0),
+        o + Vec3::new(-2.0, 0.0, 2.0),
+        [1.0, 1.0, 1.0, 1.0],
+    );
+
+    // Authored face-up (+Z), then rotated -90° about X so it ends up in
+    // exactly the same place, facing the camera. Same pixels, same final
+    // orientation — but its normal only points at the camera if the
+    // shader rotated it.
+    let mut face_up = Mesh3D::new();
+    face_up.push_quad(
+        Vec3::new(-2.0, -2.0, 0.0),
+        Vec3::new(2.0, -2.0, 0.0),
+        Vec3::new(2.0, 2.0, 0.0),
+        Vec3::new(-2.0, 2.0, 0.0),
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    let to_place = glam::Mat4::from_translation(o)
+        * glam::Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+
+    let a = centre_pixel(&render_with_model(&gpu, &facing, &cam, glam::Mat4::IDENTITY));
+    let b = centre_pixel(&render_with_model(&gpu, &face_up, &cam, to_place));
+
+    assert!(
+        a[0] > 0,
+        "precondition: the reference quad must cover the centre pixel (got {a:?})",
+    );
+    assert!(
+        b[0] > 0,
+        "precondition: the rotated quad must land in the same place and \
+         cover the centre pixel (got {b:?}) — if it is culled or moved, \
+         the comparison below is not about normals",
+    );
+    assert_eq!(
+        a, b,
+        "two quads in the same place facing the same way are shaded \
+         differently, so the rotated one's normal was not transformed by \
+         instance.model",
     );
 }
 

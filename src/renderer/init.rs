@@ -344,7 +344,11 @@ impl Renderer {
             #[cfg(feature = "render3d")]
             render3d,
             #[cfg(feature = "render3d")]
-            pending_meshes: Vec::new(),
+            meshes: super::mesh_store::MeshStore::new(),
+            #[cfg(feature = "render3d")]
+            pending_draws: Vec::new(),
+            #[cfg(feature = "render3d")]
+            transient_handles: Vec::new(),
             #[cfg(feature = "render3d")]
             camera_3d: None,
             offscreen_batch: Batch::new(),
