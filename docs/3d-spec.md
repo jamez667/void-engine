@@ -1,6 +1,20 @@
 # Adding 3D to void_engine — scoping spec
 
-**Status:** proposal, not scheduled. Written 2026-09-21 against `c9b92c4`.
+**Status:** all six phases (0–5) built and on `main`, 2026-09-22. Written
+2026-09-21 against `c9b92c4` as a proposal; the phase entries in §6 now
+record what was actually done, including where this document's own estimates
+turned out wrong.
+
+The engine has a working 3D path behind the `render3d` feature — depth
+buffer, perspective camera, meshes with per-instance transforms, shadow
+mapping and point lights — and a 3D simulation (components, physics,
+collision, broadphase, replication) that is not feature-gated. The 2D path is
+untouched and still serves the two shipped games.
+
+**What is deliberately not here:** glTF or any asset loading, a 2D HUD over a
+3D scene, point-light shadows, non-uniform scale on normals, and physics that
+2D never had (gravity, forces, constraints, a contact solver). Each is noted
+at the phase that would have owned it.
 
 All figures below were measured or read out of the tree at that commit, not
 estimated from the README. Where a number contradicts an existing TODO entry
@@ -472,14 +486,44 @@ Acne is handled by front-face culling in the shadow pass (recording back faces
 moves the comparison depth away from the lit surface) plus a slope-scaled
 bias, and `an_unoccluded_floor_shows_no_self_shadowing` asserts the result.
 
-**Phase 5 — Sim (only if 3D gameplay, not just 3D rendering).** `Transform3D`,
-`Velocity3D`, 3D collider shapes (sphere/AABB/capsule), a 3D grid key and DDA,
-15-axis SAT, quaternion rotation, Z on the wire. Add these **beside** the 2D
-types, not in place of them — in-place widening is what triggers the
-save-migration problem in §4 and the four-figure downstream edit in §5.
-Independently skippable — see §7. If the game also needs gravity, forces or a
-contact solver, note that none of those exist in 2D either: that is new
-engine work, not a port, and is not costed here.
+**Phase 5 — Sim. ✅ Done 2026-09-22.** `Transform3D`, `Velocity3D`,
+`Collider3D`, `integrate_3d`, `narrow3d` (15-axis SAT), `SpatialGrid3D`, and
+3D position/orientation on the replication wire.
+
+Added **beside** the 2D types as planned, with one deliberate exception: the
+wire. `EntityItem` was widened in place after weighing it, because two packet
+formats mean two encoders and two decoders to keep in step, and the netcode
+has no live deployment to desync. A 2D game now leaves `z` at zero and pays
+its bits. That choice broke every `EntityItem` struct literal in the repo
+(`load_sweep`, `replication_server`, `replication_e2e`, `hot_paths`) — the
+cost the option was taken with eyes open to.
+
+What the estimate got right: components, physics and persistence were
+additive and cheap. What it understated:
+
+- **Quaternion-on-the-wire is its own design problem.** Three components are
+  sent and `w` recovered as a positive root, which works only because the
+  encoder first flips to the positive-`w` representative. Without that flip a
+  rotation past 180° decodes as its *inverse* — a character facing backwards.
+- **The 15-axis SAT is not optional and is easy to half-do.** The nine
+  edge-pair cross products are what separate two boxes that no face normal
+  does, and their degenerate (parallel) cases produce NaN axes that silently
+  report bogus collisions. Two axis-aligned boxes have six such pairs.
+- **The 3D grid's cost profile differs from the 2D one.** A cell holding `n`
+  colliders in 2D holds roughly `n^(3/2)` in 3D at the same size and density,
+  so a cell size ported straight across is coarser than it looks.
+
+**Measured, not estimated:** the wire item is **18 B** (not the ~23 B a naive
+sum of the new fields suggests — quantised fields are bit-packed) and **63
+items** fit the conservative datagram floor (not the ~74 estimated, because
+the floor is shared with a scalar core that did not shrink). §4's earlier
+"+7 bytes, ~74 items" figures were wrong in both directions and are corrected
+in `snapshot.rs`. The end-to-end keyframe figures have **not** been
+re-measured; `examples/load_sweep.rs` exists for that.
+
+Still absent, and still not costed: gravity, forces, constraints and a
+contact solver. None exist in 2D either. A 3D game needing them is asking for
+new engine work, not a port.
 
 **Testing.** `tests/shader_compiles.rs` (naga) and `tests/materials_render.rs`
 (headless wgpu pixel readback) already exist and extend naturally to new
