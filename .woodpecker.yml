@@ -57,9 +57,16 @@ steps:
       # snapshot/restore; `ledger` implies `persist` but is the only axis
       # that compiles the ledger module; `ledger-pg` adds the writer thread
       # and driver; `admin` is the operator status page; `replication` is
-      # the only axis with `net` and `persist` on together. Each compiles
+      # the only axis with `net` and `persist` on together; `render3d` is
+      # the only axis that compiles the 3D renderer. Each compiles
       # something no other axis does — drop one and that module goes
       # unchecked.
+      #
+      # `render3d` was missing for the whole of the 3D work and was added
+      # after the fact: five modules and two shaders went through six
+      # commits checked only on a developer machine. The rule above is
+      # what should have caught it, so it is restated here — a new feature
+      # needs an axis in the same commit that adds the feature.
       - cargo clippy --all-targets -- -D warnings
       - cargo clippy --all-targets --features net -- -D warnings
       - cargo clippy --all-targets --no-default-features -- -D warnings
@@ -68,6 +75,13 @@ steps:
       - cargo clippy --all-targets --no-default-features --features ledger-pg -- -D warnings
       - cargo clippy --all-targets --no-default-features --features admin -- -D warnings
       - cargo clippy --all-targets --no-default-features --features replication -- -D warnings
+      # `render3d` is the only axis that compiles mesh3d, render3d,
+      # shadow3d, their two WGSL shaders and the two GPU test suites.
+      # Its tests skip themselves without an adapter, so on a headless
+      # runner this proves the axis compiles and its non-GPU unit tests
+      # pass — which is what catches a broken cfg, a stale vertex layout
+      # or a doc link into a module no other axis builds.
+      - cargo clippy --all-targets --features render3d -- -D warnings
 
       # Intra-doc links, on every axis, for the same reason clippy runs on
       # every axis: a link resolves or not depending on which modules the
@@ -88,6 +102,7 @@ steps:
       - cargo doc --no-deps --no-default-features --features ledger-pg
       - cargo doc --no-deps --no-default-features --features admin
       - cargo doc --no-deps --no-default-features --features replication
+      - cargo doc --no-deps --features render3d
       - unset RUSTDOCFLAGS
 
       - cargo test --all-targets
@@ -103,6 +118,7 @@ steps:
       # The admin page binds real loopback sockets in its tests, on port 0
       # so parallel runs cannot collide.
       - cargo test --all-targets --no-default-features --features admin
+      - cargo test --all-targets --features render3d
 
       # `--all-targets` does NOT run doctests, so every `cargo test` step
       # above skips them. The admin module's examples are the only
@@ -162,6 +178,24 @@ steps:
           exit 1
         }
 
+      # The 3D renderer's unit tests, all behind `#[cfg(feature =
+      # "render3d")]`. A broken gate makes every one of them vanish while
+      # `cargo test --features render3d` still reports success, because
+      # there is nothing left to fail. Counting is what distinguishes
+      # "compiled and ran" from "compiled away".
+      #
+      # Counts the whole `renderer::` tree rather than each 3D module,
+      # because the 2D renderer has no unit tests of its own — every hit
+      # here is 3D. The GPU-backed suites in tests/ are separate and skip
+      # themselves without an adapter.
+      - |
+        out=$(cargo test --lib --features render3d renderer:: 2>&1)
+        echo "$out"
+        echo "$out" | grep -q "31 passed" || {
+          echo "expected 31 renderer tests; the render3d cfg gate may be wrong"
+          exit 1
+        }
+
       # The wire format's round-trip properties. These are the tests that
       # fail when an encoder change silently desyncs the two ends.
       - |
@@ -182,8 +216,8 @@ steps:
       - |
         out=$(cargo test --lib --no-default-features --features replication net::snapshot:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "12 passed" || {
-          echo "expected 12 snapshot-packet tests; the cfg gate may be wrong"
+        echo "$out" | grep -q "15 passed" || {
+          echo "expected 15 snapshot-packet tests; the cfg gate may be wrong"
           exit 1
         }
 
@@ -206,8 +240,8 @@ steps:
       - |
         out=$(cargo test --test snapshot_round_trip --no-default-features --features persist 2>&1)
         echo "$out"
-        echo "$out" | grep -q "10 passed" || {
-          echo "expected 10 snapshot round-trip tests; the cfg gate may be wrong"
+        echo "$out" | grep -q "16 passed" || {
+          echo "expected 16 snapshot round-trip tests; the cfg gate may be wrong"
           exit 1
         }
 
