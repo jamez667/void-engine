@@ -15,6 +15,12 @@
 pub mod context;
 pub mod camera;
 pub mod batch;
+/// 3D vertex format and CPU-side mesh. Feature `render3d`.
+#[cfg(feature = "render3d")]
+pub mod mesh3d;
+/// The 3D pipeline and GPU-resident meshes. Feature `render3d`.
+#[cfg(feature = "render3d")]
+pub mod render3d;
 mod postprocess;
 /// Public because the depth format and the main pipeline's depth state are
 /// what any future 3D pipeline must match to share the main pass. The
@@ -83,6 +89,18 @@ pub struct Renderer {
     // did before this existed. See `depth.rs` for why only the main pass
     // has one, and why 2D rendering is unchanged by it.
     depth: Option<DepthBuffer>,
+
+    // The 3D pipeline, and the meshes queued to draw with it this frame.
+    // `camera_3d` is the game's to drive; when set, `end_frame` uploads it
+    // in place of the 2D camera, because the two share one uniform buffer
+    // and a frame is one or the other.
+    #[cfg(feature = "render3d")]
+    render3d: Option<render3d::Render3D>,
+    #[cfg(feature = "render3d")]
+    pending_meshes: Vec<render3d::GpuMesh3D>,
+    /// Set by `set_camera_3d`. `None` means this is a 2D frame.
+    #[cfg(feature = "render3d")]
+    pub camera_3d: Option<camera::Camera3D>,
 
     offscreen_batch: Batch,
     offscreen_vbuf: wgpu::Buffer,
@@ -265,6 +283,57 @@ impl Renderer {
         if self.shadow.is_none() { return; }
         self.pending_shadow = Some((sun_dir, shadow_length_px.max(0.0)));
         self.shadow_split_index = Some(self.batch.indices.len() as u32);
+    }
+
+    /// Drive this frame with a 3D camera.
+    ///
+    /// The 2D and 3D cameras share one uniform buffer and one bind group,
+    /// so a frame is one or the other. Setting this makes `end_frame`
+    /// upload `Camera3D`'s `proj * view` instead of `Camera2D`'s
+    /// orthographic projection — which means any 2D geometry in the same
+    /// frame is then transformed by a perspective matrix expecting
+    /// camera-relative metres, not the pixel offsets `Batch` produces.
+    ///
+    /// Mixing the two coherently needs either a second camera uniform or a
+    /// separate pass, and that decision belongs with whoever first wants a
+    /// 2D HUD over a 3D scene. Until then: set it for a 3D frame, leave it
+    /// `None` for a 2D one.
+    #[cfg(feature = "render3d")]
+    pub fn set_camera_3d(&mut self, camera: camera::Camera3D) {
+        self.camera_3d = Some(camera);
+    }
+
+    /// Go back to driving the frame with the 2D camera.
+    #[cfg(feature = "render3d")]
+    pub fn clear_camera_3d(&mut self) {
+        self.camera_3d = None;
+    }
+
+    /// Upload a mesh and queue it for this frame's main pass.
+    ///
+    /// Uploads on every call, which is the honest thing for a
+    /// per-frame API and the wrong thing for static geometry. A game with
+    /// a fixed world should hold its own [`render3d::GpuMesh3D`] and call
+    /// [`Self::draw_gpu_mesh_3d`] instead; this exists so the path can be
+    /// exercised without an asset pipeline. Phase 3 is where retained
+    /// meshes get a real home.
+    #[cfg(feature = "render3d")]
+    pub fn draw_mesh_3d(&mut self, mesh: &mesh3d::Mesh3D) {
+        if self.render3d.is_none() {
+            return;
+        }
+        if let Some(gpu) = render3d::GpuMesh3D::upload(&self.gpu.device, mesh) {
+            self.pending_meshes.push(gpu);
+        }
+    }
+
+    /// Queue an already-uploaded mesh for this frame's main pass.
+    #[cfg(feature = "render3d")]
+    pub fn draw_gpu_mesh_3d(&mut self, mesh: render3d::GpuMesh3D) {
+        if self.render3d.is_none() {
+            return;
+        }
+        self.pending_meshes.push(mesh);
     }
 
     /// Set what an unlit pixel keeps, overriding the default ambient clear.

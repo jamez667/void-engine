@@ -120,6 +120,11 @@ impl Renderer {
         self.sun_split_index = None;
         self.pending_godray = None;
         self.godray_split_index = None;
+        // Queued meshes are per-frame like every other pending list above.
+        // Dropping them here also releases last frame's GPU buffers, which
+        // is what keeps `draw_mesh_3d`'s upload-per-call from leaking.
+        #[cfg(feature = "render3d")]
+        self.pending_meshes.clear();
         self.shake_trauma = (self.shake_trauma - 0.02).max(0.0);
         let shake_amount = self.shake_trauma * self.shake_trauma * 8.0;
         self.shake_offset = Vec2::new(
@@ -166,6 +171,16 @@ impl Renderer {
             viewport_size: self.camera.viewport_size,
         };
         let uniform = cam_with_shake.build_uniform();
+        // A 3D camera, when set, replaces the 2D one for the whole frame:
+        // one uniform buffer, one bind group, so a frame is one or the
+        // other. `set_camera_3d` documents why mixing is a deliberate
+        // non-feature for now. Both fill the same `CameraUniform`, which is
+        // what makes the substitution free.
+        #[cfg(feature = "render3d")]
+        let uniform = match self.camera_3d.as_ref() {
+            Some(c) => c.build_uniform(),
+            None => uniform,
+        };
         self.gpu
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -545,15 +560,37 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                // Present whenever the depth texture allocated. The main
-                // pipeline's depth state is a no-op today, so this changes
-                // no pixel — it is here so a 3D pipeline has something to
-                // test against. `None` on a zero-size surface, matching
-                // the pipeline's tolerance for a missing buffer.
+                // Present whenever the depth texture allocated. The 2D
+                // pipeline's depth state is the identity, so this changes
+                // no 2D pixel; under `render3d` it is what the 3D pipeline
+                // (`Less`, writes on) actually tests against. `None` on a
+                // zero-size surface, matching the pipeline's tolerance for
+                // a missing buffer.
                 depth_stencil_attachment: self.depth.as_ref().map(|d| d.attachment()),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+
+            // 3D geometry first: it is opaque and depth-tested, so laying
+            // it down before the 2D batch lets the alpha-blended 2D
+            // primitives composite over a finished scene. Drawing it after
+            // would blend 3D over 2D in whatever order the meshes happened
+            // to be queued.
+            #[cfg(feature = "render3d")]
+            if let Some(r3d) = self.render3d.as_ref() {
+                if !self.pending_meshes.is_empty() {
+                    rpass.set_pipeline(&r3d.pipeline);
+                    rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    for mesh in &self.pending_meshes {
+                        rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        rpass.set_index_buffer(
+                            mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                }
+            }
 
             // The main batch is drawn in ranges separated by composite
             // steps. Each split names an index in the main batch AND a

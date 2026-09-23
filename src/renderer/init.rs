@@ -239,6 +239,17 @@ impl Renderer {
             log::warn!("[renderer] depth buffer unavailable — main pass will run without one");
         }
 
+        // The 3D pipeline shares the camera bind group layout with the 2D
+        // path, which is what `Camera3D` filling the same `CameraUniform`
+        // buys. Unconditional under the feature: unlike the effect passes
+        // it allocates no textures, so there is nothing to fail.
+        #[cfg(feature = "render3d")]
+        let render3d = Some(super::render3d::Render3D::new(
+            &gpu.device,
+            &camera_bgl,
+            gpu.format,
+        ));
+
         let shadow = ShadowPass::new(
             &gpu.device,
             &camera_bgl,
@@ -330,6 +341,12 @@ impl Renderer {
             window,
             postprocess,
             depth,
+            #[cfg(feature = "render3d")]
+            render3d,
+            #[cfg(feature = "render3d")]
+            pending_meshes: Vec::new(),
+            #[cfg(feature = "render3d")]
+            camera_3d: None,
             offscreen_batch: Batch::new(),
             offscreen_vbuf,
             offscreen_ibuf,

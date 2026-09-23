@@ -91,6 +91,25 @@ audio = ["dep:rodio"]
 # `App` + `run_headless` over a `Timestep`, with no GPU and no window.
 client = ["dep:wgpu"]
 
+# The 3D render path: `Vertex3D`, `Mesh3D`, and the pipeline and shader
+# that draw them. Phase 2 of `docs/3d-spec.md`.
+#
+# Separate from `client` rather than folded into it because the 2D path is
+# what two shipped games use and it must not grow a vertex format, a
+# shader or a pipeline it never binds. A 2D-only client compiles none of
+# this; `cargo tree` is unaffected either way, since it adds no
+# dependency — only code.
+#
+# Implies `client`: it is a renderer feature, and there is no sense in a
+# headless build carrying a pipeline it has no device to create.
+#
+# The 3D path is deliberately *beside* the 2D one, not a replacement:
+# `Vertex3D` next to `Vertex`, `Camera3D` next to `Camera2D`. Widening the
+# existing types instead would move the two buffer caps derived from
+# `size_of::<Vertex>()` and break ~408 `Batch` call sites across
+# void-claim and mini-miner-2. See `docs/3d-spec.md` §5.
+render3d = ["client"]
+
 # Saving and loading a `World`: the component name registry, snapshot and
 # restore, and RNG state capture. Off by default because a game that never
 # saves should not carry an encoder or the registry's startup audit.
@@ -239,3 +258,11 @@ required-features = ["client"]
 [[test]]
 name = "depth_buffer"
 required-features = ["client"]
+
+# Draws through the real 3D shader, vertex layout and depth state on a
+# headless device. The unit tests beside mesh3d/render3d check those pieces
+# in isolation and none of them draws, so this is what would catch a shader
+# that renders nothing or a winding that culls every face.
+[[test]]
+name = "render3d"
+required-features = ["render3d"]

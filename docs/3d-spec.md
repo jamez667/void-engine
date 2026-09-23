@@ -359,12 +359,41 @@ and a target sitting on the eye (a follow rig settling).
 exported unconditionally — checked against a headless build, so Phase 5's
 simulation work is not blocked by the gate.
 
-**Phase 2 — 3D vertex + pipeline.** A `Vertex3D` (`pos: [f32;3]`, normal, uv,
-color) and a *separate* pipeline and shader. **Do not widen `Vertex`** — it
-would grow all 3.19M-vert budgets on every 2D vertex, move the two
-stride-derived buffer caps that have already caused two logged incidents
-(`frame.rs:37-43`, `:595-601`), and force a decision about `pattern`/`local`/
-`scale` semantics that has no good answer under perspective.
+**Phase 2 — 3D vertex + pipeline. ✅ Done 2026-09-22.** `Vertex3D` (48 bytes
+against the 2D `Vertex`'s 84), `Mesh3D`, `GpuMesh3D`, `shader3d.wgsl` and a
+separate pipeline, all behind a new `render3d` feature (implies `client`).
+`Vertex` was not touched, for the reasons above.
+
+**This is the first point where 3D actually draws**, and the pipeline here is
+what finally uses the Phase 0 depth buffer: `Less` with writes on, against
+the 2D path's identity state. Both live in the same main pass, which is legal
+because depth state is per-pipeline. 3D geometry draws before the 2D batch so
+alpha-blended 2D primitives composite over a finished scene.
+
+Design notes worth carrying forward:
+
+- **The 3D shader is separate, not a branch in `shader.wgsl`.** That file's
+  fragment stage is ~20 procedural material functions evaluated in pattern
+  space with a per-vertex metres-per-pixel AA fade. Under perspective there
+  is no single metres-per-pixel per frame, so those inputs stop meaning
+  anything — which is §8's open question, deliberately not answered here.
+- **Attribute offsets are derived via `offset_of!`**, unlike `Vertex::desc`'s
+  nine hand-written literals. `frame.rs` records two incidents from a
+  hardcoded stride drifting; a field reorder now cannot silently produce a
+  layout that compiles and renders garbage.
+- **A frame is 2D or 3D, not both.** Both cameras share one uniform buffer
+  and bind group, so `set_camera_3d` replaces the 2D camera wholesale. A 2D
+  HUD over a 3D scene needs a second uniform or a separate pass; that
+  decision belongs to whoever first wants it.
+- **Back-face culling is on for 3D only.** The 2D path's quad winding has
+  never had to be thought about, so culling it would silently drop geometry.
+
+`tests/render3d.rs` draws through the real shader, layout and depth state on
+a headless device. Three checks, each verified load-bearing by breaking what
+it guards: geometry is visible and lit; geometry *behind* the camera is not
+drawn (swapping `look_at_rh`→`look_at_lh` draws 1.98% of the frame and fails
+all three); and the nearer of two boxes occludes the farther one drawn after
+it (`Less`→`Always` shows blue and fails).
 
 **Phase 3 — Mesh path.** `Mesh` (vertex+index buffers, retained on GPU, not
 rebuilt per frame like `Batch`) and a draw API. This is genuinely new
