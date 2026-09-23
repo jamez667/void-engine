@@ -11,6 +11,8 @@
 //! * `pick3d` — click a crate to select it; click again to launch it.
 //! * `Camera3D` + shadow mapping + point lights.
 //! * A 2D `Batch` HUD composited over the scene.
+//! * `ai3d` — a walking agent that plans a route across the floor and
+//!   pushes itself along it with forces, so the crates get in its way.
 //!
 //! # Controls
 //!
@@ -20,10 +22,15 @@
 //! * **A / D** — orbit the camera. **W / S** — raise and lower it.
 //! * **R** — reset the scene.
 //!
+//! The orange box walks itself between the corners of the floor. It is an
+//! ordinary dynamic body driven by forces, not a scripted mover: it
+//! collides with the crates, shoves them aside, and is shoved back.
+//!
 //! Run with:
 //!     cargo run --release --features render3d --example crates3d
 
 use glam::{DVec3, Mat4, Quat, Vec2, Vec3};
+use void_engine::ai3d::{self, Agent3D, AgentState, NavPlane, WalkTuning3D};
 use void_engine::collision::grid3d::SpatialGrid3D;
 use void_engine::collision::narrow3d;
 use void_engine::components::{Collider3D, Transform3D, Velocity3D};
@@ -40,6 +47,7 @@ use void_engine::renderer::mesh3d::Mesh3D;
 use void_engine::renderer::mesh_store::{MeshDraw, MeshHandle};
 use void_engine::renderer::render3d::PointLight3D;
 use void_engine::renderer::Renderer;
+use void_engine::pathfind::TileSource;
 use void_engine::{App, ClientApp, SimCtx, World};
 
 /// Half-extent of a crate, in metres.
@@ -50,6 +58,43 @@ const FLOOR_HALF: f64 = 12.0;
 const CAMERA_DISTANCE: f64 = 18.0;
 /// How far a click reaches.
 const PICK_RANGE: f64 = 100.0;
+
+/// The walker's half-extents: short and wide on purpose.
+///
+/// Friction reacts at the feet, a half-height below the centre of mass,
+/// so a walk force always pitches the body forward while gravity rights
+/// it with a lever of a half-width. A walker's aspect ratio therefore
+/// decides whether it can accelerate at all without face-planting: a
+/// cube of this mass leans 87 degrees crossing the floor, these
+/// proportions lean 0.1. See `ai3d::WalkTuning3D::for_body`.
+const AGENT_HW: f64 = 0.5;
+const AGENT_HH: f64 = 0.25;
+/// The walker's mass, in kilograms.
+const AGENT_MASS: f32 = 80.0;
+/// Friction of the floor the walker pushes against.
+const FLOOR_FRICTION: f32 = 0.7;
+/// Edge length of one navigation tile.
+const NAV_TILE: f32 = 1.5;
+/// The nav grid's extent in tiles, comfortably inside the floor.
+const NAV_DIMS: (u32, u32) = (15, 15);
+
+/// The floor the agent may walk on.
+///
+/// Every tile inside the grid is walkable — the crates are obstacles the
+/// *physics* resolves, not the planner, so the agent shoves its way
+/// through a pile rather than routing around it. Routing around them
+/// would mean feeding their tiles in as `extra_blocked`, which is the
+/// seam `plan_path` leaves open for exactly that.
+struct NavFloor;
+
+impl TileSource for NavFloor {
+    fn dims(&self) -> (u32, u32) {
+        NAV_DIMS
+    }
+    fn blocks(&self, c: i32, r: i32) -> bool {
+        c < 0 || r < 0 || c >= NAV_DIMS.0 as i32 || r >= NAV_DIMS.1 as i32
+    }
+}
 
 /// One thing in the world: a pose, a body, and how to draw it.
 struct Body {
@@ -83,6 +128,15 @@ struct Game {
     pending_launch: bool,
     dropped: usize,
 
+    /// The walking agent, and which body it drives.
+    agent: Agent3D,
+    agent_body: usize,
+    /// How many destinations the agent has been given, which picks the
+    /// next one.
+    agent_trips: usize,
+    /// Its own mesh, so it reads as a walker rather than a crate.
+    agent_mesh: Option<MeshHandle>,
+
     /// Frame at which to run the self-check, if `--verify` was passed.
     verify_at: Option<u32>,
     frame: u32,
@@ -101,6 +155,14 @@ impl Game {
             pending_click: None,
             pending_launch: false,
             dropped: 0,
+            agent: Agent3D::new(WalkTuning3D::for_body(
+                AGENT_MASS as f64,
+                [AGENT_HW, AGENT_HW, AGENT_HH],
+                FLOOR_FRICTION as f64,
+            )),
+            agent_body: 0,
+            agent_trips: 0,
+            agent_mesh: None,
             verify_at: None,
             frame: 0,
         };
@@ -139,6 +201,62 @@ impl Game {
         for i in 0..3 {
             self.drop_crate(DVec3::new(0.0, 0.0, 1.0 + i as f64 * 1.6));
         }
+
+        self.spawn_agent();
+    }
+
+    /// The nav grid, pinned to the top face of the floor.
+    ///
+    /// `floor_z` is the surface the agent's feet rest on, not the centre
+    /// of the floor body — the floor box is centred at -0.5 with a 0.5
+    /// half-extent, so its top is exactly zero.
+    fn nav_plane(&self) -> NavPlane {
+        NavPlane::new(NAV_DIMS, NAV_TILE, 0.0)
+    }
+
+    /// Add the walker, and send it somewhere.
+    fn spawn_agent(&mut self) {
+        let plane = self.nav_plane();
+        let pos = plane.tile_center(2, 2) + DVec3::new(0.0, 0.0, AGENT_HH);
+        let collider = Collider3D::box3d(AGENT_HW as f32, AGENT_HW as f32, AGENT_HH as f32);
+        let slot = self.grid.insert(pos, collider.radius as f64);
+
+        self.agent_body = self.bodies.len();
+        self.bodies.push(Body {
+            transform: Transform3D::at(pos),
+            velocity: Velocity3D::default(),
+            rigid: RigidBody::box3d(
+                AGENT_MASS,
+                [AGENT_HW as f32, AGENT_HW as f32, AGENT_HH as f32],
+            )
+            .with_material(Material3D { restitution: 0.0, friction: FLOOR_FRICTION }),
+            collider,
+            colour: [0.95, 0.72, 0.20, 1.0],
+            slot,
+        });
+
+        self.agent = Agent3D::new(WalkTuning3D::for_body(
+            AGENT_MASS as f64,
+            [AGENT_HW, AGENT_HW, AGENT_HH],
+            FLOOR_FRICTION as f64,
+        ));
+        self.send_agent_somewhere_new();
+    }
+
+    /// Pick a fresh destination and plan a route to it.
+    ///
+    /// Corners of the grid, in rotation, so the walk is long enough to
+    /// watch and crosses the middle where the crates are.
+    fn send_agent_somewhere_new(&mut self) {
+        let plane = self.nav_plane();
+        let (w, h) = (NAV_DIMS.0 as i32 - 3, NAV_DIMS.1 as i32 - 3);
+        let corners = [(2, 2), (w, 2), (w, h), (2, h)];
+        let (c, r) = corners[self.agent_trips % corners.len()];
+        self.agent_trips += 1;
+
+        self.agent.set_goal(plane.tile_center(c, r));
+        let from = self.bodies[self.agent_body].transform.pos;
+        ai3d::replan(&mut self.agent, plane, &NavFloor, from, &Default::default());
     }
 
     /// Add a dynamic crate at `pos`.
@@ -410,6 +528,31 @@ impl App for Game {
             }
         }
 
+        // ---- the agent -------------------------------------------------
+        //
+        // Before `step`, in the same place a player's input would be
+        // read: the force is an acceleration the integrator consumes.
+        {
+            let i = self.agent_body;
+            if let Some(b) = self.bodies.get_mut(i) {
+                ai3d::drive_agent(
+                    &mut self.agent,
+                    &mut b.rigid,
+                    &b.transform,
+                    &mut b.velocity,
+                    dt,
+                );
+            }
+        }
+
+        // Arrived, or wedged against a crate it cannot shift: either way
+        // give it somewhere new to be. `stuck()` reports, the caller
+        // decides — the engine cannot re-plan on its own because it does
+        // not hold the tile source.
+        if self.agent.state == AgentState::Arrived || self.agent.stuck() {
+            self.send_agent_somewhere_new();
+        }
+
         // ---- the physics step ------------------------------------------
         //
         // `physics3d::step` does gravity, integration and sleeping; the
@@ -489,6 +632,14 @@ impl ClientApp for Game {
                 [1.0; 4],
             );
             self.floor_mesh = f.is_empty().then_some(None).flatten().or(r.upload_mesh(&f).ok());
+
+            let mut w = Mesh3D::new();
+            w.push_box(
+                Vec3::ZERO,
+                Vec3::new(AGENT_HW as f32 * 2.0, AGENT_HW as f32 * 2.0, AGENT_HH as f32 * 2.0),
+                [1.0; 4],
+            );
+            self.agent_mesh = r.upload_mesh(&w).ok();
         }
 
         // A click recorded last tick is resolved now, against the camera
@@ -521,6 +672,8 @@ impl ClientApp for Game {
         for (i, b) in self.bodies.iter().enumerate() {
             let handle = if b.rigid.kind == BodyKind::Static {
                 self.floor_mesh
+            } else if i == self.agent_body {
+                self.agent_mesh
             } else {
                 self.crate_mesh
             };
@@ -659,10 +812,15 @@ impl Game {
 
         // 3. Physics ran. The opening crates are placed at z = 1.0, 2.4,
         //    3.8 and must have fallen toward the floor by now.
+        // The agent is dynamic too, but it is a different size and it is
+        // deliberately still walking, so it fails both the resting-height
+        // and the everything-is-asleep checks below on purpose.
         let crates: Vec<&Body> = self
             .bodies
             .iter()
-            .filter(|b| b.rigid.kind.is_dynamic())
+            .enumerate()
+            .filter(|(i, b)| b.rigid.kind.is_dynamic() && *i != self.agent_body)
+            .map(|(_, b)| b)
             .collect();
         let lowest = crates
             .iter()
@@ -714,6 +872,11 @@ impl Game {
         // instead of separating.
         let mut worst = 0.0f64;
         for c in &self.contacts() {
+            // Crate against crate only. The agent is actively pushing,
+            // so a live overlap with it is the solver doing its job.
+            if c.a == self.agent_body || c.b == self.agent_body {
+                continue;
+            }
             let (a, b) = (&self.bodies[c.a], &self.bodies[c.b]);
             if a.rigid.kind.is_dynamic() && b.rigid.kind.is_dynamic() {
                 worst = worst.max(c.penetration);
@@ -745,6 +908,43 @@ impl Game {
             std::process::exit(1);
         }
 
+        // The agent must have got somewhere. A walker that never moves
+        // looks identical to one whose path failed to plan, and both
+        // render fine — so check the distance, not the pixels.
+        let walker = &self.bodies[self.agent_body];
+        let plane = self.nav_plane();
+        let start = plane.tile_center(2, 2);
+        let walked = (walker.transform.pos - start).truncate().length();
+        if walked < 1.0 {
+            eprintln!(
+                "VERIFY FAIL: the agent has moved {walked:.2} m from where it \
+                 spawned after {VERIFY_AT_FRAME} frames — state is {:?}, so it \
+                 is not walking",
+                self.agent.state,
+            );
+            std::process::exit(1);
+        }
+        if walker.transform.pos.z < AGENT_HH - 0.05 {
+            eprintln!(
+                "VERIFY FAIL: the agent is at z={:.3}, below its {AGENT_HH:.2} m \
+                 resting height — it is sinking into the floor",
+                walker.transform.pos.z,
+            );
+            std::process::exit(1);
+        }
+        // Upright. A walk force through the centre of mass imparts no
+        // torque, so a leaning agent means it has acquired a lever arm.
+        let up = (walker.transform.rot * Vec3::Z).as_dvec3();
+        let tilt = up.dot(DVec3::Z).clamp(-1.0, 1.0).acos().to_degrees();
+        if tilt > 5.0 {
+            eprintln!("VERIFY FAIL: the agent is leaning {tilt:.1} degrees off vertical");
+            std::process::exit(1);
+        }
+
+        println!(
+            "[verify] agent walked {walked:.2} m, tilt {tilt:.2} deg, state {:?}",
+            self.agent.state,
+        );
         println!(
             "[verify] OK — scene rendered, geometry visible, \
              physics settled (resting z={lowest:.3}, worst overlap={worst:.4})"
@@ -811,7 +1011,7 @@ impl Game {
 /// rather than one still in motion. Settling takes a little under four
 /// seconds from the drop, plus the half second of continuous stillness
 /// [`void_engine::physics3d::TIME_TO_SLEEP`] requires.
-const VERIFY_AT_FRAME: u32 = 420;
+const VERIFY_AT_FRAME: u32 = 900;
 
 fn main() {
     // `--verify` runs headed for a couple of seconds, captures a frame,

@@ -191,6 +191,17 @@ steps:
           echo "expected 22 picking tests"
           exit 1
         }
+      # The walking agent. Its integration tests run the *real* physics
+      # sequence -- step, contacts, solve, sleep -- so a shrinking count
+      # here means a body-and-floor scene stopped being exercised, which
+      # is where every agent bug so far has hidden.
+      - |
+        out=$(cargo test --lib ai3d:: 2>&1)
+        echo "$out"
+        echo "$out" | grep -q "40 passed" || {
+          echo "expected 40 walking-agent tests"
+          exit 1
+        }
       - |
         out=$(cargo test --lib collision::narrow3d:: 2>&1)
         echo "$out"

@@ -24,6 +24,14 @@
 /// nothing unless a game calls `admin::serve`.
 #[cfg(feature = "admin")]
 pub mod admin;
+/// Point-to-point walking for a 3D agent: grid pathfinding across a floor
+/// plane, and the steering that turns the next waypoint into a force on
+/// an ordinary dynamic rigid body.
+///
+/// Not `client`-gated, for the reason [`pick3d`] is not: a dedicated
+/// server walks its NPCs with exactly this code, and AI that only exists
+/// while someone is looking at it is not AI.
+pub mod ai3d;
 pub mod app;
 /// The headless fixed-tick driver. Available in every build.
 pub mod app_headless;
