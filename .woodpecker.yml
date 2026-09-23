@@ -214,8 +214,8 @@ steps:
       - |
         out=$(cargo test --lib physics3d:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "37 passed" || {
-          echo "expected 37 rigid-body tests"
+        echo "$out" | grep -q "38 passed" || {
+          echo "expected 38 rigid-body tests"
           exit 1
         }
 

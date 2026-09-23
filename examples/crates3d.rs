@@ -192,12 +192,29 @@ impl Game {
             // Slot indices and body indices coincide here only because
             // nothing is ever removed. A game that despawned would keep
             // a slot -> body map.
-            let (Some(ba), Some(bb)) = (self.bodies.get(ia), self.bodies.get(ib)) else {
+            let (Some(ba0), Some(bb0)) = (self.bodies.get(ia), self.bodies.get(ib)) else {
                 continue;
             };
-            if !ba.rigid.kind.is_dynamic() && !bb.rigid.kind.is_dynamic() {
+            if !ba0.rigid.kind.is_dynamic() && !bb0.rigid.kind.is_dynamic() {
                 continue;
             }
+
+            // **Order matters, and the grid does not order for physics.**
+            //
+            // `query_pairs` returns `(min, max)` by slot index, so the
+            // floor — inserted first — is always the `a` side. The
+            // narrowphase normal points "from B toward A", so for a crate
+            // resting on that floor it points *downward*, and
+            // `correct_penetration` then pushes the crate further in. The
+            // crates sink a little every tick and fall through: measured
+            // at penetration climbing 0.05 -> 0.88 over three seconds.
+            //
+            // Putting the dynamic body first makes the normal point up
+            // out of the floor, which is what the solver expects. Where
+            // both are dynamic the grid's order is fine.
+            let swap = !ba0.rigid.kind.is_dynamic() && bb0.rigid.kind.is_dynamic();
+            let (ia, ib) = if swap { (ib, ia) } else { (ia, ib) };
+            let (ba, bb) = if swap { (bb0, ba0) } else { (ba0, bb0) };
 
             let ha = to_half(&ba.collider);
             let hb = to_half(&bb.collider);
@@ -214,7 +231,19 @@ impl Game {
                 // centres, pulled onto the surface. Good enough for boxes
                 // this size; a real manifold would give up to four points
                 // per face pair and make stacks steadier.
-                let point = (ba.transform.pos + bb.transform.pos) * 0.5;
+                // The deepest point of A into B. This must be a real
+                // surface point, not an approximation: the lever arm from
+                // each centre to the contact decides how much of the
+                // impulse becomes spin, and a point metres off the
+                // surface shrinks the impulse until bodies sink through
+                // each other. See `obb_contact_point`.
+                let point = narrow3d::obb_contact_point(
+                    ba.transform.pos,
+                    ha,
+                    ba.transform.rot,
+                    normal,
+                    penetration,
+                );
                 out.push(physics3d::Contact {
                     a: ia,
                     b: ib,
@@ -476,6 +505,22 @@ impl ClientApp for Game {
 
         // ---- self-check, under `--verify` -------------------------------
         self.frame += 1;
+        if std::env::var("CRATES3D_TRACE").is_ok() && self.frame.is_multiple_of(30) {
+            let zs: Vec<String> = self
+                .bodies
+                .iter()
+                .filter(|b| b.rigid.kind.is_dynamic())
+                .map(|b| format!("{:.3}", b.transform.pos.z))
+                .collect();
+            let cs = self.contacts();
+            let pen = cs.iter().map(|c| c.penetration).fold(0.0f64, f64::max);
+            let pairs = self.grid.query_pairs().len();
+            let norms: Vec<String> = cs.iter().take(3)
+                .map(|c| format!("({},{}) n=({:.2},{:.2},{:.2}) p={:.3}",
+                     c.a, c.b, c.normal.x, c.normal.y, c.normal.z, c.penetration)).collect();
+            eprintln!("[trace] f{:4} z=[{}] pairs={} contacts={} max_pen={:.4} {}",
+                self.frame, zs.join(" "), pairs, cs.len(), pen, norms.join(" | "));
+        }
         if let Some(at) = self.verify_at {
             if self.frame == at {
                 // Ask for a capture; it arrives next frame.

@@ -678,6 +678,43 @@ mod tests {
         assert!(s.velocities[crate_].linear.z >= -1e-6, "the crate was stopped");
     }
 
+    /// A crate resting on a big static floor must stay put over many
+    /// ticks. This is the crates3d failure reduced to its essentials:
+    /// gravity each tick, one contact, repeat.
+    #[test]
+    fn a_box_resting_on_a_floor_does_not_sink_through_it() {
+        let mut s = Scene::new();
+        let ground_top = 0.0;
+        let half = 0.5;
+        let crate_ = s.push(
+            RigidBody::box3d(1.0, [half as f32, half as f32, half as f32])
+                .with_material(Material3D { restitution: 0.0, friction: 0.6 }),
+            DVec3::new(0.0, 0.0, half + 0.001),
+            DVec3::ZERO,
+        );
+        let floor = s.push(RigidBody::static_body(), DVec3::new(0.0, 0.0, -0.5), DVec3::ZERO);
+
+        let dt = 1.0 / 60.0;
+        for tick in 0..600 {
+            // gravity
+            s.velocities[crate_].linear += DVec3::new(0.0, 0.0, -9.81) * dt;
+            s.transforms[crate_].pos += s.velocities[crate_].linear * dt;
+
+            let z = s.transforms[crate_].pos.z;
+            let pen = (ground_top + half) - z;
+            if pen > 0.0 {
+                let point = DVec3::new(0.0, 0.0, z - half);
+                s.solve(&[contact(crate_, floor, DVec3::new(0.0, 0.0, 1.0), pen, point)]);
+            }
+            if tick % 120 == 0 {
+                eprintln!("[probe] tick {tick} z={:.4} pen={:.4} vz={:.4}",
+                    s.transforms[crate_].pos.z, pen.max(0.0), s.velocities[crate_].linear.z);
+            }
+        }
+        let z = s.transforms[crate_].pos.z;
+        assert!(z > 0.3, "the crate sank to z={z:.4}; it should rest near 0.5");
+    }
+
     /// Out-of-range or self-referential indices must be ignored rather
     /// than panicking: a caller rebuilding its body array between ticks
     /// can produce a stale contact.

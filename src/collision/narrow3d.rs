@@ -241,6 +241,68 @@ pub fn segment_vs_sphere(p0: DVec3, p1: DVec3, center: DVec3, radius: f64) -> bo
     segment_vs_sphere_t(p0, p1, center, radius).is_some()
 }
 
+/// The deepest point of box A into box B, for a contact along `normal`.
+///
+/// # Why a contact needs this, and what goes wrong without it
+///
+/// A solver applies its impulse *at a point*, and the lever arm from
+/// each body's centre to that point is what decides how much of the
+/// impulse becomes spin rather than stopping the approach — see
+/// `effective_mass` in [`crate::physics3d::solver`].
+///
+/// An approximate point does not degrade the result gracefully; it
+/// breaks it. Using the midpoint between centres puts the contact
+/// metres away from the surfaces when one body is large — a crate on a
+/// wide floor is the ordinary case — which inflates the lever arm,
+/// inflates the effective mass, and shrinks the impulse to a fraction of
+/// what is needed. The crate then sinks a little further every tick,
+/// penetration grows monotonically, and it falls through. Measured on
+/// `examples/crates3d`: penetration climbed 0.05 -> 0.88 over three
+/// seconds and the crates passed through the floor.
+///
+/// # What this returns
+///
+/// The support point of A in the direction of `-normal`: the corner (or
+/// face centre, when the box is square-on) that reaches furthest into B.
+///
+/// Returned as-is, with no offset along the normal. For a resting box
+/// that point already *is* the contact surface — a crate at z = 0.5 with
+/// half-extent 0.5 supports at z = 0, which is exactly the floor's top.
+/// An earlier revision nudged it by half the penetration and had the
+/// sign backwards, moving the point away from the surface and leaving
+/// the crates sinking exactly as before; the nudge bought nothing even
+/// with the sign right.
+///
+/// This is a *single* point, not a manifold. One point per pair is enough
+/// to stop bodies interpenetrating and is what makes a stack stand up;
+/// four points per face pair is what makes it stand up *steadily*, and is
+/// the obvious next step.
+pub fn obb_contact_point(
+    pos_a: DVec3,
+    half_a: [f64; 3],
+    rot_a: Quat,
+    normal: DVec3,
+    penetration: f64,
+) -> DVec3 {
+    let axes = obb_axes(rot_a);
+    // Walk from A's centre to the corner furthest along -normal. On each
+    // local axis, step to whichever face the normal points away from.
+    let mut p = pos_a;
+    for i in 0..3 {
+        let d = axes[i].dot(normal);
+        // A near-zero dot means the normal lies in this face's plane, so
+        // neither direction is "deeper" — the support is the face centre
+        // on that axis, which is what contributing nothing gives.
+        if d > 0.0 {
+            p -= axes[i] * half_a[i].abs();
+        } else if d < 0.0 {
+            p += axes[i] * half_a[i].abs();
+        }
+    }
+    let _ = penetration;
+    p
+}
+
 /// Segment-vs-oriented-box, returning the entry parameter `t` along
 /// `p0..p1`.
 ///
