@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use glam::DVec2;
+use glam::{DVec2, DVec3};
 use void_engine::collision::{AoiScratch, SpatialGrid};
 use void_engine::components::Transform2D;
 use void_engine::ecs::EntityId;
@@ -66,7 +66,7 @@ struct ClientView {
     /// introduced this tenant, so the tests can still assert identity —
     /// and so a generation arriving out of step is visible rather than
     /// filed under a second key.
-    entities: HashMap<u32, (EntityId, DVec2)>,
+    entities: HashMap<u32, (EntityId, DVec3)>,
     /// Name table learned from the header chunk, as a real client would.
     names: HashMap<NameId, String>,
     last_tick: u32,
@@ -135,7 +135,7 @@ impl ClientView {
 
     /// Position held for an entity, looked up the way a client must —
     /// by index, then checked against the identity it was introduced with.
-    fn pos_of(&self, id: EntityId) -> Option<DVec2> {
+    fn pos_of(&self, id: EntityId) -> Option<DVec3> {
         match self.entities.get(&id.index) {
             Some((held, pos)) if *held == id => Some(*pos),
             _ => None,
@@ -309,12 +309,19 @@ impl Server {
             .get::<Transform2D>(id)
             .map(|t| t.pos)
             .unwrap_or(DVec2::ZERO);
-        EntityItem { kind, entity: id, pos, rot: 0.0, vel: DVec2::ZERO, component: NameId(0) }
+        EntityItem {
+            kind,
+            entity: id,
+            pos: pos.extend(0.0),
+            rot: glam::Quat::IDENTITY,
+            vel: DVec3::ZERO,
+            component: NameId(0),
+        }
     }
 }
 
 /// Quantisation is lossy, so positions compare within one step.
-fn close(a: DVec2, b: DVec2) -> bool {
+fn close(a: DVec3, b: DVec3) -> bool {
     let step = (2.0 * HALF) / ((1u64 << 16) - 1) as f64;
     (a.x - b.x).abs() <= step && (a.y - b.y).abs() <= step
 }
@@ -394,7 +401,7 @@ fn positions_arrive_intact() {
     client.apply(&wire.sent);
 
     let got = client.pos_of(e).expect("the entity must have arrived");
-    assert!(close(got, DVec2::new(37.5, -42.25)), "got {got:?}");
+    assert!(close(got, DVec3::new(37.5, -42.25, 0.0)), "got {got:?}");
 }
 
 /// The client learns the component name table from the header chunk, and

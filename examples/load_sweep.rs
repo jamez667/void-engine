@@ -324,7 +324,17 @@ impl Sim {
             self.world.get::<Transform2D>(id).map(|t| t.pos).unwrap_or(DVec2::ZERO),
             self.world.get::<Velocity>(id).map(|v| v.linear).unwrap_or(DVec2::ZERO),
         );
-        EntityItem { kind, entity: id, pos, rot: 0.0, vel, component: NameId(0) }
+        // This sweep drives a 2D world, so z is zero and the quaternion is
+        // identity. They still cost their wire bits — which is the point
+        // of measuring with them present.
+        EntityItem {
+            kind,
+            entity: id,
+            pos: pos.extend(0.0),
+            rot: glam::Quat::IDENTITY,
+            vel: vel.extend(0.0),
+            component: NameId(0),
+        }
     }
 
     /// One full server tick for every client, timed by phase.

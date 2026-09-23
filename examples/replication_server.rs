@@ -229,7 +229,14 @@ impl Server {
             world.get::<Transform2D>(id).map(|t| t.pos).unwrap_or(DVec2::ZERO),
             world.get::<Velocity>(id).map(|v| v.linear).unwrap_or(DVec2::ZERO),
         );
-        EntityItem { kind, entity: id, pos, rot: 0.0, vel, component: NameId(0) }
+        EntityItem {
+            kind,
+            entity: id,
+            pos: pos.extend(0.0),
+            rot: glam::Quat::IDENTITY,
+            vel: vel.extend(0.0),
+            component: NameId(0),
+        }
     }
 }
 
@@ -494,7 +501,7 @@ async fn client_task(
     // Keyed by entity index: an `Updated` carries no generation, so the
     // full `EntityId` would file it under a different key than the
     // `Entered` that introduced the entity. See `EntityItem::key`.
-    let mut entities: HashMap<u32, DVec2> = HashMap::new();
+    let mut entities: HashMap<u32, glam::DVec3> = HashMap::new();
     let mut names: HashMap<NameId, String> = HashMap::new();
     let mut applied = 0u32;
 

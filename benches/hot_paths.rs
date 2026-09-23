@@ -178,9 +178,9 @@ fn snapshot_encode_per_tick(clients: usize, per_client: usize) -> f64 {
             // is roughly what a moving crowd produces.
             kind: if i % 16 == 0 { ItemKind::Entered } else { ItemKind::Updated },
             entity: EntityId { index: i, generation: 1 },
-            pos: DVec2::new((i % 900) as f64 - 450.0, (i % 700) as f64 - 350.0),
-            rot: 0.3,
-            vel: DVec2::new(9.0, -4.0),
+            pos: DVec2::new((i % 900) as f64 - 450.0, (i % 700) as f64 - 350.0).extend(0.0),
+            rot: glam::Quat::IDENTITY,
+            vel: DVec2::new(9.0, -4.0).extend(0.0),
             component: NameId(3),
         })
         .collect();

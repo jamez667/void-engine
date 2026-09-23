@@ -43,20 +43,37 @@
 //!
 //! # Budget
 //!
-//! A delta item costs ~16 B and the scalar core ~13 B. Measured by
-//! growing a packet one item at a time against the conservative 1200 B
-//! floor, 93 items fit a datagram with no bulk header, fewer when the
-//! name table rides along.
+//! A delta item cost ~16 B and the scalar core ~13 B while this was a 2D
+//! format, and 93 items fit the conservative 1200 B datagram floor with
+//! no bulk header.
 //!
-//! A steady-state delta — a few arrivals and departures plus whatever
-//! moved — is one datagram: 40 items encode to 484 B. A full keyframe
-//! over a thousand-odd visible entities is not, and chunks; that is
-//! precisely what `send_chunked` is for. A 1834-item keyframe lands in
-//! 34 datagrams once that connection's [`ChunkHint`] has converged.
+//! **The 3D widening moved both.** An item gained a third position axis,
+//! a third velocity axis, and a three-component quaternion in place of a
+//! scalar angle. Re-measured by
+//! `measure_item_cost_and_items_per_datagram`:
+//!
+//! | | 2D | 3D |
+//! | --- | --- | --- |
+//! | item | ~16 B | **18 B** |
+//! | items per datagram | 93 | **63** |
+//!
+//! Note the item grew less than the naive sum of its new fields (+7 B)
+//! would suggest — quantised fields are bit-packed, not byte-aligned —
+//! but items per datagram fell further than the item cost alone explains,
+//! because the floor is shared with a scalar core that did not shrink.
+//! Both numbers are measured, not estimated; an earlier revision of this
+//! comment guessed "~74 items" and was wrong.
+//!
+//! The end-to-end figures (a 40-item delta at 484 B, a 1834-item keyframe
+//! in 34 datagrams) have *not* been re-measured. `examples/load_sweep.rs`
+//! exists for that and should be run before anyone plans around them.
+//! What has not changed is the shape: a steady-state delta is still one
+//! datagram and a full keyframe still chunks, which is what
+//! `send_chunked` is for.
 //!
 //! [`ChunkHint`]: super::chunk::ChunkHint
 
-use glam::DVec2;
+use glam::{DVec3, Quat};
 
 use super::bitpack::{BitError, BitReader, BitWriter};
 use super::chunk::Chunkable;
@@ -66,8 +83,18 @@ use crate::persist::registry::{NameId, Registry};
 /// Bits per position axis. Over a 1 km sector this is ~1.5 cm, which is
 /// finer than a player can perceive at any sane rendering scale.
 pub const POS_BITS: u32 = 16;
-/// Bits for rotation, over ±π. ~0.09° — well inside what interpolation
-/// smooths over anyway.
+/// Bits per rotation *component*, over ±1.
+///
+/// A quaternion since Phase 5. The x, y and z components are sent and `w`
+/// is reconstructed as `sqrt(1 - x² - y² - z²)` on the far side, which
+/// costs three components rather than four and is exact up to the sign of
+/// `w`. That sign is not sent because `q` and `-q` name the same
+/// rotation, so recovering the positive root always yields the right
+/// orientation.
+///
+/// 12 bits over ±1 is ~0.0005 per component — finer than the ~0.09° the
+/// scalar 2D encoding gave, and well inside what interpolation smooths
+/// over.
 pub const ROT_BITS: u32 = 12;
 /// Bits per velocity axis, over [`MAX_SPEED`].
 pub const VEL_BITS: u32 = 16;
@@ -98,12 +125,41 @@ pub struct EntityItem {
     pub entity: EntityId,
     /// Sector-local position. See the module docs on why this is not a
     /// world coordinate.
-    pub pos: DVec2,
-    pub rot: f32,
-    pub vel: DVec2,
+    ///
+    /// `DVec3` since the 3D simulation landed (Phase 5 of
+    /// `docs/3d-spec.md`). A 2D game leaves `z` at zero and pays
+    /// [`POS_BITS`] for it — 2 bytes per entity per snapshot — which is
+    /// the cost of one wire format rather than two.
+    pub pos: DVec3,
+    /// Orientation as a quaternion.
+    ///
+    /// Was a scalar `f32` in radians while the engine was 2D. A single
+    /// angle describes every 2D orientation and no 3D one, so this is the
+    /// one field that could not simply widen: see [`ROT_BITS`] for how it
+    /// is quantised.
+    pub rot: Quat,
+    pub vel: DVec3,
     /// Which component this item's payload belongs to, interned against
     /// the table in the packet header.
     pub component: NameId,
+}
+
+/// Put a quaternion in the form the wire encoding expects: unit length,
+/// with `w >= 0`.
+///
+/// `q` and `-q` name the same rotation, so choosing the positive-`w`
+/// representative costs nothing and lets the decoder recover `w` as a
+/// positive square root instead of spending a bit on its sign.
+///
+/// A zero or non-finite quaternion has no orientation to send; identity
+/// is the honest substitute, and it keeps NaN off the wire.
+#[inline]
+fn normalised_for_wire(q: Quat) -> Quat {
+    if !q.is_finite() || q.length_squared() <= f32::EPSILON {
+        return Quat::IDENTITY;
+    }
+    let q = q.normalize();
+    if q.w < 0.0 { -q } else { q }
 }
 
 impl EntityItem {
@@ -112,9 +168,9 @@ impl EntityItem {
         Self {
             kind: ItemKind::Left,
             entity,
-            pos: DVec2::ZERO,
-            rot: 0.0,
-            vel: DVec2::ZERO,
+            pos: DVec3::ZERO,
+            rot: Quat::IDENTITY,
+            vel: DVec3::ZERO,
             component: NameId(0),
         }
     }
@@ -274,9 +330,17 @@ impl SnapshotPacket {
                 w.write_varint(item.component.0 as u64);
                 w.write_quantised(item.pos.x, half_extent, POS_BITS);
                 w.write_quantised(item.pos.y, half_extent, POS_BITS);
-                w.write_quantised(item.rot as f64, std::f64::consts::PI, ROT_BITS);
+                w.write_quantised(item.pos.z, half_extent, POS_BITS);
+                // Send the quaternion with `w` non-negative, so the far
+                // side can recover it as the positive root. `q` and `-q`
+                // are the same rotation, so flipping is free.
+                let q = normalised_for_wire(item.rot);
+                w.write_quantised(q.x as f64, 1.0, ROT_BITS);
+                w.write_quantised(q.y as f64, 1.0, ROT_BITS);
+                w.write_quantised(q.z as f64, 1.0, ROT_BITS);
                 w.write_quantised(item.vel.x, MAX_SPEED, VEL_BITS);
                 w.write_quantised(item.vel.y, MAX_SPEED, VEL_BITS);
+                w.write_quantised(item.vel.z, MAX_SPEED, VEL_BITS);
             }
         }
     }
@@ -353,12 +417,24 @@ impl SnapshotPacket {
                 continue;
             }
             let component = NameId(r.read_varint()? as u16);
-            let pos = DVec2::new(
+            let pos = DVec3::new(
+                r.read_quantised(half_extent, POS_BITS)?,
                 r.read_quantised(half_extent, POS_BITS)?,
                 r.read_quantised(half_extent, POS_BITS)?,
             );
-            let rot = r.read_quantised(std::f64::consts::PI, ROT_BITS)? as f32;
-            let vel = DVec2::new(
+            // Three components off the wire; `w` is the positive root of
+            // what is left. The encoder guarantees `w >= 0` by sending
+            // `-q` where needed, so the positive root is the right one.
+            let qx = r.read_quantised(1.0, ROT_BITS)? as f32;
+            let qy = r.read_quantised(1.0, ROT_BITS)? as f32;
+            let qz = r.read_quantised(1.0, ROT_BITS)? as f32;
+            // Quantisation can push the sum a hair over 1, which would
+            // make the root imaginary — clamp at zero rather than emit a
+            // NaN quaternion that silently corrupts every pose it touches.
+            let qw = (1.0 - (qx * qx + qy * qy + qz * qz)).max(0.0).sqrt();
+            let rot = Quat::from_xyzw(qx, qy, qz, qw).normalize();
+            let vel = DVec3::new(
+                r.read_quantised(MAX_SPEED, VEL_BITS)?,
                 r.read_quantised(MAX_SPEED, VEL_BITS)?,
                 r.read_quantised(MAX_SPEED, VEL_BITS)?,
             );
@@ -414,9 +490,9 @@ mod tests {
         EntityItem {
             kind,
             entity: ent(index),
-            pos: DVec2::new(1.5, -2.5),
-            rot: 0.25,
-            vel: DVec2::new(10.0, -10.0),
+            pos: DVec3::new(1.5, -2.5, 3.25),
+            rot: Quat::from_rotation_z(0.25),
+            vel: DVec3::new(10.0, -10.0, 4.0),
             component: NameId(3),
         }
     }
@@ -478,14 +554,87 @@ mod tests {
         let pos_step = (2.0 * HALF) / ((1u64 << POS_BITS) - 1) as f64;
         assert!((a.pos.x - b.pos.x).abs() <= pos_step);
         assert!((a.pos.y - b.pos.y).abs() <= pos_step);
+        assert!(
+            (a.pos.z - b.pos.z).abs() <= pos_step,
+            "z must survive the round trip like x and y: sent {}, got {}",
+            a.pos.z,
+            b.pos.z,
+        );
 
-        let rot_step = (2.0 * std::f64::consts::PI) / ((1u64 << ROT_BITS) - 1) as f64;
-        assert!((a.rot - b.rot).abs() as f64 <= rot_step);
+        // Rotations compare by the angle between them rather than
+        // componentwise: two quaternions can differ in every component and
+        // still name nearly the same orientation. Three components at
+        // ROT_BITS each, plus the reconstructed w, so the worst case is
+        // roughly three steps of accumulated error.
+        let rot_step = 2.0 / ((1u64 << ROT_BITS) - 1) as f32;
+        let angle = a.rot.angle_between(b.rot);
+        assert!(
+            angle <= rot_step * 4.0,
+            "orientation drifted {angle} rad, more than the {} the \
+             quantisation allows",
+            rot_step * 4.0,
+        );
 
         let vel_step = (2.0 * MAX_SPEED) / ((1u64 << VEL_BITS) - 1) as f64;
         assert!((a.vel.x - b.vel.x).abs() <= vel_step);
+        assert!(
+            (a.vel.z - b.vel.z).abs() <= vel_step,
+            "velocity z must survive too: sent {}, got {}",
+            a.vel.z,
+            b.vel.z,
+        );
         assert_eq!(a.entity, b.entity);
         assert_eq!(a.component, b.component);
+    }
+
+    /// Only three quaternion components go on the wire; `w` is recovered
+    /// as a positive square root. That works because the encoder sends
+    /// `-q` whenever `w` is negative, and `q` and `-q` name the same
+    /// rotation — so a rotation past 180°, whose natural `w` is negative,
+    /// must still arrive correct.
+    ///
+    /// Without the sign flip this comes back as the *inverse* rotation,
+    /// which for a player model is a character facing backwards.
+    #[test]
+    fn a_rotation_with_negative_w_survives_the_three_component_encoding() {
+        // 270° about Z: w = cos(135°) < 0.
+        let sent = Quat::from_rotation_z(std::f32::consts::PI * 1.5);
+        assert!(sent.w < 0.0, "precondition: this rotation must have w < 0");
+
+        let mut p = packet(1, 1);
+        p.items[0].rot = sent;
+        let got = decode(&p).items[0].rot;
+
+        let angle = sent.angle_between(got);
+        assert!(
+            angle < 0.01,
+            "a rotation with negative w came back {angle} rad away from \
+             what was sent — the encoder is not flipping to the positive-w \
+             representative, so the decoder recovers the inverse rotation",
+        );
+    }
+
+    /// Quantisation can push x²+y²+z² a hair above 1, making the root for
+    /// `w` imaginary. Clamping at zero keeps a NaN quaternion off the
+    /// wire; without it the pose silently corrupts everything it touches.
+    #[test]
+    fn a_rotation_near_the_quantisation_edge_does_not_decode_to_nan() {
+        // 180° about an axis with no w left over — the worst case for the
+        // reconstruction, since w is exactly zero there.
+        let sent = Quat::from_axis_angle(
+            glam::Vec3::new(1.0, 1.0, 1.0).normalize(),
+            std::f32::consts::PI,
+        );
+        let mut p = packet(1, 1);
+        p.items[0].rot = sent;
+        let got = decode(&p).items[0].rot;
+        assert!(got.is_finite(), "decoded quaternion was {got:?}");
+        assert!(
+            (got.length() - 1.0).abs() < 1e-3,
+            "decoded quaternion has length {}, so it scales geometry as \
+             well as rotating it",
+            got.length(),
+        );
     }
 
     /// Generation rides arrivals and departures, not updates — and the
@@ -545,6 +694,28 @@ mod tests {
         let empty = packet(0, 0).encode(HALF).len();
         let one   = packet(0, 1).encode(HALF).len();
         assert!(one - empty < 32, "one item costs {} B", one - empty);
+    }
+
+    /// Report the real per-item cost and items-per-datagram after the 3D
+    /// widening, so the module docs quote a measured number rather than an
+    /// estimate. Printed rather than asserted tightly: the point is the
+    /// figure, and pinning it exactly would fail on any future tweak.
+    #[test]
+    fn measure_item_cost_and_items_per_datagram() {
+        let empty = packet(0, 0).encode(HALF).len();
+        let one = packet(0, 1).encode(HALF).len();
+        let per_item = one - empty;
+
+        let mut fits = 0usize;
+        for n in 1..400usize {
+            if packet(0, n).encode(HALF).len() <= MIN_DATAGRAM_BUDGET {
+                fits = n;
+            } else {
+                break;
+            }
+        }
+        eprintln!("[3d-wire] item={per_item} B, core={empty} B, items/datagram={fits}");
+        assert!(per_item > 0 && fits > 0);
     }
 
     #[test]
@@ -658,3 +829,4 @@ mod tests {
         assert!(!names.contains(&"hidden"), "a server-only component must not be advertised");
     }
 }
+
