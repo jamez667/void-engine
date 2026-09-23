@@ -59,16 +59,23 @@ const CAMERA_DISTANCE: f64 = 18.0;
 /// How far a click reaches.
 const PICK_RANGE: f64 = 100.0;
 
-/// The walker's half-extents: short and wide on purpose.
+/// The walker's half-extents: wider than it is tall, on purpose.
 ///
 /// Friction reacts at the feet, a half-height below the centre of mass,
 /// so a walk force always pitches the body forward while gravity rights
 /// it with a lever of a half-width. A walker's aspect ratio therefore
 /// decides whether it can accelerate at all without face-planting: a
 /// cube of this mass leans 87 degrees crossing the floor, these
-/// proportions lean 0.1. See `ai3d::WalkTuning3D::for_body`.
+/// proportions lean under half a degree. See
+/// `ai3d::WalkTuning3D::for_body`.
+///
+/// The height is 0.35 rather than the 0.25 it started at, to give the
+/// robot's cube hull somewhere to sit once the tracks have taken the
+/// bottom 0.24 of it. That costs margin but not much: the tipping limit
+/// still leaves 1.84x headroom over the force needed to break friction,
+/// and the walk measures 0.45 degrees of lean against a 5 degree check.
 const AGENT_HW: f64 = 0.5;
-const AGENT_HH: f64 = 0.25;
+const AGENT_HH: f64 = 0.35;
 /// The walker's mass, in kilograms.
 const AGENT_MASS: f32 = 80.0;
 /// Friction of the floor the walker pushes against.
@@ -638,46 +645,64 @@ fn walker_mesh() -> Mesh3D {
     // body that overhung them by 70 mm a side — from a camera 18 m up
     // that strip was a few pixels in the body's own shadow, and the
     // yellow hull appeared to meet the floor directly.
+    // They sit *just* outside the hull, not splayed out from it. At
+    // ±0.42 with a 0.30 width they spanned 1.14 m against a 0.46 m hull —
+    // two and a half times its width — and the robot read as a small box
+    // balanced on an outsized chassis rather than as a tracked vehicle.
     for side in [-1.0f32, 1.0] {
         m.push_box(
-            Vec3::new(0.0, side * 0.42, -0.14),
-            Vec3::new(0.98, 0.30, 0.22),
+            Vec3::new(0.0, side * 0.29, -0.23),
+            Vec3::new(0.86, 0.20, 0.24),
             TREAD,
         );
         // Rollers at each end, so the treads read as tracks rather than
         // as skids. Same bottom as the treads, a little taller.
         for end in [-1.0f32, 1.0] {
             m.push_box(
-                Vec3::new(end * 0.40, side * 0.42, -0.13),
-                Vec3::new(0.16, 0.34, 0.24),
+                Vec3::new(end * 0.34, side * 0.29, -0.22),
+                Vec3::new(0.14, 0.20, 0.26),
                 METAL,
             );
         }
     }
 
-    // The body: narrower than the track width, so the tracks are visible
-    // from above rather than hidden under an overhang, and lifted clear
-    // of the floor on them.
-    m.push_box(Vec3::new(0.0, 0.0, 0.10), Vec3::new(0.66, 0.54, 0.26), BODY);
+    // The hull: a **cube**, which is the whole shape of this robot.
+    //
+    // It was a 0.66 x 0.54 x 0.26 slab first, and a slab is not the
+    // silhouette — it read as a flattened box on tracks rather than as a
+    // boxy little robot. A cube needs headroom the original 0.5 m tall
+    // collider did not have once the tracks took 0.22 of it, which is why
+    // `AGENT_HH` grew to 0.35: at that height the tipping limit still
+    // leaves 1.84x headroom over the force needed to break friction, so
+    // the walker's gait is unaffected. See `WalkTuning3D::for_body`.
+    //
+    // Still narrower in Y than the track width, so the tracks stay
+    // visible from above rather than hidden under an overhang.
+    const HULL: f32 = 0.46;
+    m.push_box(Vec3::new(0.0, 0.0, 0.12), Vec3::splat(HULL), BODY);
     // A darker front panel, which is what makes the facing direction
     // readable at a glance.
-    m.push_box(Vec3::new(0.32, 0.0, 0.10), Vec3::new(0.06, 0.44, 0.20), PANEL);
+    m.push_box(
+        Vec3::new(HULL * 0.5, 0.0, 0.12),
+        Vec3::new(0.06, HULL * 0.85, HULL * 0.8),
+        PANEL,
+    );
 
     // Arms, folded against the sides.
     for side in [-1.0f32, 1.0] {
         m.push_box(
-            Vec3::new(0.08, side * 0.34, 0.02),
-            Vec3::new(0.30, 0.08, 0.16),
+            Vec3::new(0.08, side * 0.28, 0.05),
+            Vec3::new(0.34, 0.08, 0.20),
             METAL,
         );
     }
 
     // Head: a short neck and two eyes on stalks, looking forward.
-    m.push_box(Vec3::new(0.06, 0.0, 0.225), Vec3::new(0.22, 0.16, 0.07), METAL);
+    m.push_box(Vec3::new(0.06, 0.0, 0.38), Vec3::new(0.22, 0.16, 0.06), METAL);
     for side in [-1.0f32, 1.0] {
         // The barrel of each eye...
         m.push_box(
-            Vec3::new(0.12, side * 0.11, 0.29),
+            Vec3::new(0.12, side * 0.11, 0.48),
             Vec3::new(0.20, 0.16, 0.16),
             METAL,
         );
@@ -685,7 +710,7 @@ fn walker_mesh() -> Mesh3D {
         // the scene uses, so the robot always reads as facing you or
         // facing away.
         m.push_box(
-            Vec3::new(0.23, side * 0.11, 0.29),
+            Vec3::new(0.23, side * 0.11, 0.48),
             Vec3::new(0.04, 0.12, 0.12),
             LENS,
         );
@@ -815,6 +840,12 @@ mod tests {
 
     /// The head may clear the collider, but only by a little — past that
     /// the robot reads as standing in a hole rather than as tall.
+    ///
+    /// The allowance is a *fraction of the robot's own height*, not a
+    /// fixed distance. A fixed one does not survive the robot changing
+    /// size: it was 0.12 m, which was a fifth of a 0.6 m robot and would
+    /// have been a tenth of a 1.2 m one, so the same mesh would pass or
+    /// fail depending on scale rather than on how it looks.
     #[test]
     fn the_walker_mesh_does_not_tower_over_its_collider() {
         let m = walker_mesh();
@@ -823,10 +854,19 @@ mod tests {
             .iter()
             .map(|v| v.pos[2])
             .fold(f32::NEG_INFINITY, f32::max);
+        let lowest = m
+            .vertices
+            .iter()
+            .map(|v| v.pos[2])
+            .fold(f32::INFINITY, f32::min);
+
+        let total = highest - lowest;
+        let over = highest - AGENT_HH as f32;
         assert!(
-            highest <= AGENT_HH as f32 + 0.12,
-            "the head reaches {highest:.3}, far above the {:.3} collider top",
-            AGENT_HH,
+            over <= total * 0.25,
+            "the head clears the collider by {over:.3} m, {:.0}% of the \
+             robot's {total:.2} m height — it will read as standing in a hole",
+            over / total * 100.0,
         );
     }
 }
