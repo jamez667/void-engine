@@ -82,6 +82,13 @@ const TARGET_LAYERS: u32 = 3;
 /// How grippy a crate is. See `drop_crate` for why it decides whether a
 /// stack stands or slides apart.
 const CRATE_FRICTION: f32 = 0.8;
+/// The floor's shade. Named because the walker's treads have to stay
+/// clear of it — see `walker_mesh`.
+const FLOOR_COLOUR: [f32; 4] = [0.22, 0.24, 0.28, 1.0];
+/// The walker's track colour, near black so it never merges into the
+/// floor. Module-level so the mesh tests can identify the tracks by
+/// colour rather than by guessing at their position.
+const TREAD_COLOUR: [f32; 4] = [0.06, 0.06, 0.07, 1.0];
 
 /// The floor the agent may walk on.
 ///
@@ -213,7 +220,7 @@ impl Game {
             rigid: RigidBody::static_body()
                 .with_material(Material3D { restitution: 0.1, friction: 0.7 }),
             collider: Collider3D::box3d(floor_half[0], floor_half[1], floor_half[2]),
-            colour: [0.22, 0.24, 0.28, 1.0],
+            colour: FLOOR_COLOUR,
             slot,
             carried: false,
             dynamic_mass: (0.0, glam::Mat3::ZERO),
@@ -256,7 +263,12 @@ impl Game {
             )
             .with_material(Material3D { restitution: 0.0, friction: FLOOR_FRICTION }),
             collider,
-            colour: [0.95, 0.72, 0.20, 1.0],
+            // White, because the walker's colours are baked into its mesh
+            // per part. The shader multiplies vertex colour by this tint,
+            // so anything else here would wash every part through the
+            // same filter — while white leaves the selection-brighten and
+            // sleep-dim paths still working on it.
+            colour: [1.0, 1.0, 1.0, 1.0],
             slot,
             carried: false,
             dynamic_mass: (0.0, glam::Mat3::ZERO),
@@ -579,6 +591,262 @@ impl Game {
     }
 }
 
+/// The walker, as a little tracked trash robot rather than a box.
+///
+/// Built from boxes in the body's **local** space, where `+X` is the
+/// direction it walks and `+Z` is up. The physics collider stays the
+/// plain box it always was — this is cosmetic geometry, and the eyes
+/// deliberately poke a few centimetres above the collider because a
+/// silhouette that reads as a face is worth more than a mesh that fits
+/// its own hitbox exactly.
+///
+/// Part colours are baked into the vertices. The shader multiplies
+/// vertex colour by the per-instance tint, so the agent is drawn with a
+/// white tint and each part keeps its own shade — which is also why the
+/// sleep-dimming and selection-brightening still work on it.
+fn walker_mesh() -> Mesh3D {
+    // Deliberately NOT the floor's own dark grey (0.22, 0.24, 0.28).
+    //
+    // The treads are the part that touches the ground, and at the first
+    // attempt they were within a few percent of the floor colour — so the
+    // bottom 160 mm of the robot merged into it and the yellow body above
+    // read as buried to its waist. The mesh was sitting exactly on the
+    // floor the whole time; it was the contrast that was wrong. Near
+    // black separates it from the mid-grey floor at any light level.
+    const TREAD: [f32; 4] = TREAD_COLOUR;
+    const BODY: [f32; 4] = [0.95, 0.72, 0.20, 1.0];
+    const PANEL: [f32; 4] = [0.75, 0.55, 0.14, 1.0];
+    const METAL: [f32; 4] = [0.55, 0.57, 0.60, 1.0];
+    const LENS: [f32; 4] = [0.10, 0.65, 0.85, 1.0];
+
+    let mut m = Mesh3D::new();
+
+    // Everything below is laid out **bottom-up from the collider's own
+    // bottom face**, which is at local z = -0.25. Nothing may go below
+    // that or the robot is drawn buried: the body rests with its centre
+    // a half-height above the floor, so local -0.25 *is* the ground.
+    //
+    // The head is allowed above the collider — a silhouette that reads as
+    // a face is worth more than a mesh that fits its own hitbox exactly —
+    // but only just, or the robot looks like it is standing in a hole.
+
+    // Treads: two near-black blocks along the sides, flat on the floor.
+    //
+    // **They must be wider than the body and a real fraction of its
+    // height**, or the robot looks like it is standing in the ground. At
+    // the first attempt they were a 140 mm strip tucked under a 300 mm
+    // body that overhung them by 70 mm a side — from a camera 18 m up
+    // that strip was a few pixels in the body's own shadow, and the
+    // yellow hull appeared to meet the floor directly.
+    for side in [-1.0f32, 1.0] {
+        m.push_box(
+            Vec3::new(0.0, side * 0.42, -0.14),
+            Vec3::new(0.98, 0.30, 0.22),
+            TREAD,
+        );
+        // Rollers at each end, so the treads read as tracks rather than
+        // as skids. Same bottom as the treads, a little taller.
+        for end in [-1.0f32, 1.0] {
+            m.push_box(
+                Vec3::new(end * 0.40, side * 0.42, -0.13),
+                Vec3::new(0.16, 0.34, 0.24),
+                METAL,
+            );
+        }
+    }
+
+    // The body: narrower than the track width, so the tracks are visible
+    // from above rather than hidden under an overhang, and lifted clear
+    // of the floor on them.
+    m.push_box(Vec3::new(0.0, 0.0, 0.10), Vec3::new(0.66, 0.54, 0.26), BODY);
+    // A darker front panel, which is what makes the facing direction
+    // readable at a glance.
+    m.push_box(Vec3::new(0.32, 0.0, 0.10), Vec3::new(0.06, 0.44, 0.20), PANEL);
+
+    // Arms, folded against the sides.
+    for side in [-1.0f32, 1.0] {
+        m.push_box(
+            Vec3::new(0.08, side * 0.34, 0.02),
+            Vec3::new(0.30, 0.08, 0.16),
+            METAL,
+        );
+    }
+
+    // Head: a short neck and two eyes on stalks, looking forward.
+    m.push_box(Vec3::new(0.06, 0.0, 0.225), Vec3::new(0.22, 0.16, 0.07), METAL);
+    for side in [-1.0f32, 1.0] {
+        // The barrel of each eye...
+        m.push_box(
+            Vec3::new(0.12, side * 0.11, 0.29),
+            Vec3::new(0.20, 0.16, 0.16),
+            METAL,
+        );
+        // ...and the lens on the front of it, in a colour nothing else in
+        // the scene uses, so the robot always reads as facing you or
+        // facing away.
+        m.push_box(
+            Vec3::new(0.23, side * 0.11, 0.29),
+            Vec3::new(0.04, 0.12, 0.12),
+            LENS,
+        );
+    }
+
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The robot must stand **on** the floor, not in it.
+    ///
+    /// Its body rests with the centre a half-height up, so local
+    /// z = -AGENT_HH is the ground plane. Any vertex below that is drawn
+    /// underground, and because the treads are the lowest and darkest
+    /// part it reads as the whole robot having sunk. Measured when this
+    /// was first built: the rollers hung 30 mm through the floor.
+    #[test]
+    fn the_walker_mesh_stands_on_the_floor() {
+        let m = walker_mesh();
+        let lowest = m
+            .vertices
+            .iter()
+            .map(|v| v.pos[2])
+            .fold(f32::INFINITY, f32::min);
+        let ground = -(AGENT_HH as f32);
+        assert!(
+            lowest >= ground - 1e-5,
+            "the mesh reaches {lowest:.3} but the floor is at {ground:.3},              so it is drawn {:.0} mm underground",
+            (ground - lowest) * 1000.0,
+        );
+    }
+
+    /// And it must not float either: something has to actually touch.
+    #[test]
+    fn the_walker_mesh_touches_the_floor() {
+        let m = walker_mesh();
+        let lowest = m
+            .vertices
+            .iter()
+            .map(|v| v.pos[2])
+            .fold(f32::INFINITY, f32::min);
+        let ground = -(AGENT_HH as f32);
+        assert!(
+            (lowest - ground).abs() < 0.01,
+            "the mesh's lowest point is {:.0} mm above the floor, so the              robot hovers",
+            (lowest - ground) * 1000.0,
+        );
+    }
+
+    /// The part that touches the ground must not be the ground's colour.
+    ///
+    /// This is what actually made the robot look buried, and no geometry
+    /// test would have caught it: the mesh was sitting exactly on the
+    /// floor, but the treads were within a few percent of the floor's own
+    /// grey, so the bottom 160 mm merged into it and the body above read
+    /// as sunk to its waist. Wrong contrast, right position.
+    #[test]
+    fn the_treads_stand_out_against_the_floor() {
+        let m = walker_mesh();
+        // The lowest vertices are the treads; sample their colour.
+        let ground = -(AGENT_HH as f32);
+        let tread = m
+            .vertices
+            .iter()
+            .find(|v| (v.pos[2] - ground).abs() < 1e-4)
+            .expect("something must touch the floor")
+            .color;
+
+        // Sum of channel differences: a crude but honest stand-in for
+        // "can a person tell these apart at a glance".
+        let diff: f32 = (0..3).map(|i| (tread[i] - FLOOR_COLOUR[i]).abs()).sum();
+        assert!(
+            diff > 0.25,
+            "the treads {tread:?} are within {diff:.3} of the floor \
+             {FLOOR_COLOUR:?}, so the robot's base disappears into it",
+        );
+    }
+
+    /// The tracks must be visible from above, not hidden under the body.
+    ///
+    /// The second thing that made the robot look sunk, and again not a
+    /// position bug: the body was 0.62 wide over tracks at ±0.38, so it
+    /// overhung them by 70 mm a side. From a camera 18 m up, the tracks
+    /// were a few pixels of near-black in the body's own shadow, and the
+    /// yellow hull appeared to meet the floor directly. The widest thing
+    /// at ground level has to be the tracks.
+    #[test]
+    fn the_tracks_are_wider_than_the_body() {
+        let m = walker_mesh();
+        let ground = -(AGENT_HH as f32);
+
+        // Half-width of whatever touches the floor...
+        let track_half = m
+            .vertices
+            .iter()
+            .filter(|v| (v.pos[2] - ground).abs() < 1e-4)
+            .map(|v| v.pos[1].abs())
+            .fold(0.0f32, f32::max);
+        // ...against the half-width of the bulk clear above them.
+        //
+        // The tracks are identified by *colour*, not by position. Keying
+        // on "whatever is far out in Y" is circular: widen the body and
+        // it starts matching the filter, so the test compares the body
+        // against itself and passes no matter how badly it overhangs.
+        // Nothing may be wider than the running gear. Stated that way
+        // round it is not circular: it asks of *every* vertex whether it
+        // sticks out past what touches the floor, so widening the body
+        // fails it immediately. Asking instead for "the widest thing that
+        // is not the tracks" needs a rule for what counts as the tracks,
+        // and every such rule the body can grow into is a rule that makes
+        // the test compare the body against itself.
+        let widest = m
+            .vertices
+            .iter()
+            .map(|v| v.pos[1].abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            widest <= track_half + 1e-4,
+            "something reaches {widest:.3} out while the tracks only reach \
+             {track_half:.3}, so it overhangs them and hides them from view",
+        );
+    }
+
+    /// The head may clear the collider, but only by a little — past that
+    /// the robot reads as standing in a hole rather than as tall.
+    #[test]
+    fn the_walker_mesh_does_not_tower_over_its_collider() {
+        let m = walker_mesh();
+        let highest = m
+            .vertices
+            .iter()
+            .map(|v| v.pos[2])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            highest <= AGENT_HH as f32 + 0.12,
+            "the head reaches {highest:.3}, far above the {:.3} collider top",
+            AGENT_HH,
+        );
+    }
+}
+
+/// Write a frame out as a binary PPM.
+///
+/// PPM because it needs no dependency: a 15-byte header and raw RGB. Any
+/// image viewer or converter reads it, and adding an encoder crate to an
+/// example for the sake of a debug dump is not worth the build time.
+fn write_ppm(path: &str, shot: &void_engine::renderer::ScreenshotData) {
+    let mut out = format!("P6
+{} {}
+255
+", shot.width, shot.height).into_bytes();
+    for px in shot.pixels.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    let _ = std::fs::write(path, out);
+}
+
 /// Distinct colours so crates are tellable apart.
 fn crate_colour(n: usize) -> [f32; 4] {
     const PALETTE: [[f32; 4]; 6] = [
@@ -770,13 +1038,7 @@ impl ClientApp for Game {
             );
             self.floor_mesh = f.is_empty().then_some(None).flatten().or(r.upload_mesh(&f).ok());
 
-            let mut w = Mesh3D::new();
-            w.push_box(
-                Vec3::ZERO,
-                Vec3::new(AGENT_HW as f32 * 2.0, AGENT_HW as f32 * 2.0, AGENT_HH as f32 * 2.0),
-                [1.0; 4],
-            );
-            self.agent_mesh = r.upload_mesh(&w).ok();
+            self.agent_mesh = r.upload_mesh(&walker_mesh()).ok();
         }
 
         // A click recorded last tick is resolved now, against the camera
@@ -818,7 +1080,26 @@ impl ClientApp for Game {
 
             // Camera-relative, subtracting in f64 before the cast — the
             // precision contract the whole 3D path follows.
-            let model = b.transform.model_matrix(eye);
+            let model = if i == self.agent_body {
+                // The walker is drawn facing where it *walks*, not where
+                // the solver left it.
+                //
+                // Nothing ever yaws the body deliberately — it is a box
+                // pushed along by a centre-of-mass force — so its
+                // rotation is contact noise, and a robot built from it
+                // would spin on the spot while driving in a straight
+                // line. `StackTask::facing` is the direction the agent is
+                // actually heading, slewed so corners are turns rather
+                // than flicks.
+                let f = self.task.facing();
+                let yaw = (f.y).atan2(f.x) as f32;
+                Mat4::from_rotation_translation(
+                    Quat::from_rotation_z(yaw),
+                    (b.transform.pos - eye).as_vec3(),
+                )
+            } else {
+                b.transform.model_matrix(eye)
+            };
 
             let mut tint = b.colour;
             if Some(i) == self.selected {
@@ -873,6 +1154,13 @@ impl Game {
             eprintln!("VERIFY FAIL: no screenshot was captured");
             std::process::exit(1);
         };
+
+        // Dump the frame when asked, so a human can look at the scene
+        // rather than only at the assertions below.
+        if let Ok(path) = std::env::var("CRATES3D_SHOT") {
+            write_ppm(&path, &shot);
+            eprintln!("[verify] wrote {path}");
+        }
 
         let px = &shot.pixels;
         let n = (px.len() / 4) as f64;

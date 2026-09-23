@@ -330,6 +330,19 @@ impl StackTask {
         }
     }
 
+    /// The horizontal direction the agent is heading, as a unit vector.
+    ///
+    /// Worth exposing because it is the only honest answer to "which way
+    /// is this thing pointing". The body's own rotation is not: nothing
+    /// ever yaws it deliberately — it is a box shoved along by a
+    /// centre-of-mass force — so its orientation is whatever the contact
+    /// solver last left it at, and a mesh oriented from it spins on the
+    /// spot. This is slewed rather than snapped, so it turns corners
+    /// smoothly instead of flicking between the grid's four directions.
+    pub fn facing(&self) -> DVec3 {
+        self.facing
+    }
+
     pub fn is_done(&self) -> bool {
         self.state == StackState::Done
     }
