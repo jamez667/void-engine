@@ -243,6 +243,19 @@ pub fn register_engine_components(registry: &mut Registry) -> Result<(), super::
     registry.register::<Velocity>("velocity", Persist::Volatile)?;
     registry.register::<Collider>("collider", Persist::Volatile)?;
     registry.register::<Destructible2D>("destructible2d", Persist::Volatile)?;
+    // 3D components, registered beside the 2D ones under distinct names.
+    // Adding names is additive: an existing save simply has no columns
+    // under these, and `restore` leaves what it does not find alone.
+    // Widening `Transform2D` instead would have changed the *bytes* of a
+    // name every existing save already carries, which the schema check
+    // turns into a hard `SchemaMismatch` — there is no migration path
+    // behind it. See `docs/3d-spec.md` §4.
+    //
+    // Note `velocity3d` rather than a suffix-free name: the 2D one took
+    // the plain `velocity`, so the 3D one cannot.
+    registry.register::<Transform3D>("transform3d", Persist::Volatile)?;
+    registry.register::<Velocity3D>("velocity3d", Persist::Volatile)?;
+    registry.register::<Collider3D>("collider3d", Persist::Volatile)?;
     // Particles are cosmetic and short-lived; restoring mid-flight sparks
     // is worse than letting them lapse.
     registry.register_transient::<Particle>("particle")?;

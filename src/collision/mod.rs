@@ -21,6 +21,14 @@
 
 pub mod grid;
 pub mod narrow;
+/// 3D narrowphase: sphere and oriented-box tests.
+///
+/// **Not** re-exported flat, unlike [`narrow`]. `obb_axes` and
+/// `obb_vs_obb` exist in both halves with different signatures, so
+/// flattening them here would either shadow the 2D names two shipped
+/// games already call or fail to compile. Reach for these as
+/// `collision::narrow3d::obb_vs_obb`.
+pub mod narrow3d;
 
 pub use grid::{AoiScratch, ColliderId, SpatialGrid};
 pub use narrow::{
