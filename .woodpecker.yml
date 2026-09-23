@@ -178,6 +178,19 @@ steps:
           exit 1
         }
 
+      # The rigid-body solver. Not feature-gated, so a broken cfg is not
+      # the risk here — the risk is the suite quietly shrinking, because
+      # almost every test in it encodes a physical property that is wrong
+      # in a way nobody notices from a screenshot: gravity that scales
+      # with mass, friction that is unbounded, a body that never sleeps.
+      - |
+        out=$(cargo test --lib physics3d:: 2>&1)
+        echo "$out"
+        echo "$out" | grep -q "37 passed" || {
+          echo "expected 37 rigid-body tests"
+          exit 1
+        }
+
       # The 3D renderer's unit tests, all behind `#[cfg(feature =
       # "render3d")]`. A broken gate makes every one of them vanish while
       # `cargo test --features render3d` still reports success, because
