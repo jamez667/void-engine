@@ -57,6 +57,29 @@ impl Renderer {
             }],
         });
 
+        // A second camera uniform for the 3D path, against the same
+        // layout. Two buffers rather than one rewritten per frame is what
+        // lets a 2D HUD sit over a 3D scene: the 3D pipeline binds this,
+        // the 2D batch keeps the one above, and neither overwrites the
+        // other's matrix.
+        #[cfg(feature = "render3d")]
+        let (camera_3d_buffer, camera_3d_bind_group) = {
+            let buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("camera_3d_buffer"),
+                contents: bytemuck::bytes_of(&camera_uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("camera_3d_bg"),
+                layout: &camera_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                }],
+            });
+            (buf, bg)
+        };
+
         // Glyph atlas, with a white texel reserved at its centre.
         //
         // This was a 1×1 white texture, and flat-coloured geometry still
@@ -362,6 +385,10 @@ impl Renderer {
             transient_handles: Vec::new(),
             #[cfg(feature = "render3d")]
             camera_3d: None,
+            #[cfg(feature = "render3d")]
+            camera_3d_buffer,
+            #[cfg(feature = "render3d")]
+            camera_3d_bind_group,
             offscreen_batch: Batch::new(),
             offscreen_vbuf,
             offscreen_ibuf,

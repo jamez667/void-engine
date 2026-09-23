@@ -178,19 +178,28 @@ impl Renderer {
             viewport_size: self.camera.viewport_size,
         };
         let uniform = cam_with_shake.build_uniform();
-        // A 3D camera, when set, replaces the 2D one for the whole frame:
-        // one uniform buffer, one bind group, so a frame is one or the
-        // other. `set_camera_3d` documents why mixing is a deliberate
-        // non-feature for now. Both fill the same `CameraUniform`, which is
-        // what makes the substitution free.
-        #[cfg(feature = "render3d")]
-        let uniform = match self.camera_3d.as_ref() {
-            Some(c) => c.build_uniform(),
-            None => uniform,
-        };
+        // The 2D camera always owns this buffer. It used to be shared,
+        // and a 3D camera overwrote it for the whole frame — which is
+        // what made a frame 2D *or* 3D. The 3D camera now has its own
+        // below, so a HUD can sit over a scene.
         self.gpu
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        // The 3D camera, into its own buffer. Written even when unset so
+        // the buffer never holds a matrix from an earlier frame: a game
+        // that clears its 3D camera mid-session would otherwise draw the
+        // next 3D geometry through a stale view.
+        #[cfg(feature = "render3d")]
+        {
+            let u3d = match self.camera_3d.as_ref() {
+                Some(c) => c.build_uniform(),
+                None => uniform,
+            };
+            self.gpu
+                .queue
+                .write_buffer(&self.camera_3d_buffer, 0, bytemuck::bytes_of(&u3d));
+        }
 
         // Fill the per-instance ring, grouped by mesh, and record the
         // order so the draw loop can walk the same slots. The grouping
@@ -710,7 +719,10 @@ impl Renderer {
             if let Some(r3d) = self.render3d.as_ref() {
                 if !self.pending_draws.is_empty() {
                     rpass.set_pipeline(&r3d.pipeline);
-                    rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    // The *3D* camera, not the shared one. The 2D batch
+                    // drawn later in this same pass binds its own, which
+                    // is what lets a HUD composite over the scene.
+                    rpass.set_bind_group(0, &self.camera_3d_bind_group, &[]);
                     // Shadow map at 2, point lights at 3. Both are
                     // frame-constant, so they bind once outside the loop.
                     if let Some(sh) = self.shadow3d.as_ref() {

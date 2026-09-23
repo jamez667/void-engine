@@ -131,9 +131,19 @@ pub struct Renderer {
     /// but they do not survive the frame that made them.
     #[cfg(feature = "render3d")]
     transient_handles: Vec<mesh_store::MeshHandle>,
-    /// Set by `set_camera_3d`. `None` means this is a 2D frame.
+    /// Set by `set_camera_3d`. `None` means no 3D geometry this frame.
     #[cfg(feature = "render3d")]
     pub camera_3d: Option<camera::Camera3D>,
+    /// The 3D camera's own uniform buffer and bind group.
+    ///
+    /// Separate from `camera_buffer` so a frame can be both: 3D geometry
+    /// binds this, the 2D `Batch` binds the 2D one, and a HUD composites
+    /// over a scene without either camera overwriting the other. Before
+    /// this existed a frame was one or the other.
+    #[cfg(feature = "render3d")]
+    camera_3d_buffer: wgpu::Buffer,
+    #[cfg(feature = "render3d")]
+    camera_3d_bind_group: wgpu::BindGroup,
 
     offscreen_batch: Batch,
     offscreen_vbuf: wgpu::Buffer,
@@ -318,19 +328,19 @@ impl Renderer {
         self.shadow_split_index = Some(self.batch.indices.len() as u32);
     }
 
-    /// Drive this frame with a 3D camera.
+    /// Set the camera 3D geometry is drawn through.
     ///
-    /// The 2D and 3D cameras share one uniform buffer and one bind group,
-    /// so a frame is one or the other. Setting this makes `end_frame`
-    /// upload `Camera3D`'s `proj * view` instead of `Camera2D`'s
-    /// orthographic projection — which means any 2D geometry in the same
-    /// frame is then transformed by a perspective matrix expecting
-    /// camera-relative metres, not the pixel offsets `Batch` produces.
+    /// **A frame can be both 2D and 3D.** The two cameras have their own
+    /// uniform buffers, so 3D meshes are drawn through this one and the
+    /// 2D [`Batch`] through [`Self::camera`] — which is what lets a HUD,
+    /// menu or debug overlay composite over a 3D scene.
     ///
-    /// Mixing the two coherently needs either a second camera uniform or a
-    /// separate pass, and that decision belongs with whoever first wants a
-    /// 2D HUD over a 3D scene. Until then: set it for a 3D frame, leave it
-    /// `None` for a 2D one.
+    /// Ordering in the main pass is fixed and deliberate: 3D geometry
+    /// draws first, depth-tested and opaque, then the alpha-blended 2D
+    /// batch composites over the finished scene. A 2D element cannot be
+    /// occluded by 3D geometry, which is the right default for UI.
+    ///
+    /// Leave it `None` for a purely 2D frame; nothing else changes.
     #[cfg(feature = "render3d")]
     pub fn set_camera_3d(&mut self, camera: camera::Camera3D) {
         self.camera_3d = Some(camera);

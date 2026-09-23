@@ -274,3 +274,11 @@ required-features = ["render3d"]
 [[test]]
 name = "shadow3d"
 required-features = ["render3d"]
+
+# Draws a 2D overlay over a 3D scene in one pass. Guards the second
+# camera uniform: when the two shared one, adding 3D geometry moved the
+# UI, which is easy to miss because the UI is still drawn — just not
+# where it belongs.
+[[test]]
+name = "ui_over_3d"
+required-features = ["render3d"]
