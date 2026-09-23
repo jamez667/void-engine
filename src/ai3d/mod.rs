@@ -39,6 +39,7 @@
 pub mod agent;
 pub mod nav;
 pub mod steer;
+pub mod task;
 
 use std::collections::HashSet;
 
@@ -51,6 +52,9 @@ use crate::physics3d::body::{self, RigidBody};
 pub use agent::{Agent3D, AgentState, PROGRESS_EPSILON, STALL_TIMEOUT};
 pub use nav::{plan_path, NavPath, NavPlane};
 pub use steer::{desired_speed, steering_force, WalkTuning3D};
+pub use task::{
+    drive_stacker, CarryPose, CrateId, CrateInfo, StackAction, StackState, StackTask, StackTuning,
+};
 
 /// Advance one agent by one tick, applying its walk force to `body`.
 ///

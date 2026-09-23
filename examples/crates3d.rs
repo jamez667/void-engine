@@ -30,7 +30,7 @@
 //!     cargo run --release --features render3d --example crates3d
 
 use glam::{DVec3, Mat4, Quat, Vec2, Vec3};
-use void_engine::ai3d::{self, Agent3D, AgentState, NavPlane, WalkTuning3D};
+use void_engine::ai3d::{self, Agent3D, NavPlane, WalkTuning3D};
 use void_engine::collision::grid3d::SpatialGrid3D;
 use void_engine::collision::narrow3d;
 use void_engine::components::{Collider3D, Transform3D, Velocity3D};
@@ -77,6 +77,11 @@ const FLOOR_FRICTION: f32 = 0.7;
 const NAV_TILE: f32 = 1.5;
 /// The nav grid's extent in tiles, comfortably inside the floor.
 const NAV_DIMS: (u32, u32) = (15, 15);
+/// How many crates high the agent builds its stack.
+const TARGET_LAYERS: u32 = 3;
+/// How grippy a crate is. See `drop_crate` for why it decides whether a
+/// stack stands or slides apart.
+const CRATE_FRICTION: f32 = 0.8;
 
 /// The floor the agent may walk on.
 ///
@@ -105,6 +110,18 @@ struct Body {
     colour: [f32; 4],
     /// Its slot in the broadphase grid, so a pick result maps back here.
     slot: u32,
+    /// Held by the agent. A carried crate is kinematic and is written to
+    /// a pose every tick, so it must be kept out of the contact list
+    /// entirely — see `contacts()`.
+    carried: bool,
+    /// What to restore when it is put down.
+    ///
+    /// `RigidBody::kinematic()` throws the mass and inertia away, and
+    /// rebuilding them from a constant would silently reset the mass of
+    /// any crate that was not the default weight. Invisible in this
+    /// example, where every crate is 1 kg, and a real bug in the first
+    /// game that has a heavy one.
+    dynamic_mass: (f32, glam::Mat3),
 }
 
 struct Game {
@@ -131,9 +148,9 @@ struct Game {
     /// The walking agent, and which body it drives.
     agent: Agent3D,
     agent_body: usize,
-    /// How many destinations the agent has been given, which picks the
-    /// next one.
-    agent_trips: usize,
+    /// The stacking behaviour driving the agent. It owns the agent's
+    /// goal; nothing else may set it.
+    task: ai3d::StackTask,
     /// Its own mesh, so it reads as a walker rather than a crate.
     agent_mesh: Option<MeshHandle>,
 
@@ -161,7 +178,13 @@ impl Game {
                 FLOOR_FRICTION as f64,
             )),
             agent_body: 0,
-            agent_trips: 0,
+            task: ai3d::StackTask::new(ai3d::StackTuning::for_agent_and_crate(
+                [AGENT_HW, AGENT_HW, AGENT_HH],
+                [CRATE_HALF as f64, CRATE_HALF as f64, CRATE_HALF as f64],
+                NAV_TILE as f64,
+                TARGET_LAYERS,
+                WalkTuning3D::default(),
+            )),
             agent_mesh: None,
             verify_at: None,
             frame: 0,
@@ -192,6 +215,8 @@ impl Game {
             collider: Collider3D::box3d(floor_half[0], floor_half[1], floor_half[2]),
             colour: [0.22, 0.24, 0.28, 1.0],
             slot,
+            carried: false,
+            dynamic_mass: (0.0, glam::Mat3::ZERO),
         });
 
         // A small starting stack so there is something to look at.
@@ -233,6 +258,8 @@ impl Game {
             collider,
             colour: [0.95, 0.72, 0.20, 1.0],
             slot,
+            carried: false,
+            dynamic_mass: (0.0, glam::Mat3::ZERO),
         });
 
         self.agent = Agent3D::new(WalkTuning3D::for_body(
@@ -240,23 +267,88 @@ impl Game {
             [AGENT_HW, AGENT_HW, AGENT_HH],
             FLOOR_FRICTION as f64,
         ));
-        self.send_agent_somewhere_new();
+        // The task owns the agent's goal from here. Nothing else may set
+        // it: two owners fighting over `agent.goal` shows up as an agent
+        // that walks halfway to a crate and then heads for a corner.
+        self.task = ai3d::StackTask::new(ai3d::StackTuning::for_agent_and_crate(
+            [AGENT_HW, AGENT_HW, AGENT_HH],
+            [CRATE_HALF as f64, CRATE_HALF as f64, CRATE_HALF as f64],
+            NAV_TILE as f64,
+            TARGET_LAYERS,
+            self.agent.tuning,
+        ));
     }
 
-    /// Pick a fresh destination and plan a route to it.
-    ///
-    /// Corners of the grid, in rotation, so the walk is long enough to
-    /// watch and crosses the middle where the crates are.
-    fn send_agent_somewhere_new(&mut self) {
-        let plane = self.nav_plane();
-        let (w, h) = (NAV_DIMS.0 as i32 - 3, NAV_DIMS.1 as i32 - 3);
-        let corners = [(2, 2), (w, 2), (w, h), (2, h)];
-        let (c, r) = corners[self.agent_trips % corners.len()];
-        self.agent_trips += 1;
+    /// Every crate the stacker may consider, as it looks this tick.
+    fn crate_infos(&self) -> Vec<ai3d::CrateInfo> {
+        self.bodies
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| *i != self.agent_body && b.rigid.kind != BodyKind::Static)
+            .map(|(i, b)| ai3d::CrateInfo {
+                id: ai3d::CrateId(i as u32),
+                pos: b.transform.pos,
+                half_extents: [
+                    b.collider.half_extents[0] as f64,
+                    b.collider.half_extents[1] as f64,
+                    b.collider.half_extents[2] as f64,
+                ],
+                // Only this task carries anything here, so a crate it is
+                // holding is not "carried by someone else".
+                carried_by_other: false,
+                sleeping: b.rigid.sleeping,
+            })
+            .collect()
+    }
 
-        self.agent.set_goal(plane.tile_center(c, r));
-        let from = self.bodies[self.agent_body].transform.pos;
-        ai3d::replan(&mut self.agent, plane, &NavFloor, from, &Default::default());
+    /// Do what the stacker asked.
+    fn apply_stack_action(&mut self, action: ai3d::StackAction) {
+        match action {
+            ai3d::StackAction::Pickup { id, pose } => {
+                let Some(b) = self.bodies.get_mut(id.0 as usize) else { return };
+                b.carried = true;
+                b.rigid.kind = BodyKind::Kinematic;
+                b.rigid.inv_mass = 0.0;
+                b.rigid.inv_inertia = glam::Mat3::ZERO;
+                b.transform.pos = pose.pos;
+                b.transform.rot = pose.rot;
+                // Zeroed, and this is not cosmetic. A kinematic body is
+                // skipped by `step`, so a residual velocity would never
+                // be integrated *and never decay* — it would be handed
+                // straight back on release. Worse, the solver's wake rule
+                // tests the partner's velocity, so a carried crate still
+                // holding walking speed wakes every crate it passes over
+                // and the scene never sleeps.
+                b.velocity = Velocity3D::default();
+                b.rigid.wake();
+            }
+            ai3d::StackAction::Hold { id, pose } => {
+                let Some(b) = self.bodies.get_mut(id.0 as usize) else { return };
+                b.transform.pos = pose.pos;
+                b.transform.rot = pose.rot;
+                b.velocity = Velocity3D::default();
+            }
+            ai3d::StackAction::Release { id, pose, velocity } => {
+                let Some(b) = self.bodies.get_mut(id.0 as usize) else { return };
+                b.carried = false;
+                b.rigid.kind = BodyKind::Dynamic;
+                b.rigid.inv_mass = b.dynamic_mass.0;
+                b.rigid.inv_inertia = b.dynamic_mass.1;
+                b.transform.pos = pose.pos;
+                b.transform.rot = pose.rot;
+                b.velocity.linear = velocity;
+                b.velocity.angular = DVec3::ZERO;
+                // **Mandatory.** The solver wakes a sleeping body only
+                // when its partner is awake *and moving*, and the layer
+                // below is a settled, asleep crate that is perfectly
+                // still. A crate released asleep is skipped by `step`,
+                // never falls, and hangs in the air.
+                b.rigid.wake();
+            }
+            ai3d::StackAction::None
+            | ai3d::StackAction::NoCrateAvailable
+            | ai3d::StackAction::Finished => {}
+        }
     }
 
     /// Add a dynamic crate at `pos`.
@@ -266,6 +358,21 @@ impl Game {
         // A little initial spin so crates land at varied angles rather
         // than all perfectly square, which makes the physics legible.
         let n = self.dropped as f64;
+        // Stashed before anything can turn this crate kinematic: making
+        // it kinematic zeroes both, and they are what a release has to
+        // put back.
+        // Grippy, because these get stacked.
+        //
+        // Friction combines as the geometric mean, so crate-on-crate is
+        // whatever this is. At 0.6 a crate landing on the tower still has
+        // horizontal speed to shed and only 5.9 m/s² to shed it with, so
+        // it creeps off the edge over the next few seconds and the stack
+        // comes apart on its own — built correctly, then slid apart.
+        // Cardboard on cardboard is about 0.8 in reality, and that stops
+        // the slide before the crate reaches an edge.
+        let rigid = RigidBody::box3d(1.0, [CRATE_HALF, CRATE_HALF, CRATE_HALF])
+            .with_material(Material3D { restitution: 0.15, friction: CRATE_FRICTION });
+        let dynamic_mass = (rigid.inv_mass, rigid.inv_inertia);
         self.bodies.push(Body {
             transform: Transform3D {
                 pos,
@@ -278,11 +385,12 @@ impl Game {
             // No damping: with a proper contact manifold the crates
             // settle and sleep on their own, so bleeding energy every
             // tick would only be hiding a solver that could not rest.
-            rigid: RigidBody::box3d(1.0, [CRATE_HALF, CRATE_HALF, CRATE_HALF])
-            .with_material(Material3D { restitution: 0.15, friction: 0.6 }),
+            rigid,
             collider,
             colour: crate_colour(self.dropped),
             slot,
+            carried: false,
+            dynamic_mass,
         });
         self.dropped += 1;
     }
@@ -364,6 +472,19 @@ impl Game {
                 continue;
             };
             if !ba0.rigid.kind.is_dynamic() && !bb0.rigid.kind.is_dynamic() {
+                continue;
+            }
+
+            // A carried crate is a ghost.
+            //
+            // It is kinematic, so the solver treats it as infinitely
+            // massive, and it is teleported to a new pose every tick
+            // rather than integrated. Leaving it in the contact list
+            // means every body it sweeps past gets a deep, fast contact
+            // against an immovable object — the agent holding it would be
+            // launched by its own cargo. It becomes solid again the
+            // moment it is released.
+            if ba0.carried || bb0.carried {
                 continue;
             }
 
@@ -528,6 +649,30 @@ impl App for Game {
             }
         }
 
+        // ---- the stacking behaviour -------------------------------------
+        //
+        // Runs before the walker, which runs before `step`: the task
+        // decides where the agent wants to be, the walker decides how
+        // hard to push to get there, and the integrator consumes the
+        // force. The action is applied *here*, before the broadphase is
+        // re-hashed below, so the narrowphase sees the carried crate
+        // where it actually is rather than where it was last tick.
+        {
+            let crates = self.crate_infos();
+            let plane = self.nav_plane();
+            let transform = self.bodies[self.agent_body].transform.clone();
+            let action = ai3d::drive_stacker(
+                &mut self.task,
+                &mut self.agent,
+                &transform,
+                plane,
+                &NavFloor,
+                &crates,
+                dt,
+            );
+            self.apply_stack_action(action);
+        }
+
         // ---- the agent -------------------------------------------------
         //
         // Before `step`, in the same place a player's input would be
@@ -543,14 +688,6 @@ impl App for Game {
                     dt,
                 );
             }
-        }
-
-        // Arrived, or wedged against a crate it cannot shift: either way
-        // give it somewhere new to be. `stuck()` reports, the caller
-        // decides — the engine cannot re-plan on its own because it does
-        // not hold the tile source.
-        if self.agent.state == AgentState::Arrived || self.agent.stuck() {
-            self.send_agent_somewhere_new();
         }
 
         // ---- the physics step ------------------------------------------
@@ -595,6 +732,26 @@ impl App for Game {
             // testing for stillness any earlier sees every settled body
             // as moving and nothing ever sleeps.
             physics3d::update_sleep_all(&mut refs, dt);
+        }
+
+        if std::env::var("CRATES3D_PEN").is_ok() && self.frame.is_multiple_of(120) {
+            let cs = self.contacts();
+            let mut worst = 0.0f64;
+            let mut n = 0;
+            for c in &cs {
+                let (a, b) = (&self.bodies[c.a], &self.bodies[c.b]);
+                if a.rigid.kind.is_dynamic() && b.rigid.kind.is_dynamic() {
+                    worst = worst.max(c.penetration);
+                    n += 1;
+                }
+            }
+            let mut zs: Vec<String> = Vec::new();
+            for (i, b) in self.bodies.iter().enumerate() {
+                if b.rigid.kind == BodyKind::Static || i == self.agent_body { continue }
+                zs.push(format!("{:.3}", b.transform.pos.z));
+            }
+            eprintln!("[pen] f{:5} crate-crate contacts={n} worst_pen={worst:.4} z=[{}]",
+                self.frame, zs.join(" "));
         }
 
         // Anything that falls off the world is gone; without this a

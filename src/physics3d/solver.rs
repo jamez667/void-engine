@@ -167,10 +167,28 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
         }
     }
 
-    // Positional correction last, so it works on the post-impulse state
-    // rather than fighting it.
-    for c in contacts {
-        correct_penetration(bodies, c);
+    // Positional correction after the impulses, so it works on the
+    // post-impulse state rather than fighting it — and **iterated**, for
+    // the same reason the impulses are.
+    //
+    // One pass moves the pair apart by `excess * BAUMGARTE`, which at the
+    // default 20% barely outruns the `g*dt²` a contact sinks under its
+    // own weight each tick — and loses outright once something is resting
+    // on top, because the load doubles while the recovery rate does not.
+    // A stack therefore compresses instead of settling. Measured on
+    // `examples/crates3d` before this: a three-high stack of 1 m crates
+    // sat at z = 0.48 / 1.44 / 2.42 against a nominal 0.50 / 1.50 / 2.50,
+    // with crate-on-crate overlap of 32-65 mm — up to thirteen times
+    // [`PENETRATION_SLOP`] — and the overlap grew the longer it stood.
+    //
+    // Each pass re-measures depth from the *current* positions rather
+    // than reusing the contact's stored penetration, which is what stops
+    // the extra passes from over-correcting and launching the stack.
+    let mut separated = vec![0.0f64; contacts.len()];
+    for _ in 0..SOLVER_ITERATIONS {
+        for (i, c) in contacts.iter().enumerate() {
+            separated[i] += correct_penetration(bodies, c, separated[i]);
+        }
     }
 
     let _ = dt;
@@ -307,34 +325,46 @@ fn apply(bodies: &mut [BodyRef<'_>], i: usize, rot: Quat, rel: DVec3, impulse: D
 /// Splitting this from the impulse solve is what keeps a resting stack
 /// still: correcting overlap with velocity injects energy the solver then
 /// has to remove again, which reads as a stack that breathes.
-fn correct_penetration(bodies: &mut [BodyRef<'_>], c: &Contact) {
+/// Returns how far apart this call pushed the pair, so the caller can
+/// discount it on the next pass.
+fn correct_penetration(
+    bodies: &mut [BodyRef<'_>],
+    c: &Contact,
+    already_separated: f64,
+) -> f64 {
     let (ia, ib) = (c.a, c.b);
     if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
-        return;
+        return 0.0;
     }
 
-    // Only the excess beyond the slop, so a settled contact is left alone.
-    let excess = (c.penetration - PENETRATION_SLOP).max(0.0);
+    // Only the excess beyond the slop, so a settled contact is left
+    // alone — and only what is *left* of it, since earlier passes this
+    // tick have already pushed the pair `already_separated` apart.
+    // Without that term the same overlap is corrected once per pass and
+    // the pair is flung apart instead of settled.
+    let excess = (c.penetration - already_separated - PENETRATION_SLOP).max(0.0);
     if excess <= 0.0 {
-        return;
+        return 0.0;
     }
 
     let inv_a = if bodies[ia].body.kind.is_dynamic() { bodies[ia].body.inv_mass as f64 } else { 0.0 };
     let inv_b = if bodies[ib].body.kind.is_dynamic() { bodies[ib].body.inv_mass as f64 } else { 0.0 };
     let total = inv_a + inv_b;
     if total <= 0.0 {
-        return;
+        return 0.0;
     }
 
     // Shared in proportion to inverse mass, so a light body moves most
     // and an immovable one not at all.
-    let correction = c.normal * (excess * BAUMGARTE / total);
+    let gained = excess * BAUMGARTE;
+    let correction = c.normal * (gained / total);
     if inv_a > 0.0 {
         bodies[ia].transform.pos += correction * inv_a;
     }
     if inv_b > 0.0 {
         bodies[ib].transform.pos -= correction * inv_b;
     }
+    gained
 }
 
 #[cfg(test)]
