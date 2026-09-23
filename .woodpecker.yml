@@ -194,8 +194,8 @@ steps:
       - |
         out=$(cargo test --lib collision::narrow3d:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "21 passed" || {
-          echo "expected 21 3D narrowphase tests"
+        echo "$out" | grep -q "24 passed" || {
+          echo "expected 24 3D narrowphase tests"
           exit 1
         }
       - |
@@ -214,8 +214,8 @@ steps:
       - |
         out=$(cargo test --lib physics3d:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "38 passed" || {
-          echo "expected 38 rigid-body tests"
+        echo "$out" | grep -q "40 passed" || {
+          echo "expected 40 rigid-body tests"
           exit 1
         }
 

@@ -130,9 +130,29 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
         return;
     }
 
-    // Anything in a contact is in play this step.
+    // A sleeping body is woken by a contact with something that is
+    // *moving*, not by contact as such.
+    //
+    // Waking on contact alone means nothing can ever stay asleep: a crate
+    // resting on the floor is in a contact every single tick, so it is
+    // woken on the tick after it falls asleep, forever. That silently
+    // disabled sleeping for every settled body in the scene -- measured
+    // on `examples/crates3d`, three crates sat motionless at 0.006 m/s,
+    // two orders below the 0.05 threshold, and still reported awake after
+    // 1200 ticks.
+    //
+    // The partner must be awake *and* actually in motion. A static floor
+    // is never in motion, and two settled crates leaning together do not
+    // keep each other up.
     for c in contacts {
-        for i in [c.a, c.b] {
+        for (i, other) in [(c.a, c.b), (c.b, c.a)] {
+            let disturbed = match bodies.get(other) {
+                Some(o) => !o.body.sleeping && !crate::physics3d::is_still(o.velocity),
+                None => false,
+            };
+            if !disturbed {
+                continue;
+            }
             if let Some(r) = bodies.get_mut(i) {
                 if r.body.kind.is_dynamic() && r.body.sleeping {
                     r.body.wake();
@@ -581,12 +601,23 @@ mod tests {
 
     /// A body hit while asleep must wake, or projectiles pass through
     /// settled objects — the classic sleeping-body bug.
+    ///
+    /// The partner here is *moving*. An earlier version of this test used
+    /// a static body and asserted that the contact alone woke the sleeper,
+    /// which is the behaviour that made sleeping impossible: a crate
+    /// resting on the floor is in a contact every tick, so it was woken
+    /// the tick after it fell asleep, forever. See
+    /// [`a_body_asleep_on_the_floor_is_not_woken_by_the_floor`].
     #[test]
     fn a_contact_wakes_a_sleeping_body() {
         let mut s = Scene::new();
         let a = s.push(RigidBody::sphere(1.0, 0.5), DVec3::ZERO, DVec3::ZERO);
         s.bodies[a].sleeping = true;
-        let b = s.push(RigidBody::static_body(), DVec3::new(0.0, 0.0, -1.0), DVec3::ZERO);
+        let b = s.push(
+            RigidBody::sphere(1.0, 0.5),
+            DVec3::new(0.0, 0.0, -1.0),
+            DVec3::new(0.0, 0.0, 4.0),
+        );
 
         s.solve(&[contact(a, b, DVec3::new(0.0, 0.0, 1.0), 0.1, DVec3::ZERO)]);
         assert!(!s.bodies[a].sleeping, "the contact should have woken it");
@@ -727,5 +758,59 @@ mod tests {
             contact(a, a, DVec3::new(0.0, 0.0, 1.0), 0.1, DVec3::ZERO),
         ]);
         assert!(s.velocities[a].linear.is_finite());
+    }
+
+    /// A sleeping body resting on a static floor stays asleep.
+    ///
+    /// Waking on the mere *presence* of a contact means nothing can ever
+    /// stay asleep: a settled crate touches the floor every tick, so it
+    /// is woken the tick after it falls asleep, forever. That silently
+    /// disabled sleeping for every resting body in a scene.
+    #[test]
+    fn a_body_asleep_on_the_floor_is_not_woken_by_the_floor() {
+        let mut s = Scene::new();
+        let a = s.push(
+            RigidBody::box3d(1.0, [0.5, 0.5, 0.5]),
+            DVec3::new(0.0, 0.0, 0.5),
+            DVec3::ZERO,
+        );
+        let floor = s.push(RigidBody::static_body(), DVec3::new(0.0, 0.0, -0.5), DVec3::ZERO);
+        s.bodies[a].sleeping = true;
+
+        s.solve(&[contact(a, floor, DVec3::Z, 0.001, DVec3::ZERO)]);
+
+        assert!(
+            s.bodies[a].sleeping,
+            "resting on a static floor must not wake a sleeping body"
+        );
+    }
+
+    /// A sleeping body *is* woken by something moving into it.
+    ///
+    /// The counterpart to the rule above, and the reason the rule cannot
+    /// simply be "never wake on contact": a projectile that fails to wake
+    /// what it hits passes straight through.
+    #[test]
+    fn a_moving_body_wakes_what_it_hits() {
+        let mut s = Scene::new();
+        let a = s.push(
+            RigidBody::box3d(1.0, [0.5, 0.5, 0.5]),
+            DVec3::new(0.0, 0.0, 0.5),
+            DVec3::ZERO,
+        );
+        let hitter = s.push(
+            RigidBody::sphere(1.0, 0.5),
+            DVec3::new(1.4, 0.0, 0.5),
+            DVec3::new(-5.0, 0.0, 0.0),
+        );
+        s.bodies[a].sleeping = true;
+
+        // Normal from the hitter toward A: -X.
+        s.solve(&[contact(a, hitter, DVec3::NEG_X, 0.01, DVec3::new(0.5, 0.0, 0.5))]);
+
+        assert!(
+            !s.bodies[a].sleeping,
+            "a body struck by something moving must wake"
+        );
     }
 }

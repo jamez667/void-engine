@@ -285,22 +285,251 @@ pub fn obb_contact_point(
     penetration: f64,
 ) -> DVec3 {
     let axes = obb_axes(rot_a);
-    // Walk from A's centre to the corner furthest along -normal. On each
-    // local axis, step to whichever face the normal points away from.
+    // Walk from A's centre to the support point furthest along -normal.
+    //
+    // **The tolerance is load-bearing.** An axis whose dot with the
+    // normal is near zero lies (almost) in the contact plane, so neither
+    // of its faces is deeper and the support is the *centre* on that
+    // axis. Testing `d > 0.0` exactly instead means a box resting flat
+    // but rotated a few degrees about the normal — the ordinary case for
+    // anything that fell and settled — picks a **corner** rather than a
+    // face centre.
+    //
+    // That is not a small error. A corner is half a box off-centre, so
+    // every contact impulse also applies torque, the box is spun by the
+    // very force holding it up, and the spin is regenerated every tick.
+    // Measured in `examples/crates3d`: settled crates held 0.098 rad/s
+    // and 0.073 m/s indefinitely, visibly jiggling on a flat floor, and
+    // damping could not remove it because it was recreated each tick.
+    //
+    // 1e-6 rather than something looser: a genuinely tilted box should
+    // still contact on its corner, which is correct. This only catches
+    // axes that are perpendicular to the normal to within float noise.
+    const IN_PLANE: f64 = 1e-6;
     let mut p = pos_a;
     for i in 0..3 {
         let d = axes[i].dot(normal);
-        // A near-zero dot means the normal lies in this face's plane, so
-        // neither direction is "deeper" — the support is the face centre
-        // on that axis, which is what contributing nothing gives.
-        if d > 0.0 {
+        if d > IN_PLANE {
             p -= axes[i] * half_a[i].abs();
-        } else if d < 0.0 {
+        } else if d < -IN_PLANE {
             p += axes[i] * half_a[i].abs();
         }
     }
     let _ = penetration;
     p
+}
+
+/// The most points a face-vs-face contact can produce.
+///
+/// A convex quad clipped against a convex quad cannot yield more than
+/// eight vertices, but for two boxes the useful set is the four that
+/// bound the overlap region; taking more only adds near-duplicate points
+/// that split the same impulse.
+pub const MAX_MANIFOLD_POINTS: usize = 4;
+
+/// Every contact point between two overlapping boxes, not just the
+/// deepest one.
+///
+/// # Why one point is not enough
+///
+/// [`obb_contact_point`] returns the single deepest vertex of A. For a
+/// box resting *flat* on a surface all four of its bottom vertices are
+/// equally deep, so "deepest" is a tie broken by float noise, and the
+/// answer is a **corner** — half a box away from the centre of support.
+///
+/// Every normal impulse then arrives at the end of a 0.5 m lever arm, so
+/// the force holding the crate up also spins it. The spin tips the crate,
+/// the tip is corrected, and the correction spins it back: the box never
+/// settles. Measured on `examples/crates3d` with single-point contacts:
+/// three crates still awake after 1200 ticks, drifting sideways across a
+/// flat floor at a steady 0.15 m/s with nothing pushing them, and a stack
+/// that held a 0.10 m overlap for six hundred ticks before the upper
+/// crate slid off the corner and fell through the lower one.
+///
+/// With the full face, impulses land on both sides of the centre of mass
+/// and their torques cancel. That is what lets a box rest.
+///
+/// # Method
+///
+/// Sutherland–Hodgman clipping, the standard construction:
+///
+/// 1. Pick the face of each box most anti-parallel to the contact normal
+///    — for A the face pointing along `-normal`, for B the one along
+///    `+normal`. These are the faces actually in contact.
+/// 2. Treat B's as the *reference* face and A's as the *incident* face,
+///    and clip the incident face against the four side planes of the
+///    reference face. What survives is the overlap region.
+/// 3. Keep the clipped vertices that are at or below the reference plane;
+///    those are the points genuinely in contact, each with its own
+///    penetration depth.
+///
+/// Returns points in A's frame of reference — world space, on A's
+/// surface, exactly as [`obb_contact_point`] does — paired with the depth
+/// at each. Never returns more than [`MAX_MANIFOLD_POINTS`]; when the
+/// clip yields more, the deepest are kept.
+///
+/// Falls back to the single deepest point when the faces are not
+/// parallel enough to clip usefully (an edge or corner contact), which is
+/// the case [`obb_contact_point`] already handles correctly.
+pub fn obb_contact_manifold(
+    pos_a: DVec3,
+    half_a: [f64; 3],
+    rot_a: Quat,
+    pos_b: DVec3,
+    half_b: [f64; 3],
+    rot_b: Quat,
+    normal: DVec3,
+    penetration: f64,
+) -> Vec<(DVec3, f64)> {
+    let axes_a = obb_axes(rot_a);
+    let axes_b = obb_axes(rot_b);
+
+    // The incident face on A is the one facing most along -normal; the
+    // reference face on B the one facing most along +normal.
+    let (ia, sa) = most_aligned(&axes_a, -normal);
+    let (ib, sb) = most_aligned(&axes_b, normal);
+
+    // A face pair that is badly skewed is an edge or corner contact, and
+    // clipping it produces a sliver rather than a face. The single-point
+    // answer is the right one there.
+    let a_dot = (axes_a[ia] * sa).dot(-normal).abs();
+    let b_dot = (axes_b[ib] * sb).dot(normal).abs();
+    const PARALLEL: f64 = 0.95;
+    if a_dot < PARALLEL || b_dot < PARALLEL {
+        return vec![(
+            obb_contact_point(pos_a, half_a, rot_a, normal, penetration),
+            penetration,
+        )];
+    }
+
+    /// How far outside a boundary a point may sit and still count as
+    /// contacting. Chosen at the scale of the penetration slop: small
+    /// enough that a genuinely separated point is still excluded, large
+    /// enough to swamp the per-frame creep of a settled body.
+    const CONTACT_TOLERANCE: f64 = 1e-3;
+
+    // The four corners of A's incident face.
+    let (u, v) = other_two(ia);
+    let face_centre = pos_a + axes_a[ia] * sa * half_a[ia];
+    let eu = axes_a[u] * half_a[u];
+    let ev = axes_a[v] * half_a[v];
+    let mut poly = vec![
+        face_centre - eu - ev,
+        face_centre + eu - ev,
+        face_centre + eu + ev,
+        face_centre - eu + ev,
+    ];
+
+    // Clip against the four side planes of B's reference face. Each plane
+    // faces outward, so a point is kept when it is on the inner side.
+    let (bu, bv) = other_two(ib);
+    let ref_centre = pos_b + axes_b[ib] * sb * half_b[ib];
+    //
+    // The side planes are pushed out by the same tolerance as the depth
+    // test, and for the same reason: a crate resting exactly flush with
+    // the edge of what it stands on has corners *on* the boundary, and
+    // an exact test drops and re-adds them as the body creeps by
+    // micrometres. That flicker redistributes the impulse every few
+    // frames and keeps the body awake indefinitely.
+    for (axis, extent) in [(axes_b[bu], half_b[bu]), (axes_b[bv], half_b[bv])] {
+        for sign in [1.0f64, -1.0] {
+            let n = axis * sign;
+            let plane_d = ref_centre.dot(n) + extent + CONTACT_TOLERANCE;
+            poly = clip_to_plane(&poly, n, plane_d);
+            if poly.is_empty() {
+                return vec![(
+                    obb_contact_point(pos_a, half_a, rot_a, normal, penetration),
+                    penetration,
+                )];
+            }
+        }
+    }
+
+    // Depth of each surviving point below B's reference plane. Points
+    // clear of it are not touching and are dropped.
+    //
+    // **The tolerance is what makes a stack sleep.** Testing `>= 0.0`
+    // exactly means a corner hovering a micron above the surface leaves
+    // the manifold, the remaining points absorb its share of the impulse,
+    // and the crate lurches — then the lurch brings the corner back and
+    // it lurches the other way. Measured here: the contact count for one
+    // resting crate flickered 4 -> 3 -> 4 and velocity spiked from
+    // 0.006 to 0.083 m/s on exactly the frames it changed, which was
+    // enough to reset the sleep timer forever.
+    //
+    // Accepting points just above the plane keeps the set stable across
+    // frames. Their depth clamps to zero, so they contribute no
+    // positional correction and only resist approach — a point that is
+    // truly separating is still filtered by the `vn > 0.0` early-out in
+    // the solver.
+    let ref_n = axes_b[ib] * sb;
+    let ref_d = ref_centre.dot(ref_n);
+    let mut out: Vec<(DVec3, f64)> = poly
+        .into_iter()
+        .filter_map(|p| {
+            let depth = ref_d - p.dot(ref_n);
+            (depth >= -CONTACT_TOLERANCE).then_some((p, depth.max(0.0)))
+        })
+        .collect();
+
+    if out.is_empty() {
+        return vec![(
+            obb_contact_point(pos_a, half_a, rot_a, normal, penetration),
+            penetration,
+        )];
+    }
+
+    if out.len() > MAX_MANIFOLD_POINTS {
+        out.sort_by(|x, y| y.1.total_cmp(&x.1));
+        out.truncate(MAX_MANIFOLD_POINTS);
+    }
+    out
+}
+
+/// Which of `axes` points most nearly along `dir`, and with which sign.
+fn most_aligned(axes: &[DVec3; 3], dir: DVec3) -> (usize, f64) {
+    let mut best = 0usize;
+    let mut best_dot = f64::NEG_INFINITY;
+    let mut sign = 1.0f64;
+    for (i, a) in axes.iter().enumerate() {
+        let d = a.dot(dir);
+        if d.abs() > best_dot {
+            best_dot = d.abs();
+            best = i;
+            sign = if d >= 0.0 { 1.0 } else { -1.0 };
+        }
+    }
+    (best, sign)
+}
+
+/// The two axis indices that are not `i`.
+fn other_two(i: usize) -> (usize, usize) {
+    match i {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    }
+}
+
+/// Sutherland–Hodgman: keep the part of `poly` with `p · n <= d`,
+/// inserting the crossing point on every edge that spans the plane.
+fn clip_to_plane(poly: &[DVec3], n: DVec3, d: f64) -> Vec<DVec3> {
+    let mut out = Vec::with_capacity(poly.len() + 1);
+    for i in 0..poly.len() {
+        let cur = poly[i];
+        let nxt = poly[(i + 1) % poly.len()];
+        let dc = cur.dot(n) - d;
+        let dn = nxt.dot(n) - d;
+        if dc <= 0.0 {
+            out.push(cur);
+        }
+        // Sign change means the edge crosses the plane; add the crossing.
+        if (dc < 0.0 && dn > 0.0) || (dc > 0.0 && dn < 0.0) {
+            let t = dc / (dc - dn);
+            out.push(cur + (nxt - cur) * t);
+        }
+    }
+    out
 }
 
 /// Segment-vs-oriented-box, returning the entry parameter `t` along
@@ -745,5 +974,102 @@ mod tests {
             DVec3::ZERO,
             1.0
         ));
+    }
+
+    /// A box resting flat on a wide floor contacts on its whole face,
+    /// not on one corner.
+    ///
+    /// This is the property the whole manifold exists for. With a single
+    /// contact point every impulse lands half a box off-centre and the
+    /// force holding the crate up also spins it.
+    #[test]
+    fn a_box_resting_flat_contacts_on_four_points() {
+        let half_crate = [0.5, 0.5, 0.5];
+        let half_floor = [12.0, 12.0, 0.5];
+        // Resting with 0.01 of overlap, square-on.
+        let pos_a = DVec3::new(0.0, 0.0, 0.49);
+        let pos_b = DVec3::new(0.0, 0.0, -0.5);
+        let normal = DVec3::Z;
+
+        let m = obb_contact_manifold(
+            pos_a, half_crate, q(), pos_b, half_floor, q(), normal, 0.01,
+        );
+
+        assert_eq!(m.len(), 4, "a flat face pair should give four points, got {m:?}");
+
+        // They must be the four corners of the crate's bottom face, not
+        // four copies of one corner: the centroid sits under the centre
+        // of mass, which is what makes the torques cancel.
+        let centroid: DVec3 = m.iter().map(|(p, _)| *p).sum::<DVec3>() / 4.0;
+        assert!(
+            (centroid.x).abs() < 1e-9 && (centroid.y).abs() < 1e-9,
+            "contact centroid should sit under the centre of mass, got {centroid:?}"
+        );
+        for (p, _) in &m {
+            assert!((p.x.abs() - 0.5).abs() < 1e-9, "x should be at a face edge: {p:?}");
+            assert!((p.y.abs() - 0.5).abs() < 1e-9, "y should be at a face edge: {p:?}");
+        }
+    }
+
+    /// The manifold survives a body hovering right at the surface.
+    ///
+    /// A settled box does not sit at a fixed depth: gravity pushes it in
+    /// a fraction of a millimetre each tick and the solver lifts it back
+    /// out, so its corners oscillate either side of the contact plane. An
+    /// exact `depth >= 0.0` test drops those corners on the frames they
+    /// are a hair proud of the surface and takes them back the next, and
+    /// the surviving points absorb the lost impulse each time.
+    ///
+    /// Measured before the tolerance: the contact count for one resting
+    /// crate flickered 4 -> 3 -> 4 and its velocity jumped from 0.006 to
+    /// 0.083 m/s on exactly those frames, resetting the sleep timer
+    /// forever.
+    #[test]
+    fn the_manifold_does_not_flicker_as_a_body_hovers() {
+        let half_crate = [0.5, 0.5, 0.5];
+        let half_floor = [12.0, 12.0, 0.5];
+        let mut counts = Vec::new();
+        // Sweep from just inside the surface to just outside it, the
+        // range a resting body oscillates over between frames.
+        for i in -10..=10 {
+            let z = 0.5 + i as f64 * 2e-5;
+            let m = obb_contact_manifold(
+                DVec3::new(0.0, 0.0, z),
+                half_crate,
+                q(),
+                DVec3::new(0.0, 0.0, -0.5),
+                half_floor,
+                q(),
+                DVec3::Z,
+                (0.5 - z).max(0.0),
+            );
+            counts.push(m.len());
+        }
+        assert!(
+            counts.iter().all(|&c| c == 4),
+            "point count must not change as a resting body hovers, got {counts:?}"
+        );
+    }
+
+    /// A genuinely tilted box still contacts on its corner.
+    ///
+    /// The tolerances must not be so loose that they invent a face
+    /// contact where the geometry has none.
+    #[test]
+    fn a_steeply_tilted_box_still_gives_a_corner_contact() {
+        let half = [0.5, 0.5, 0.5];
+        // 30 degrees is far past the parallelism cutoff.
+        let rot = Quat::from_rotation_x(std::f64::consts::FRAC_PI_6 as f32);
+        let m = obb_contact_manifold(
+            DVec3::new(0.0, 0.0, 0.6),
+            half,
+            rot,
+            DVec3::new(0.0, 0.0, -0.5),
+            [12.0, 12.0, 0.5],
+            q(),
+            DVec3::Z,
+            0.01,
+        );
+        assert_eq!(m.len(), 1, "a steeply tilted box rests on an edge or corner, got {m:?}");
     }
 }

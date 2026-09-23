@@ -91,12 +91,15 @@ pub fn update_sleep(
     }
 }
 
-/// Apply gravity and damping, then integrate, then update sleep state.
+/// Apply gravity and damping, then integrate.
 ///
 /// The half of a physics step that does not need to know about contacts.
 /// A caller runs this, builds its contact list from
-/// [`crate::collision::grid3d`] and [`crate::collision::narrow3d`], and
-/// calls [`solver::solve`].
+/// [`crate::collision::grid3d`] and [`crate::collision::narrow3d`], calls
+/// [`solver::solve`], and finishes with [`update_sleep_all`].
+///
+/// Sleep is deliberately **not** updated here; see [`update_sleep_all`]
+/// for why it cannot be.
 ///
 /// `gravity` is a parameter rather than [`GRAVITY`] directly because a
 /// game in space, underwater, or on a small body wants its own — and
@@ -126,6 +129,30 @@ pub fn step(
             dt,
         );
 
+    }
+}
+
+/// Update every body's sleep state. Call **after** solving contacts.
+///
+/// # Why this cannot be part of [`step`]
+///
+/// `step` applies gravity and integrates; the contact solve happens
+/// afterwards, in the caller. A body resting on the floor therefore still
+/// holds a full tick of falling speed when `step` ends — 0.1635 m/s under
+/// standard gravity at 60 Hz, twice the 0.05 m/s stillness threshold —
+/// and the solver cancels it a moment later.
+///
+/// A sleep pass inside `step` sees that as motion, so it resets the
+/// clock **every tick** and the half second of continuous stillness
+/// [`TIME_TO_SLEEP`] asks for never accumulates. Nothing resting on
+/// anything ever sleeps. Measured in `examples/crates3d`: crates sitting
+/// motionless at 0.006 m/s, an order below the threshold, reported
+/// `time_below_threshold` of 0.017 s — one tick — forever.
+///
+/// Running the check here, after the solve, tests the velocity a body
+/// actually *ends* the tick with, which is what "still" means.
+pub fn update_sleep_all(bodies: &mut [BodyRef<'_>], dt: f32) {
+    for r in bodies.iter_mut() {
         update_sleep(r.body, r.velocity, dt);
     }
 }
@@ -162,6 +189,10 @@ mod tests {
                 .map(|((body, transform), velocity)| BodyRef { body, transform, velocity })
                 .collect();
             super::step(&mut refs, gravity, dt);
+            // The full sequence a caller runs. With no contacts there is
+            // nothing to solve between the two, but sleep is still
+            // updated where a real caller updates it: after the solve.
+            super::update_sleep_all(&mut refs, dt);
         }
     }
 

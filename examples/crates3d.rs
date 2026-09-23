@@ -133,8 +133,11 @@ impl Game {
         });
 
         // A small starting stack so there is something to look at.
+        // Spaced by a full diameter and a half: 1.4 m apart leaves only
+        // 0.4 m of gap between 1 m cubes, so they start interpenetrating
+        // and the solver has to shove them apart on the first tick.
         for i in 0..3 {
-            self.drop_crate(DVec3::new(0.0, 0.0, 1.0 + i as f64 * 1.4));
+            self.drop_crate(DVec3::new(0.0, 0.0, 1.0 + i as f64 * 1.6));
         }
     }
 
@@ -154,16 +157,63 @@ impl Game {
                 linear: DVec3::ZERO,
                 angular: DVec3::new((n * 0.3).sin(), (n * 0.5).cos(), 0.0) * 0.8,
             },
-            rigid: RigidBody::box3d(
-                1.0,
-                [CRATE_HALF, CRATE_HALF, CRATE_HALF],
-            )
+            // No damping: with a proper contact manifold the crates
+            // settle and sleep on their own, so bleeding energy every
+            // tick would only be hiding a solver that could not rest.
+            rigid: RigidBody::box3d(1.0, [CRATE_HALF, CRATE_HALF, CRATE_HALF])
             .with_material(Material3D { restitution: 0.15, friction: 0.6 }),
             collider,
             colour: crate_colour(self.dropped),
             slot,
         });
         self.dropped += 1;
+    }
+
+    /// A drop point clear of everything already in the world.
+    ///
+    /// Spawning at a fixed height overlaps: press the key twice quickly
+    /// and two crates occupy the same space. The solver then has to push
+    /// them apart from *inside* each other, which is the one case a
+    /// single contact point handles badly — the normal it picks is the
+    /// axis of least penetration, and deep inside a box that axis flips
+    /// between ticks, so they grind against each other instead of
+    /// separating.
+    ///
+    /// Avoiding the overlap is much cheaper than resolving it: drop above
+    /// whatever is already there, and step upward until nothing is within
+    /// a crate's diameter.
+    fn spawn_point(&self) -> DVec3 {
+        // A little lateral scatter so crates topple into a pile rather
+        // than forming a perfect column.
+        let n = self.dropped as f64;
+        let x = (n * 1.1).sin() * 0.6;
+        let y = (n * 0.9).cos() * 0.6;
+
+        // Start above the tallest thing in the world.
+        let highest = self
+            .bodies
+            .iter()
+            .filter(|b| b.rigid.kind.is_dynamic())
+            .map(|b| b.transform.pos.z)
+            .fold(2.0f64, f64::max);
+        let mut z = highest + 3.0;
+
+        // Then walk up until the drop point is clear. Full diameter of
+        // separation, so a crate rotated to any angle still fits.
+        let clearance = (CRATE_HALF as f64) * 2.0 * 1.2;
+        for _ in 0..32 {
+            let p = DVec3::new(x, y, z);
+            let clash = self
+                .bodies
+                .iter()
+                .filter(|b| b.rigid.kind.is_dynamic())
+                .any(|b| b.transform.pos.distance(p) < clearance);
+            if !clash {
+                break;
+            }
+            z += clearance;
+        }
+        DVec3::new(x, y, z)
     }
 
     /// Where the camera sits this frame.
@@ -227,30 +277,29 @@ impl Game {
                 bb.transform.rot,
             );
             if let Some((normal, penetration)) = hit {
-                // Contact point approximated as the midpoint between
-                // centres, pulled onto the surface. Good enough for boxes
-                // this size; a real manifold would give up to four points
-                // per face pair and make stacks steadier.
-                // The deepest point of A into B. This must be a real
-                // surface point, not an approximation: the lever arm from
-                // each centre to the contact decides how much of the
-                // impulse becomes spin, and a point metres off the
-                // surface shrinks the impulse until bodies sink through
-                // each other. See `obb_contact_point`.
-                let point = narrow3d::obb_contact_point(
+                // **Every** contact point between the pair, not just the
+                // deepest one. A box resting flat has four equally deep
+                // bottom corners; picking one puts every impulse on a
+                // 0.5 m lever arm and the force holding the crate up also
+                // spins it. See `obb_contact_manifold`.
+                for (point, depth) in narrow3d::obb_contact_manifold(
                     ba.transform.pos,
                     ha,
                     ba.transform.rot,
+                    bb.transform.pos,
+                    hb,
+                    bb.transform.rot,
                     normal,
                     penetration,
-                );
-                out.push(physics3d::Contact {
-                    a: ia,
-                    b: ib,
-                    normal,
-                    penetration,
-                    point,
-                });
+                ) {
+                    out.push(physics3d::Contact {
+                        a: ia,
+                        b: ib,
+                        normal,
+                        penetration: depth,
+                        point,
+                    });
+                }
             }
         }
         out
@@ -337,14 +386,7 @@ impl App for Game {
             self.reset();
         }
         if ctx.input.key_pressed(KeyCode::Space) {
-            // Drop from above the current pile, offset so it topples
-            // rather than landing perfectly stacked.
-            let n = self.dropped as f64;
-            self.drop_crate(DVec3::new(
-                (n * 1.1).sin() * 0.6,
-                (n * 0.9).cos() * 0.6,
-                8.0,
-            ));
+            self.drop_crate(self.spawn_point());
         }
 
         // A click is recorded here and resolved in `render`, which is
@@ -404,6 +446,12 @@ impl App for Game {
                 })
                 .collect();
             physics3d::solver::solve(&mut refs, &contacts, dt as f64);
+            // Sleep is checked *here*, after the solve, not inside
+            // `step`. A resting body still holds a tick of gravity when
+            // `step` ends -- the solver cancels it a moment later -- so
+            // testing for stillness any earlier sees every settled body
+            // as moving and nothing ever sleeps.
+            physics3d::update_sleep_all(&mut refs, dt);
         }
 
         // Anything that falls off the world is gone; without this a
@@ -505,22 +553,6 @@ impl ClientApp for Game {
 
         // ---- self-check, under `--verify` -------------------------------
         self.frame += 1;
-        if std::env::var("CRATES3D_TRACE").is_ok() && self.frame.is_multiple_of(30) {
-            let zs: Vec<String> = self
-                .bodies
-                .iter()
-                .filter(|b| b.rigid.kind.is_dynamic())
-                .map(|b| format!("{:.3}", b.transform.pos.z))
-                .collect();
-            let cs = self.contacts();
-            let pen = cs.iter().map(|c| c.penetration).fold(0.0f64, f64::max);
-            let pairs = self.grid.query_pairs().len();
-            let norms: Vec<String> = cs.iter().take(3)
-                .map(|c| format!("({},{}) n=({:.2},{:.2},{:.2}) p={:.3}",
-                     c.a, c.b, c.normal.x, c.normal.y, c.normal.z, c.penetration)).collect();
-            eprintln!("[trace] f{:4} z=[{}] pairs={} contacts={} max_pen={:.4} {}",
-                self.frame, zs.join(" "), pairs, cs.len(), pen, norms.join(" | "));
-        }
         if let Some(at) = self.verify_at {
             if self.frame == at {
                 // Ask for a capture; it arrives next frame.
@@ -661,7 +693,62 @@ impl Game {
             std::process::exit(1);
         }
 
-        println!("[verify] OK — scene rendered, geometry visible, physics settled");
+        // A crate resting on the floor has its centre exactly a
+        // half-extent above it. Sinking past the penetration slop means
+        // the solver is losing ground every tick, which ends with the
+        // crate falling through — the failure that `lowest < -2.0` above
+        // only catches once it is far too late.
+        let resting = CRATE_HALF as f64;
+        if lowest < resting - 0.02 {
+            eprintln!(
+                "VERIFY FAIL: the lowest crate is at z={lowest:.3}, {:.3} m \
+                 into the floor — contacts are not holding it up",
+                resting - lowest,
+            );
+            std::process::exit(1);
+        }
+
+        // Nothing may overlap anything else once settled. A pair stuck
+        // inside each other is what a single-point contact manifold
+        // produces: the normal flips between ticks and the pair grinds
+        // instead of separating.
+        let mut worst = 0.0f64;
+        for c in &self.contacts() {
+            let (a, b) = (&self.bodies[c.a], &self.bodies[c.b]);
+            if a.rigid.kind.is_dynamic() && b.rigid.kind.is_dynamic() {
+                worst = worst.max(c.penetration);
+            }
+        }
+        if worst > 0.05 {
+            eprintln!(
+                "VERIFY FAIL: two crates overlap by {worst:.3} m — they are \
+                 stuck inside each other rather than resting on each other",
+            );
+            std::process::exit(1);
+        }
+
+        // Everything must have gone to sleep. A settled crate that stays
+        // awake is jiggling: the solver is still finding motion to cancel
+        // every tick, which is exactly what a single-point contact
+        // manifold produced, and it costs the scene real work forever.
+        if asleep != crates.len() {
+            let worst_v = crates
+                .iter()
+                .map(|b| b.velocity.linear.length())
+                .fold(0.0f64, f64::max);
+            eprintln!(
+                "VERIFY FAIL: only {asleep} of {} crates are asleep after \
+                 {VERIFY_AT_FRAME} frames — the fastest is still moving at \
+                 {worst_v:.4} m/s, so the scene never comes to rest",
+                crates.len(),
+            );
+            std::process::exit(1);
+        }
+
+        println!(
+            "[verify] OK — scene rendered, geometry visible, \
+             physics settled (resting z={lowest:.3}, worst overlap={worst:.4})"
+        );
         std::process::exit(0);
     }
 }
@@ -719,10 +806,12 @@ impl Game {
 
 /// Frames to run before the self-check fires, when `--verify` is passed.
 ///
-/// Long enough for the opening stack to fall and settle, so the check
-/// sees a scene physics has actually acted on rather than its initial
-/// placement.
-const VERIFY_AT_FRAME: u32 = 120;
+/// Long enough for the opening stack to fall and settle *and fall
+/// asleep*, so the check sees a scene physics has actually finished with
+/// rather than one still in motion. Settling takes a little under four
+/// seconds from the drop, plus the half second of continuous stillness
+/// [`void_engine::physics3d::TIME_TO_SLEEP`] requires.
+const VERIFY_AT_FRAME: u32 = 420;
 
 fn main() {
     // `--verify` runs headed for a couple of seconds, captures a frame,

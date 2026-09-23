@@ -582,3 +582,51 @@ even if 3D is never built.
 4. **What happens to procedural materials?** The `pattern`/`local`/`scale`
    system is a genuinely nice piece of work that assumes a flat plane. Port
    it, drop it for 3D, or run 3D unlit initially?
+
+## 9. What the running game corrected
+
+Assembling `examples/crates3d` found three defects the unit tests could not,
+because each needs a body to rest on another for hundreds of consecutive
+ticks before it shows.
+
+**One contact point per pair is not "enough to stand a stack up".** The
+narrowphase returned the single deepest vertex of A, and `obb_contact_point`'s
+own doc called four points per face pair "the obvious next step". It is not an
+improvement, it is a correctness requirement. A box resting flat has four
+equally deep bottom corners, so "deepest" is a tie broken by float noise and
+the answer is a corner — half a box from the centre of mass. Every impulse
+holding the crate up also spun it. Measured: three crates still awake after
+1200 ticks, drifting sideways across a flat floor at 0.157 m/s with nothing
+pushing them, resting 0.08 m *inside* the floor, and a stack holding a 0.10 m
+overlap for six hundred ticks before the upper crate slid off the corner and
+fell through the lower one. The user reported all three as "jiggling" and
+"spawning inside each other and kinda getting stuck".
+
+`obb_contact_manifold` replaces it: Sutherland–Hodgman clipping of A's contact
+face against B's, up to four points, falling back to the single point for
+genuine edge and corner contacts. Same measurement after: all three asleep by
+frame 400, velocity 0.000, resting z = 0.500 exactly, overlap 0.0000.
+
+**Boundary tests in a manifold must be tolerant.** An exact `depth >= 0.0`
+drops a corner on the frames it sits a micron proud of the surface and takes
+it back the next. The surviving points absorb the lost impulse each time: the
+contact count flickered 4 → 3 → 4 and velocity spiked from 0.006 to 0.083 m/s
+on exactly those frames, which reset the sleep timer forever.
+
+**Nothing can sleep if contact alone wakes it.** The solver woke any body in
+any contact, and a crate resting on the floor is in a contact every tick — so
+it was woken the tick after it fell asleep, permanently. Waking now requires
+the other body to be *moving*. A projectile still wakes what it hits; a static
+floor does not.
+
+**Sleep cannot be updated inside `step`.** `step` integrates, the caller
+solves contacts afterwards, so a resting body still holds a full tick of
+gravity when `step` ends — 0.1635 m/s at 60 Hz, twice the 0.05 m/s stillness
+threshold. A sleep pass there resets the clock every tick and the half second
+of continuous stillness never accumulates. It moved to `update_sleep_all`,
+which callers run after the solve. This is a breaking change to `step`.
+
+Each fix is guarded by a test verified to fail when the fix is reverted, and
+`crates3d --verify` now asserts resting height, zero overlap and that every
+crate sleeps — it fails with the exact 0.079 m sinking when the manifold is
+reverted.
