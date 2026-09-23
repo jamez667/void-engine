@@ -221,9 +221,200 @@ fn a_schema_mismatch_is_rejected() {
     v2.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 2).unwrap();
 
     let err = restore(&snap, &v2).err().expect("a schema bump must fail");
-    assert_eq!(err, SnapshotError::SchemaMismatch {
-        name: "destructible2d".into(), found: 1, expected: 2,
-    });
+    // Matched rather than compared whole: `detail` carries the underlying
+    // `MigrateError`'s message, and pinning that string would make this
+    // test fail on any rewording of an error nobody is asserting about.
+    match err {
+        SnapshotError::SchemaMismatch { name, found, expected, detail } => {
+            assert_eq!(name, "destructible2d");
+            assert_eq!((found, expected), (1, 2));
+            assert!(
+                detail.contains("no migration registered"),
+                "the error should say which step is missing, got {detail:?}",
+            );
+        }
+        other => panic!("expected a schema mismatch, got {other:?}"),
+    }
+}
+
+/// The point of the migration chain: a component whose shape changed can
+/// still load a save written before the change.
+///
+/// Before this existed, a version bump was unconditionally fatal to every
+/// existing save — `registry.rs` promised "the load path runs migrations
+/// forward" in three places and no such machinery was there.
+#[test]
+fn a_registered_migration_brings_an_old_save_forward() {
+    let mut v1 = Registry::new();
+    v1.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 1).unwrap();
+
+    let mut w = World::new();
+    let e = w.spawn();
+    w.insert(e, Destructible2D::new(5.0, 100.0));
+    let snap = capture(&w, &v1, 0, &RngStreams::new()).unwrap();
+
+    let mut v2 = Registry::new();
+    v2.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 2).unwrap();
+    // A migration that genuinely rewrites the bytes, so this test can
+    // tell "the chain ran and its output was decoded" from "the chain was
+    // skipped and the original bytes were decoded". A no-op step proves
+    // only the first half, which is the trap: it passes whether or not
+    // the migration is wired into the load path at all.
+    //
+    // This is what a real migration looks like: decode a mirror of the
+    // old shape, change it, re-encode. Here the mirror is the same type,
+    // and the change doubles every radius.
+    v2.register_migration("destructible2d", 1, |bytes| {
+        let mut col: Vec<Option<Destructible2D>> =
+            bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+        for slot in col.iter_mut().flatten() {
+            slot.radius *= 2.0;
+        }
+        bincode::serialize(&col).map_err(|e| e.to_string())
+    })
+    .unwrap();
+
+    let restored = restore(&snap, &v2).expect("a migrated save must load");
+    let got = restored
+        .get::<Destructible2D>(e)
+        .expect("the component must survive the migration");
+    assert_eq!(
+        got.radius, 10.0,
+        "the migration doubles the radius, so 5.0 must arrive as 10.0 — \
+         seeing 5.0 means the chain never ran and the original bytes were \
+         decoded straight through",
+    );
+    assert_eq!(got.mass, 100.0, "fields the migration did not touch must survive");
+}
+
+/// Steps chain: a save two versions behind runs both migrations, in
+/// order. Declaring a 1→3 jump is deliberately impossible, because a
+/// chain of small steps is what lets a save written at *any* intermediate
+/// version load.
+#[test]
+fn migrations_chain_across_several_versions_in_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ORDER: AtomicUsize = AtomicUsize::new(0);
+
+    let mut v1 = Registry::new();
+    v1.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 1).unwrap();
+
+    let mut w = World::new();
+    let e = w.spawn();
+    w.insert(e, Destructible2D::new(3.0, 50.0));
+    let snap = capture(&w, &v1, 0, &RngStreams::new()).unwrap();
+
+    ORDER.store(0, Ordering::SeqCst);
+    let mut v3 = Registry::new();
+    v3.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 3).unwrap();
+    v3.register_migration("destructible2d", 1, |b| {
+        assert_eq!(ORDER.swap(1, Ordering::SeqCst), 0, "1->2 must run first");
+        Ok(b.to_vec())
+    })
+    .unwrap();
+    v3.register_migration("destructible2d", 2, |b| {
+        assert_eq!(ORDER.swap(2, Ordering::SeqCst), 1, "2->3 must run second");
+        Ok(b.to_vec())
+    })
+    .unwrap();
+
+    restore(&snap, &v3).expect("a two-step migration must load");
+    assert_eq!(ORDER.load(Ordering::SeqCst), 2, "both steps must have run");
+}
+
+/// A gap in the chain is still fatal. The difference migrations make is
+/// that a game *can* close the gap — not that a missing step is ignored,
+/// which would read bytes in the wrong shape and corrupt state silently.
+#[test]
+fn a_gap_in_the_migration_chain_is_still_an_error() {
+    let mut v1 = Registry::new();
+    v1.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 1).unwrap();
+
+    let mut w = World::new();
+    let e = w.spawn();
+    w.insert(e, Destructible2D::new(1.0, 2.0));
+    let snap = capture(&w, &v1, 0, &RngStreams::new()).unwrap();
+
+    let mut v3 = Registry::new();
+    v3.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 3).unwrap();
+    // Only the second half of the chain: 1->2 is missing.
+    v3.register_migration("destructible2d", 2, |b| Ok(b.to_vec())).unwrap();
+
+    let err = restore(&snap, &v3).err().expect("a gap must fail");
+    match err {
+        SnapshotError::SchemaMismatch { detail, .. } => assert!(
+            detail.contains("from version 1 to 2"),
+            "the error should name the missing step, got {detail:?}",
+        ),
+        other => panic!("expected a schema mismatch, got {other:?}"),
+    }
+}
+
+/// A save from a *newer* build cannot be migrated: steps only run
+/// forward. Refusing is the honest answer — the alternative is reading
+/// fields this build does not know about as though they were fields it
+/// does.
+#[test]
+fn a_component_from_a_future_build_is_refused() {
+    let mut newer = Registry::new();
+    newer.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 5).unwrap();
+
+    let mut w = World::new();
+    let e = w.spawn();
+    w.insert(e, Destructible2D::new(1.0, 2.0));
+    let snap = capture(&w, &newer, 0, &RngStreams::new()).unwrap();
+
+    let mut older = Registry::new();
+    older.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 2).unwrap();
+
+    let err = restore(&snap, &older).err().expect("a future component must fail");
+    match err {
+        SnapshotError::SchemaMismatch { detail, .. } => assert!(
+            detail.contains("newer than this build"),
+            "the error should say the save is from the future, got {detail:?}",
+        ),
+        other => panic!("expected a schema mismatch, got {other:?}"),
+    }
+}
+
+/// A failing migration surfaces its own message rather than a bare
+/// version comparison — otherwise a game debugging a bad upgrade learns
+/// only that two numbers differ.
+#[test]
+fn a_failing_migration_reports_why() {
+    let mut v1 = Registry::new();
+    v1.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 1).unwrap();
+
+    let mut w = World::new();
+    let e = w.spawn();
+    w.insert(e, Destructible2D::new(1.0, 2.0));
+    let snap = capture(&w, &v1, 0, &RngStreams::new()).unwrap();
+
+    let mut v2 = Registry::new();
+    v2.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 2).unwrap();
+    v2.register_migration("destructible2d", 1, |_| Err("field 'shape' was never set".into()))
+        .unwrap();
+
+    let err = restore(&snap, &v2).err().expect("a failing migration must fail");
+    match err {
+        SnapshotError::SchemaMismatch { detail, .. } => assert!(
+            detail.contains("field 'shape' was never set"),
+            "the migration's own message should reach the caller, got {detail:?}",
+        ),
+        other => panic!("expected a schema mismatch, got {other:?}"),
+    }
+}
+
+/// A migration for a step at or above the current version could never
+/// run, so registering one is rejected rather than silently ignored — a
+/// typo there leaves a registration that looks complete.
+#[test]
+fn a_migration_that_could_never_run_is_rejected() {
+    let mut r = Registry::new();
+    r.register_versioned::<Destructible2D>("destructible2d", Persist::Volatile, 2).unwrap();
+    assert!(r.register_migration("destructible2d", 2, |b| Ok(b.to_vec())).is_err());
+    assert!(r.register_migration("destructible2d", 7, |b| Ok(b.to_vec())).is_err());
+    assert!(r.register_migration("destructible2d", 1, |b| Ok(b.to_vec())).is_ok());
 }
 
 /// A snapshot from a future engine is refused rather than partially read:

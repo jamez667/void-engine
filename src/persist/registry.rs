@@ -26,6 +26,24 @@
 //! is a commitment in this file rather than in the type definition, so
 //! refactoring stays free and [`Registry::rename`] recovers a bad choice.
 //!
+//! # Changing a component's shape
+//!
+//! Renaming the Rust type is free; changing its *fields* is not, because
+//! a save file full of the old shape already exists. The sequence is:
+//!
+//! 1. Bump the component's `version` at its registration.
+//! 2. Register a [`Migration`] for that step with
+//!    [`Registry::register_migration`], which takes the old bytes and
+//!    returns new ones.
+//!
+//! Without step 2 the bump is a hard error on every existing save, by
+//! design — reading old bytes as the new shape is how a save file turns
+//! into corrupt state that surfaces much later. With it, the load path
+//! chains steps forward from whatever version the snapshot recorded.
+//!
+//! Migrations run **forward only**. A save from a newer build is refused
+//! rather than downgraded.
+//!
 //! # Cost
 //!
 //! A name appears once per component type in a snapshot header, never per
@@ -34,7 +52,7 @@
 //! — pays two bytes rather than a string.
 
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -117,6 +135,23 @@ impl Replicate {
     }
 }
 
+/// One version step's upgrade, as a pure function over encoded bytes.
+///
+/// # Why bytes rather than values
+///
+/// A migration exists precisely because the *old* shape is no longer a
+/// Rust type this build has — that is what "the fields changed" means. A
+/// value-level migration would need both the old and new types in scope,
+/// so every historical shape would have to be kept compiled forever.
+/// Working on bytes lets a game deserialise into whatever local struct it
+/// likes (usually a small `#[derive(Deserialize)]` mirror of the old
+/// shape, kept beside the migration) and re-encode in the new one.
+///
+/// The column is a `Vec<Option<T>>`, holes intact, as `codec_for` writes
+/// it — a migration that decodes to `Vec<Option<Old>>` and encodes a
+/// `Vec<Option<New>>` is doing the right thing.
+pub type Migration = fn(&[u8]) -> Result<Vec<u8>, String>;
+
 /// A component's registration.
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -126,9 +161,23 @@ pub struct Entry {
     /// Who, if anyone, this component is replicated to. See [`Replicate`].
     pub replicate: Replicate,
     /// Schema version for this component's encoding. Bump when the
-    /// component's fields change shape; the load path runs migrations
-    /// forward from the version recorded in the snapshot.
+    /// component's fields change shape, and register a [`Migration`] for
+    /// the step; the load path then runs migrations forward from the
+    /// version recorded in the snapshot.
+    ///
+    /// Without a migration for every step between the saved version and
+    /// this one, loading that save is a hard [`SchemaMismatch`] rather
+    /// than a silent misread — see [`Registry::migrate`].
+    ///
+    /// [`SchemaMismatch`]: crate::persist::snapshot::SnapshotError::SchemaMismatch
     pub version: u32,
+    /// Byte-level upgrades, one per version step, keyed by the version
+    /// they read.
+    ///
+    /// `migrations[&3]` takes bytes written at version 3 and returns bytes
+    /// readable at version 4. See [`Registry::register_migration`] for why
+    /// these work on bytes rather than on values.
+    pub migrations: BTreeMap<u32, Migration>,
     /// The Rust type this name refers to *in this build*. Used to look up
     /// a registration from a generic call site; never written to a file.
     pub type_id: TypeId,
@@ -211,7 +260,62 @@ pub enum RegistryError {
     UnknownRename(&'static str),
     /// More than `u16::MAX` component types.
     TooManyComponents,
+    /// A migration was registered for a step at or above the component's
+    /// current version, so it could never run. Rejected rather than
+    /// ignored: a typo here leaves a registration that looks complete.
+    UselessMigration {
+        name: &'static str,
+        from: u32,
+        current: u32,
+    },
 }
+
+/// Why a column could not be brought forward to the current schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MigrateError {
+    /// No migration registered for a step in the chain. The save cannot
+    /// be loaded, which is the honest answer — reading bytes in the wrong
+    /// shape would corrupt state rather than fail.
+    MissingStep {
+        name: &'static str,
+        from: u32,
+        to: u32,
+    },
+    /// A migration ran and failed.
+    Failed {
+        name: &'static str,
+        from: u32,
+        detail: String,
+    },
+    /// The save was written by a newer build. Migrations run forward
+    /// only, so there is nothing to do but refuse.
+    FromTheFuture {
+        name: &'static str,
+        found: u32,
+        supported: u32,
+    },
+}
+
+impl std::fmt::Display for MigrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrateError::MissingStep { name, from, to } => write!(
+                f,
+                "no migration registered for {name:?} from version {from} to {to}",
+            ),
+            MigrateError::Failed { name, from, detail } => write!(
+                f,
+                "migrating {name:?} from version {from} failed: {detail}",
+            ),
+            MigrateError::FromTheFuture { name, found, supported } => write!(
+                f,
+                "{name:?} was saved at version {found}, newer than this build's {supported}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrateError {}
 
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -226,6 +330,11 @@ impl std::fmt::Display for RegistryError {
                 write!(f, "rename from {n:?}, which is not registered"),
             RegistryError::TooManyComponents =>
                 write!(f, "more than {} component types registered", u16::MAX),
+            RegistryError::UselessMigration { name, from, current } => write!(
+                f,
+                "migration for {name:?} from version {from} can never run: \
+                 the component is already at version {current}",
+            ),
         }
     }
 }
@@ -387,7 +496,10 @@ impl Registry {
         }
 
         let id = NameId(self.entries.len() as u16);
-        self.entries.push(Entry { name, id, persist, replicate, version, type_id, codec });
+        self.entries.push(Entry {
+            name, id, persist, replicate, version, type_id, codec,
+            migrations: BTreeMap::new(),
+        });
         self.by_name.insert(name, id);
         self.by_type.insert(type_id, id);
         Ok(id)
@@ -405,6 +517,83 @@ impl Registry {
         }
         self.aliases.insert(old.to_string(), new);
         Ok(())
+    }
+
+    /// Register the upgrade from `from_version` to `from_version + 1`.
+    ///
+    /// Call once per step. To take a component from version 1 to 3, a game
+    /// registers the 1→2 and 2→3 steps and `migrate` chains them; there is
+    /// deliberately no way to declare a 1→3 jump, because a chain of small
+    /// steps is what lets a save written at *any* intermediate version
+    /// load.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::UnknownRename`] if `name` is not registered —
+    /// reusing that variant rather than adding one, since it already means
+    /// "you named a component that does not exist".
+    ///
+    /// A step at or above the component's current version is rejected: it
+    /// could never run, because `migrate` stops when it reaches the
+    /// current version, and accepting it would let a typo sit silently in
+    /// a registration that looks complete.
+    pub fn register_migration(
+        &mut self,
+        name: &'static str,
+        from_version: u32,
+        migration: Migration,
+    ) -> Result<(), RegistryError> {
+        let Some(&id) = self.by_name.get(name) else {
+            return Err(RegistryError::UnknownRename(name));
+        };
+        let entry = &mut self.entries[id.0 as usize];
+        if from_version >= entry.version {
+            return Err(RegistryError::UselessMigration {
+                name,
+                from: from_version,
+                current: entry.version,
+            });
+        }
+        entry.migrations.insert(from_version, migration);
+        Ok(())
+    }
+
+    /// Walk `bytes` forward from `from` to this entry's current version.
+    ///
+    /// Returns the bytes unchanged when already current, so the common
+    /// case costs nothing. A gap in the chain is an error rather than a
+    /// skip: silently loading bytes in the wrong shape is how a save file
+    /// turns into corrupt state that only surfaces much later.
+    ///
+    /// A version *newer* than this build's is also an error. Migrations
+    /// only run forward; a save from a future build cannot be downgraded,
+    /// and pretending otherwise would misread it.
+    pub fn migrate(&self, entry: &Entry, from: u32, bytes: &[u8]) -> Result<Vec<u8>, MigrateError> {
+        if from > entry.version {
+            return Err(MigrateError::FromTheFuture {
+                name: entry.name,
+                found: from,
+                supported: entry.version,
+            });
+        }
+        let mut current = from;
+        let mut buf = bytes.to_vec();
+        while current < entry.version {
+            let Some(step) = entry.migrations.get(&current) else {
+                return Err(MigrateError::MissingStep {
+                    name: entry.name,
+                    from: current,
+                    to: current + 1,
+                });
+            };
+            buf = step(&buf).map_err(|e| MigrateError::Failed {
+                name: entry.name,
+                from: current,
+                detail: e,
+            })?;
+            current += 1;
+        }
+        Ok(buf)
     }
 
     /// Look up by the name a snapshot recorded, following any alias.

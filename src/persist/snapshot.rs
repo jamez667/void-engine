@@ -71,9 +71,15 @@ pub enum SnapshotError {
     /// A component in the snapshot is not registered in this build, and
     /// no alias covers it.
     UnknownComponent(String),
-    /// A registered component's schema is older or newer than the
-    /// snapshot's and no migration bridges the gap.
-    SchemaMismatch { name: String, found: u32, expected: u32 },
+    /// A registered component's schema differs from the snapshot's and
+    /// the migration chain could not bridge the gap.
+    ///
+    /// `detail` carries the [`MigrateError`] that explains which step is
+    /// missing or which one failed — without it this error says only that
+    /// two numbers differ, which is the least useful half of the answer.
+    ///
+    /// [`MigrateError`]: crate::persist::registry::MigrateError
+    SchemaMismatch { name: String, found: u32, expected: u32, detail: String },
     /// The allocator arrays contradict each other.
     Corrupt(String),
     /// bincode failed.
@@ -87,8 +93,8 @@ impl std::fmt::Display for SnapshotError {
                 f, "snapshot format {found} is newer than supported {supported}"),
             SnapshotError::UnknownComponent(n) => write!(
                 f, "snapshot names component {n:?}, which is not registered"),
-            SnapshotError::SchemaMismatch { name, found, expected } => write!(
-                f, "component {name:?} schema {found} != expected {expected}"),
+            SnapshotError::SchemaMismatch { name, found, expected, detail } => write!(
+                f, "component {name:?} schema {found} != expected {expected}: {detail}"),
             SnapshotError::Corrupt(why) => write!(f, "snapshot is inconsistent: {why}"),
             SnapshotError::Codec(e) => write!(f, "codec: {e}"),
         }
@@ -189,18 +195,26 @@ pub fn restore(snapshot: &Snapshot, registry: &Registry) -> Result<World, Snapsh
             .by_name(&column.name)
             .ok_or_else(|| SnapshotError::UnknownComponent(column.name.clone()))?;
 
-        if entry.version != column.version {
-            return Err(SnapshotError::SchemaMismatch {
-                name: column.name.clone(),
-                found: column.version,
-                expected: entry.version,
-            });
-        }
-
         let Some(codec) = entry.codec else {
             return Err(SnapshotError::UnknownComponent(column.name.clone()));
         };
-        let decoded = (codec.decode)(&column.bytes).map_err(SnapshotError::Codec)?;
+
+        // Bring the column forward to this build's schema. `migrate`
+        // returns the bytes untouched when the versions already agree, so
+        // the common case costs one comparison.
+        //
+        // A gap in the chain is still a hard error — the difference this
+        // makes is that a game *can* now close the gap, where before a
+        // version bump was unconditionally fatal to every existing save.
+        let bytes = registry
+            .migrate(entry, column.version, &column.bytes)
+            .map_err(|e| SnapshotError::SchemaMismatch {
+                name: column.name.clone(),
+                found: column.version,
+                expected: entry.version,
+                detail: e.to_string(),
+            })?;
+        let decoded = (codec.decode)(&bytes).map_err(SnapshotError::Codec)?;
         world
             .install_column(entry.type_id, decoded, codec.make_storage)
             .map_err(SnapshotError::Corrupt)?;
