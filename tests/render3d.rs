@@ -22,29 +22,11 @@ use void_engine::renderer::render3d::depth_state;
 const W: u32 = 128;
 const H: u32 = 128;
 
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
+mod common;
+use common::{Gpu, Readback};
 
 fn gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::default(),
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("render3d test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::default(),
-        },
-        None,
-    ))
-    .ok()?;
-    Some(Gpu { device, queue })
+    common::gpu("render3d test device")
 }
 
 /// A camera looking at the origin from along -Y, far enough back to see a
@@ -211,17 +193,8 @@ fn render_with_model(
             cache: None,
         });
 
-    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("target"),
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let target_view = target.create_view(&Default::default());
+    let readback = Readback::new(gpu, W, H);
+    let target_view = &readback.view;
 
     let depth_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
@@ -250,21 +223,12 @@ fn render_with_model(
             usage: wgpu::BufferUsages::INDEX,
         });
 
-    let unpadded = W * 4;
-    let padded = unpadded.div_ceil(256) * 256;
-    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (padded * H) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     {
         let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target_view,
+                view: target_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -293,37 +257,10 @@ fn render_with_model(
         rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
     }
-    enc.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: &target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &readback,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(H),
-            },
-        },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-    );
+    readback.copy_from_texture(&mut enc);
     gpu.queue.submit([enc.finish()]);
 
-    let slice = readback.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    gpu.device.poll(wgpu::Maintain::Wait);
-    let mapped = slice.get_mapped_range();
-    let mut out = Vec::with_capacity((unpadded * H) as usize);
-    for row in 0..H {
-        let start = (row * padded) as usize;
-        out.extend_from_slice(&mapped[start..start + unpadded as usize]);
-    }
-    drop(mapped);
-    readback.unmap();
-    out
+    readback.pixels(gpu)
 }
 
 /// An empty shadow map with an overhead sun: nothing occludes anything, so

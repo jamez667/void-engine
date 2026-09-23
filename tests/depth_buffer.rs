@@ -18,38 +18,32 @@
 //! a validation error, so "the depth pipeline builds and draws at all" is
 //! itself part of what is being asserted.
 //!
+//! # What this does *not* catch, and what does
+//!
+//! Changing the compare to `Less` while writes stay off passes this test,
+//! and always has. With nothing written to the depth buffer every
+//! fragment tests against the 1.0 clear and passes, so the frame is
+//! identical — the compare only bites once something records depth.
+//!
+//! The guard against that is the `const` assertion at the bottom of this
+//! file: flipping [`MAIN_WRITES_DEPTH`] fails the *build*, before any
+//! pixel is drawn. The two together cover the state; neither does alone,
+//! which is worth knowing before trusting a green run here.
+//!
 //! Skipped, not failed, when no adapter is available — same rule as
 //! `materials_render.rs`.
 
 use void_engine::renderer::batch::{Batch, Material, Surface};
 use void_engine::renderer::depth::{main_pipeline_state, DEPTH_FORMAT, MAIN_WRITES_DEPTH};
 
+mod common;
+use common::{Gpu, Readback};
+
 const W: u32 = 128;
 const H: u32 = 128;
 
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
-
 fn gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::default(),
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("depth test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::default(),
-        },
-        None,
-    ))
-    .ok()?;
-    Some(Gpu { device, queue })
+    common::gpu("depth test device")
 }
 
 /// Overlapping geometry, drawn back-to-front.
@@ -208,17 +202,8 @@ fn render(gpu: &Gpu, batch: &Batch, with_depth: bool) -> Vec<u8> {
             cache: None,
         });
 
-    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("target"),
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let target_view = target.create_view(&Default::default());
+    let readback = Readback::new(gpu, W, H);
+    let target_view = &readback.view;
 
     // Mirrors `DepthBuffer::new`. Built here rather than through that type
     // because it is `pub(super)` — the format is what must match, and that
@@ -250,21 +235,12 @@ fn render(gpu: &Gpu, batch: &Batch, with_depth: bool) -> Vec<u8> {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-    let unpadded = W * 4;
-    let padded = unpadded.div_ceil(256) * 256;
-    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (padded * H) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     {
         let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target_view,
+                view: target_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -291,39 +267,10 @@ fn render(gpu: &Gpu, batch: &Batch, with_depth: bool) -> Vec<u8> {
         rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..batch.indices.len() as u32, 0, 0..1);
     }
-    enc.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: &target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &readback,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(H),
-            },
-        },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-    );
+    readback.copy_from_texture(&mut enc);
     gpu.queue.submit([enc.finish()]);
 
-    let slice = readback.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    gpu.device.poll(wgpu::Maintain::Wait);
-    let mapped = slice.get_mapped_range();
-
-    // Strip the 256-byte row padding so the comparison is over pixels.
-    let mut out = Vec::with_capacity((unpadded * H) as usize);
-    for row in 0..H {
-        let start = (row * padded) as usize;
-        out.extend_from_slice(&mapped[start..start + unpadded as usize]);
-    }
-    drop(mapped);
-    readback.unmap();
-    out
+    readback.pixels(gpu)
 }
 
 #[test]

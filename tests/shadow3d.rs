@@ -37,29 +37,11 @@ const LIGHT_DIR: Vec3 = Vec3::new(0.0, -0.35, 1.0);
 /// How much of the scene the shadow map covers.
 const SHADOW_RADIUS: f32 = 12.0;
 
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
+mod common;
+use common::{Gpu, Readback};
 
 fn gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::default(),
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("shadow3d test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::default(),
-        },
-        None,
-    ))
-    .ok()?;
-    Some(Gpu { device, queue })
+    common::gpu("shadow3d test device")
 }
 
 /// Looking down at a floor from above and behind, so a shadow cast on it
@@ -383,17 +365,8 @@ fn render(gpu: &Gpu, floor: &Mesh3D, caster: Option<&Mesh3D>, cam: &Camera3D) ->
         });
 
     // ---- targets --------------------------------------------------------
-    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let target_view = target.create_view(&Default::default());
+    let readback = Readback::new(gpu, W, H);
+    let target_view = &readback.view;
     let depth_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
@@ -425,15 +398,6 @@ fn render(gpu: &Gpu, floor: &Mesh3D, caster: Option<&Mesh3D>, cam: &Camera3D) ->
     };
     let floor_buf = upload(floor);
     let caster_buf = caster.map(upload);
-
-    let unpadded = W * 4;
-    let padded = unpadded.div_ceil(256) * 256;
-    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (padded * H) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
 
     let mut enc = gpu.device.create_command_encoder(&Default::default());
 
@@ -469,7 +433,7 @@ fn render(gpu: &Gpu, floor: &Mesh3D, caster: Option<&Mesh3D>, cam: &Camera3D) ->
         let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("main_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target_view,
+                view: target_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -505,37 +469,10 @@ fn render(gpu: &Gpu, floor: &Mesh3D, caster: Option<&Mesh3D>, cam: &Camera3D) ->
         }
     }
 
-    enc.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: &target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &readback,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(H),
-            },
-        },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-    );
+    readback.copy_from_texture(&mut enc);
     gpu.queue.submit([enc.finish()]);
 
-    let slice = readback.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    gpu.device.poll(wgpu::Maintain::Wait);
-    let mapped = slice.get_mapped_range();
-    let mut out = Vec::with_capacity((unpadded * H) as usize);
-    for row in 0..H {
-        let start = (row * padded) as usize;
-        out.extend_from_slice(&mapped[start..start + unpadded as usize]);
-    }
-    drop(mapped);
-    readback.unmap();
-    out
+    readback.pixels(gpu)
 }
 
 /// A large floor at z = 0, facing +Z.
