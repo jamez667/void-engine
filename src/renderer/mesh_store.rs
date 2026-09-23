@@ -73,6 +73,29 @@ impl std::fmt::Display for MeshError {
 
 impl std::error::Error for MeshError {}
 
+/// Reject a mesh that cannot be uploaded safely.
+///
+/// Shared by [`MeshStore::insert`] and [`MeshStore::replace`], which had
+/// identical copies of this. Two copies of a validation rule is how one
+/// of them ends up a check behind the other.
+///
+/// A free function rather than a method because it needs no `&self`: the
+/// question is entirely about the mesh, which also means it can be tested
+/// without standing up a GPU device.
+fn validate(mesh: &Mesh3D) -> Result<(), MeshError> {
+    if mesh.is_empty() || mesh.vertices.is_empty() {
+        return Err(MeshError::Empty);
+    }
+    // Checked here rather than left to the GPU: an out-of-range index is
+    // undefined behaviour at draw time, and on some backends reads past
+    // the end of the buffer. A rejected upload is the better failure.
+    let n = mesh.vertices.len();
+    if let Some(&bad) = mesh.indices.iter().find(|&&i| i as usize >= n) {
+        return Err(MeshError::IndexOutOfRange { index: bad, vertices: n });
+    }
+    Ok(())
+}
+
 struct Slot {
     /// `None` when the slot is free. The generation keeps counting up
     /// across reuse, which is what makes a stale handle detectable.
@@ -112,13 +135,7 @@ impl MeshStore {
         device: &wgpu::Device,
         mesh: &Mesh3D,
     ) -> Result<MeshHandle, MeshError> {
-        if mesh.is_empty() || mesh.vertices.is_empty() {
-            return Err(MeshError::Empty);
-        }
-        let n = mesh.vertices.len();
-        if let Some(&bad) = mesh.indices.iter().find(|&&i| i as usize >= n) {
-            return Err(MeshError::IndexOutOfRange { index: bad, vertices: n });
-        }
+        validate(mesh)?;
 
         let gpu = GpuMesh3D::upload(device, mesh).ok_or(MeshError::Empty)?;
         self.live += 1;
@@ -148,14 +165,8 @@ impl MeshStore {
         handle: MeshHandle,
         mesh: &Mesh3D,
     ) -> Result<(), MeshError> {
-        if mesh.is_empty() || mesh.vertices.is_empty() {
-            return Err(MeshError::Empty);
-        }
-        let n = mesh.vertices.len();
-        if let Some(&bad) = mesh.indices.iter().find(|&&i| i as usize >= n) {
-            return Err(MeshError::IndexOutOfRange { index: bad, vertices: n });
-        }
-        // A stale handle must not resurrect a freed slot, so validate
+        validate(mesh)?;
+        // A stale handle must not resurrect a freed slot, so check it
         // before touching anything.
         if !self.contains(handle) {
             return Ok(());
@@ -319,15 +330,30 @@ mod tests {
         let n = m.vertices.len();
         m.indices.push(n as u32 + 5);
 
-        // Reproduce `insert`'s validation without a device.
-        let bad = m.indices.iter().find(|&&i| i as usize >= m.vertices.len());
-        assert_eq!(bad, Some(&(n as u32 + 5)));
+        assert_eq!(
+            validate(&m),
+            Err(MeshError::IndexOutOfRange { index: n as u32 + 5, vertices: n }),
+        );
     }
 
     #[test]
     fn an_empty_mesh_is_rejected() {
-        let m = Mesh3D::new();
-        assert!(m.is_empty());
+        assert_eq!(validate(&Mesh3D::new()), Err(MeshError::Empty));
+    }
+
+    #[test]
+    fn a_well_formed_mesh_passes_validation() {
+        assert_eq!(validate(&a_mesh()), Ok(()));
+    }
+
+    /// A mesh with indices but no vertices is empty in the sense that
+    /// matters: there is nothing for the indices to point at, and wgpu
+    /// rejects a zero-sized vertex buffer.
+    #[test]
+    fn indices_without_vertices_are_rejected_as_empty() {
+        let mut m = Mesh3D::new();
+        m.indices.extend([0, 1, 2]);
+        assert_eq!(validate(&m), Err(MeshError::Empty));
     }
 
     /// Instances of one mesh must group together, because binding a

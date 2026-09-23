@@ -191,8 +191,8 @@ steps:
       - |
         out=$(cargo test --lib --features render3d renderer:: 2>&1)
         echo "$out"
-        echo "$out" | grep -q "31 passed" || {
-          echo "expected 31 renderer tests; the render3d cfg gate may be wrong"
+        echo "$out" | grep -q "33 passed" || {
+          echo "expected 33 renderer tests; the render3d cfg gate may be wrong"
           exit 1
         }
 
