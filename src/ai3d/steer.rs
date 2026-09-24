@@ -8,6 +8,8 @@
 
 use glam::DVec3;
 
+use crate::avoid::{AvoidTuning, Obstacle};
+
 /// Tuning for one agent's gait.
 ///
 /// # The invariant between the radii
@@ -183,6 +185,46 @@ pub fn steering_force(
     is_final: bool,
     tuning: WalkTuning3D,
 ) -> DVec3 {
+    steering_force_avoiding(
+        pos,
+        velocity,
+        target,
+        mass,
+        is_final,
+        tuning,
+        &[],
+        AvoidTuning::default(),
+    )
+}
+
+/// [`steering_force`], bending around what is in the way.
+///
+/// The same controller, with the desired velocity steered around
+/// `obstacles` by [`crate::avoid::steer_around`] before the force is
+/// computed. An empty slice is exactly [`steering_force`].
+///
+/// # Why the obstacles enter *here*
+///
+/// The obvious placement — steer the force this function returns — does
+/// not work, and fails quietly. See the comment at the bend below: the
+/// returned force is a velocity *error*, and rotating an error term
+/// steers nothing once the agent is up to speed.
+///
+/// The obstacle positions are used in the plane only; a walker cannot act
+/// on an obstacle's height, and treating the problem as 3D makes the bend
+/// point at the sky whenever an obstacle's centre is slightly above the
+/// agent's.
+#[allow(clippy::too_many_arguments)]
+pub fn steering_force_avoiding(
+    pos: DVec3,
+    velocity: DVec3,
+    target: DVec3,
+    mass: f64,
+    is_final: bool,
+    tuning: WalkTuning3D,
+    obstacles: &[Obstacle],
+    avoid: AvoidTuning,
+) -> DVec3 {
     // Flatten first: the floor holds the agent up, so a walk force never
     // has a vertical component. Without this an agent whose target is
     // below it tries to fly down to it.
@@ -198,7 +240,38 @@ pub fn steering_force(
         return DVec3::ZERO;
     }
 
-    let desired = to_target / distance * desired_speed(distance, is_final, tuning);
+    let mut heading = to_target / distance;
+
+    // Bend the **desired velocity**, not the force.
+    //
+    // This is the whole reason avoidance lives inside this function
+    // rather than wrapping its result. The force below is
+    // `(desired - actual) * k * m`, so an agent already at cruising
+    // speed applies almost nothing — and the direction of that small
+    // residual is dominated by whatever velocity error it happens to
+    // have, not by where it wants to go. Rotating it steers nothing.
+    // Measured, bending the output instead: an agent walking at a crate
+    // dead ahead deviated by 13 mm over a 12 m walk and drove straight
+    // through it.
+    //
+    // Bending the setpoint works because everything downstream is a
+    // controller chasing it: the agent now *wants* to be moving past the
+    // obstacle, and the existing velocity-matching term does the work.
+    if !obstacles.is_empty() {
+        if let Some(dir) = crate::avoid::steer_around(
+            DVec3::new(pos.x, pos.y, 0.0),
+            heading,
+            obstacles,
+            avoid,
+        ) {
+            heading = DVec3::new(dir.x, dir.y, 0.0).normalize_or_zero();
+            if heading == DVec3::ZERO {
+                heading = to_target / distance;
+            }
+        }
+    }
+
+    let desired = heading * desired_speed(distance, is_final, tuning);
     let planar_velocity = DVec3::new(velocity.x, velocity.y, 0.0);
 
     // F = m*a, with a = k * (v_wanted - v_actual). Scaling by mass is

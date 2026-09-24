@@ -84,11 +84,23 @@ const FLOOR_FRICTION: f32 = 0.7;
 const NAV_TILE: f32 = 1.5;
 /// The nav grid's extent in tiles, comfortably inside the floor.
 const NAV_DIMS: (u32, u32) = (15, 15);
-/// How many crates high the agent builds its stack.
-const TARGET_LAYERS: u32 = 3;
 /// How grippy a crate is. See `drop_crate` for why it decides whether a
 /// stack stands or slides apart.
 const CRATE_FRICTION: f32 = 0.8;
+/// How high each storage spot is stacked. Two is also the height the
+/// solver holds — `stackbench` shows a 3-high stack shears at the shipped
+/// iteration count (known open solver item).
+const SPOT_CAPACITY: u32 = 2;
+/// The storage aisle along the top edge, row 2 (`y = (7 − row) × 1.5` puts
+/// row 0 at the top edge, so row 2 sits at y = +7.5; see
+/// `src/tile_collide.rs`). 4.5 m apart so a loaded machine standing off
+/// one spot clears its neighbour, and ≥7.5 m from the origin where Space
+/// drops crates.
+const STORAGE_SPOTS: [(i32, i32); 4] = [(3, 2), (6, 2), (9, 2), (12, 2)];
+/// Where crates spawn. Note the nudge from the old list: `(11, 3)` became
+/// `(11, 4)` — it was 2.12 m from spot 3, now 3.35 m, clear of the
+/// storage aisle.
+const CRATE_SPAWN_TILES: [(i32, i32); 5] = [(3, 4), (11, 4), (4, 11), (12, 10), (7, 12)];
 /// The floor's shade. Named because the walker's treads have to stay
 /// clear of it — see `walker_mesh`.
 const FLOOR_COLOUR: [f32; 4] = [0.22, 0.24, 0.28, 1.0];
@@ -124,8 +136,9 @@ struct Body {
     colour: [f32; 4],
     /// Its slot in the broadphase grid, so a pick result maps back here.
     slot: u32,
-    /// Held by the agent. A carried crate is kinematic and is written to
-    /// a pose every tick, so it must be kept out of the contact list
+    /// Held by the agent. A carried crate is kinematic, and once per
+    /// tick — after the solve, from the machine's final transform — it is
+    /// written to a pose, so it must be kept out of the contact list
     /// entirely — see `contacts()`.
     carried: bool,
     /// What to restore when it is put down.
@@ -136,6 +149,20 @@ struct Body {
     /// example, where every crate is 1 kg, and a real bug in the first
     /// game that has a heavy one.
     dynamic_mass: (f32, glam::Mat3),
+}
+
+/// A fresh board over the storage aisle, none of its spots occupied yet.
+///
+/// Called from `spawn_agent`, so `reset` (the **R** key) rebuilds the
+/// board along with the bodies rather than leaving it holding crate ids
+/// from the scene it just cleared.
+fn storage_board() -> ai3d::JobBoard {
+    ai3d::JobBoard::new(
+        STORAGE_SPOTS
+            .iter()
+            .map(|&tile| ai3d::Spot { tile, capacity: SPOT_CAPACITY })
+            .collect(),
+    )
 }
 
 struct Game {
@@ -165,6 +192,9 @@ struct Game {
     /// The stacking behaviour driving the agent. It owns the agent's
     /// goal; nothing else may set it.
     task: ai3d::StackTask,
+    /// Where crates go: the storage spots and the jobs that fill them.
+    /// Owned here so the example configures the spots.
+    board: ai3d::JobBoard,
     /// Its own mesh, so it reads as a walker rather than a crate.
     agent_mesh: Option<MeshHandle>,
     /// The forks, and the rail they slide up. Drawn at the mast height
@@ -186,6 +216,10 @@ struct Game {
     /// three times the honest bound.
     prev_pos: Vec<DVec3>,
     worst_jump: f64,
+
+    /// Warm-start impulses carried across ticks. Keyed by body index, so
+    /// it must be cleared whenever the body array is rebuilt.
+    contact_cache: physics3d::solver::ContactCache,
 }
 
 impl Game {
@@ -211,9 +245,10 @@ impl Game {
                 [AGENT_HW, AGENT_HW, AGENT_HH],
                 [CRATE_HALF as f64, CRATE_HALF as f64, CRATE_HALF as f64],
                 NAV_TILE as f64,
-                TARGET_LAYERS,
+                SPOT_CAPACITY,
                 WalkTuning3D::default(),
             )),
+            board: ai3d::JobBoard::default(),
             agent_mesh: None,
             fork_mesh: None,
             rail_mesh: None,
@@ -221,6 +256,7 @@ impl Game {
             frame: 0,
             prev_pos: Vec::new(),
             worst_jump: 0.0,
+            contact_cache: Default::default(),
         };
         g.reset();
         g
@@ -229,6 +265,8 @@ impl Game {
     /// Clear the world back to just a floor.
     fn reset(&mut self) {
         self.bodies.clear();
+        // Indices are reused after a reset, so stale impulses must go too.
+        self.contact_cache.clear();
         self.grid.clear();
         self.selected = None;
         self.dropped = 0;
@@ -252,12 +290,23 @@ impl Game {
             dynamic_mass: (0.0, glam::Mat3::ZERO),
         });
 
-        // A small starting stack so there is something to look at.
-        // Spaced by a full diameter and a half: 1.4 m apart leaves only
-        // 0.4 m of gap between 1 m cubes, so they start interpenetrating
-        // and the solver has to shove them apart on the first tick.
-        for i in 0..3 {
-            self.drop_crate(DVec3::new(0.0, 0.0, 1.0 + i as f64 * 1.6));
+        // Crates scattered around the yard, not piled in the middle.
+        //
+        // They used to spawn on one spot at increasing heights and fall
+        // into a heap on the stack site itself — which meant the machine
+        // started with its work already done in the wrong place, and had
+        // to dismantle a pile standing exactly where it wanted to build
+        // one.
+        //
+        // Placed on tile centres so each one sits squarely in a cell the
+        // planner can route around, and kept off the storage aisle so it
+        // starts clear. A half metre up, not more: a crate dropped from
+        // height arrives fast enough for the solver to apply restitution
+        // and bounce it across the floor.
+        let plane = self.nav_plane();
+        for (col, row) in CRATE_SPAWN_TILES {
+            let c = plane.tile_center(col, row);
+            self.drop_crate(DVec3::new(c.x, c.y, CRATE_HALF as f64 + 0.5));
         }
 
         self.spawn_agent();
@@ -312,9 +361,10 @@ impl Game {
             [AGENT_HW, AGENT_HW, AGENT_HH],
             [CRATE_HALF as f64, CRATE_HALF as f64, CRATE_HALF as f64],
             NAV_TILE as f64,
-            TARGET_LAYERS,
+            SPOT_CAPACITY,
             self.agent.tuning,
         ));
+        self.board = storage_board();
     }
 
     /// Every crate the stacker may consider, as it looks this tick.
@@ -326,6 +376,7 @@ impl Game {
             .map(|(i, b)| ai3d::CrateInfo {
                 id: ai3d::CrateId(i as u32),
                 pos: b.transform.pos,
+                rot: b.transform.rot,
                 half_extents: [
                     b.collider.half_extents[0] as f64,
                     b.collider.half_extents[1] as f64,
@@ -342,14 +393,12 @@ impl Game {
     /// Do what the stacker asked.
     fn apply_stack_action(&mut self, action: ai3d::StackAction) {
         match action {
-            ai3d::StackAction::Pickup { id, pose } => {
+            ai3d::StackAction::Pickup { id } => {
                 let Some(b) = self.bodies.get_mut(id.0 as usize) else { return };
                 b.carried = true;
                 b.rigid.kind = BodyKind::Kinematic;
                 b.rigid.inv_mass = 0.0;
                 b.rigid.inv_inertia = glam::Mat3::ZERO;
-                b.transform.pos = pose.pos;
-                b.transform.rot = pose.rot;
                 // Zeroed, and this is not cosmetic. A kinematic body is
                 // skipped by `step`, so a residual velocity would never
                 // be integrated *and never decay* — it would be handed
@@ -359,12 +408,35 @@ impl Game {
                 // and the scene never sleeps.
                 b.velocity = Velocity3D::default();
                 b.rigid.wake();
+                // Lift, THEN move: the machine still had creep velocity
+                // from the approach, and without this it would carry
+                // straight into the lift instead of stopping under the
+                // load. `Inserting`/`Lifting` are manoeuvring states, so
+                // the walker is already off here — this is what stops the
+                // residual instead.
+                if let Some(a) = self.bodies.get_mut(self.agent_body) {
+                    a.velocity.linear.x = 0.0;
+                    a.velocity.linear.y = 0.0;
+                }
             }
-            ai3d::StackAction::Hold { id, pose } => {
-                let Some(b) = self.bodies.get_mut(id.0 as usize) else { return };
-                b.transform.pos = pose.pos;
-                b.transform.rot = pose.rot;
-                b.velocity = Velocity3D::default();
+            ai3d::StackAction::Creep { velocity } => {
+                // The machine jockeys itself: planar velocity set
+                // directly, `z` left to gravity so it still rests on the
+                // floor. Deliberately a velocity and not a force — the
+                // whole point of a creep is a bounded, predictable
+                // approach, and a force would put the machine's mass and
+                // the floor friction between the request and the result.
+                let Some(b) = self.bodies.get_mut(self.agent_body) else { return };
+                // Omni wheels: the velocity is applied in world space,
+                // independent of which way the machine is pointing.
+                // Rotation is the facing filter's job and does not
+                // steer the translation.
+                b.velocity.linear.x = velocity.x;
+                b.velocity.linear.y = velocity.y;
+                // A creeping machine must not fall asleep mid-manoeuvre:
+                // it is moving slowly enough to be under the stillness
+                // threshold, and a sleeping body is skipped by `step`.
+                b.rigid.wake();
             }
             ai3d::StackAction::Release { id, pose, velocity } => {
                 let Some(b) = self.bodies.get_mut(id.0 as usize) else { return };
@@ -383,9 +455,7 @@ impl Game {
                 // never falls, and hangs in the air.
                 b.rigid.wake();
             }
-            ai3d::StackAction::None
-            | ai3d::StackAction::NoCrateAvailable
-            | ai3d::StackAction::Finished => {}
+            ai3d::StackAction::None | ai3d::StackAction::NoJob => {}
         }
     }
 
@@ -488,9 +558,10 @@ impl Game {
             self.orbit.sin() * CAMERA_DISTANCE,
             self.height,
         );
-        // Look at the middle of the stack rather than the floor, so the
-        // action stays centred as crates pile up.
-        c.target = DVec3::new(0.0, 0.0, 1.5);
+        // Look at the midpoint between the storage aisle (y = +7.5) and
+        // the yard (y = 0) rather than the floor, so both stay in frame.
+        // Lower than before: nothing in the scene is taller than 2 m now.
+        c.target = DVec3::new(0.75, 3.75, 1.0);
         c
     }
 
@@ -633,7 +704,7 @@ impl Game {
 fn walker_mesh() -> Mesh3D {
     // Deliberately NOT the floor's own dark grey (0.22, 0.24, 0.28).
     //
-    // The treads are the part that touches the ground, and at the first
+    // The wheels are the part that touches the ground, and at the first
     // attempt they were within a few percent of the floor colour — so the
     // bottom 160 mm of the robot merged into it and the yellow body above
     // read as buried to its waist. The mesh was sitting exactly on the
@@ -648,40 +719,36 @@ fn walker_mesh() -> Mesh3D {
     let mut m = Mesh3D::new();
 
     // Everything below is laid out **bottom-up from the collider's own
-    // bottom face**, which is at local z = -0.25. Nothing may go below
-    // that or the robot is drawn buried: the body rests with its centre
-    // a half-height above the floor, so local -0.25 *is* the ground.
+    // bottom face**, which is at local z = -0.35 (`AGENT_HH`). Nothing
+    // may go below that or the robot is drawn buried: the body rests
+    // with its centre a half-height above the floor, so local -0.35 *is*
+    // the ground.
     //
     // The head is allowed above the collider — a silhouette that reads as
     // a face is worth more than a mesh that fits its own hitbox exactly —
     // but only just, or the robot looks like it is standing in a hole.
 
-    // Treads: two near-black blocks along the sides, flat on the floor.
+    // Four balls, one at each corner, flat on the floor.
     //
-    // **They must be wider than the body and a real fraction of its
-    // height**, or the robot looks like it is standing in the ground. At
-    // the first attempt they were a 140 mm strip tucked under a 300 mm
-    // body that overhung them by 70 mm a side — from a camera 18 m up
-    // that strip was a few pixels in the body's own shadow, and the
-    // yellow hull appeared to meet the floor directly.
-    // They sit *just* outside the hull, not splayed out from it. At
-    // ±0.42 with a 0.30 width they spanned 1.14 m against a 0.46 m hull —
-    // two and a half times its width — and the robot read as a small box
-    // balanced on an outsized chassis rather than as a tracked vehicle.
-    for side in [-1.0f32, 1.0] {
-        m.push_box(
-            Vec3::new(0.0, side * 0.29, -0.23),
-            Vec3::new(0.86, 0.20, 0.24),
-            TREAD,
-        );
-        // Rollers at each end, so the treads read as tracks rather than
-        // as skids. Same bottom as the treads, a little taller.
-        for end in [-1.0f32, 1.0] {
-            m.push_box(
-                Vec3::new(end * 0.34, side * 0.29, -0.22),
-                Vec3::new(0.14, 0.20, 0.26),
-                METAL,
-            );
+    // Omni wheels. The machine strafes, and a strafing body on tracks
+    // reads as a hovercraft; balls in the corners are the honest shape
+    // for what it actually does.
+    //
+    // They sit *outside* the hull's corners, not tucked under it: the
+    // hull is 0.23 to a side and the balls are centred at 0.30, so a good
+    // half of each shows past the edge from above. The lesson from the
+    // tracks before them was that anything hidden in the body's own
+    // shadow is invisible from the scene camera, and the robot then
+    // looks as if the hull meets the floor directly.
+    //
+    // The radius fills the gap between the ground and the hull's
+    // underside (0.24 m) with two centimetres seated into the hull, so
+    // they read as mounted in it rather than as loose balls it happens
+    // to be resting on.
+    const BALL: f32 = 0.13;
+    for sx in [-1.0f32, 1.0] {
+        for sy in [-1.0f32, 1.0] {
+            m.push_sphere(Vec3::new(sx * 0.30, sy * 0.30, -0.35 + BALL), BALL, TREAD);
         }
     }
 
@@ -926,19 +993,31 @@ fn fork_mesh() -> Mesh3D {
     let t = ai3d::FORK_THICKNESS as f32;
     let mut m = Mesh3D::new();
 
-    // Two tines, reaching forward so their tips land at `carry_forward`
-    // — that is what makes the mesh and the physics agree about where a
-    // crate sits.
+    // Two tines, spanning the chassis front face to the load's near face.
+    //
+    // Derived from `FORK_REACH` rather than eyeballed, because that
+    // constant *is* the gap the task leaves between the machine and its
+    // cargo. A hand-picked length disagrees with it and the tines get
+    // drawn through the crate — measured at 0.8 m of tine inside a box
+    // the machine was supposed to be carrying.
+    let reach = ai3d::FORK_REACH as f32;
+    let front = AGENT_HW as f32;
+    // From a little inside the chassis, so they read as attached, out to
+    // the full tine length — which spans the whole depth of the crate,
+    // so the load sits back against the mast rather than perched on the
+    // tips.
+    let root = front - 0.02;
+    let tip = front + reach;
     for side in [-1.0f32, 1.0] {
         m.push_box(
-            Vec3::new(0.75, side * 0.22, -t * 0.5),
-            Vec3::new(0.60, 0.18, t),
+            Vec3::new((root + tip) * 0.5, side * 0.22, -t * 0.5),
+            Vec3::new((tip - root) * 0.5, 0.18, t),
             TREAD_COLOUR,
         );
     }
     // The heel they hang off, so they read as attached rather than as two
     // loose sticks floating in front of the robot.
-    m.push_box(Vec3::new(0.48, 0.0, 0.07), Vec3::new(0.06, 0.52, 0.20), METAL);
+    m.push_box(Vec3::new(root, 0.0, 0.07), Vec3::new(0.06, 0.52, 0.20), METAL);
     m
 }
 
@@ -1033,9 +1112,11 @@ impl App for Game {
         // Runs before the walker, which runs before `step`: the task
         // decides where the agent wants to be, the walker decides how
         // hard to push to get there, and the integrator consumes the
-        // force. The action is applied *here*, before the broadphase is
-        // re-hashed below, so the narrowphase sees the carried crate
-        // where it actually is rather than where it was last tick.
+        // force. The action is applied *here*, pre-step, because
+        // `Creep`, `Release` and the pickup stop all feed the integrator
+        // directly. The carried crate's own pose is a separate write,
+        // made *after* the solve from the machine's final transform —
+        // see the "carried crate" block below `update_sleep_all`.
         {
             let crates = self.crate_infos();
             let plane = self.nav_plane();
@@ -1046,6 +1127,7 @@ impl App for Game {
                 &transform,
                 plane,
                 &NavFloor,
+                &mut self.board,
                 &crates,
                 dt,
             );
@@ -1056,9 +1138,14 @@ impl App for Game {
         //
         // Before `step`, in the same place a player's input would be
         // read: the force is an acceleration the integrator consumes.
+        //
+        // Skipped entirely while the task is manoeuvring: it drives the
+        // body itself with `Creep`, a world-space velocity, and a walker
+        // pushing toward a goal at the same time is what made the machine
+        // slide sideways instead of driving. See `StackTask::manoeuvring`.
         {
             let i = self.agent_body;
-            if let Some(b) = self.bodies.get_mut(i) {
+            if let Some(b) = self.bodies.get_mut(i).filter(|_| !self.task.manoeuvring()) {
                 ai3d::drive_agent(
                     &mut self.agent,
                     &mut b.rigid,
@@ -1104,13 +1191,38 @@ impl App for Game {
                     velocity: &mut b.velocity,
                 })
                 .collect();
-            physics3d::solver::solve(&mut refs, &contacts, dt as f64);
+            physics3d::solver::solve_warm(&mut refs, &contacts, dt as f64, &mut self.contact_cache);
             // Sleep is checked *here*, after the solve, not inside
             // `step`. A resting body still holds a tick of gravity when
             // `step` ends -- the solver cancels it a moment later -- so
             // testing for stillness any earlier sees every settled body
             // as moving and nothing ever sleeps.
             physics3d::update_sleep_all(&mut refs, dt);
+        }
+
+        // ---- the carried crate ------------------------------------------
+        //
+        // Written AFTER the solve, from the machine's final transform for
+        // this tick. This is the only place a carried crate's pose is
+        // written, and it is here for a measured reason: computed from
+        // the pre-step transform and written before the step, the crate
+        // trailed the tines by exactly one physics tick — 5 to 10 cm at
+        // hauling speed, exactly what was on screen. Between step and
+        // solve is not enough either: the solver moves the machine every
+        // tick (floor correction), so the crate would trail by that.
+        //
+        // Carried crates are excluded from the contact list, so their
+        // grid slot lagging a tick is harmless.
+        {
+            let agent_pos = self.bodies[self.agent_body].transform.pos;
+            let floor_z = self.nav_plane().floor_z;
+            if let Some((id, pose)) = self.task.carried_pose(agent_pos, floor_z) {
+                if let Some(b) = self.bodies.get_mut(id.0 as usize) {
+                    b.transform.pos = pose.pos;
+                    b.transform.rot = pose.rot;
+                    b.velocity = Velocity3D::default();
+                }
+            }
         }
 
         // How far did anything move this tick?
@@ -1404,7 +1516,14 @@ impl Game {
             .count();
         let warm_frac = warm as f64 / n;
         println!("[verify] crate-coloured pixels = {:.2}%", warm_frac * 100.0);
-        if warm_frac < 0.002 {
+        // Threshold is 0.05%, not the 0.2% this was originally tuned at —
+        // that number assumed the crates sat mid-floor. With the storage
+        // aisle along the top edge and 2-high stacks, a correct scene
+        // measures 0.09–0.21% depending on where the machine is at the
+        // capture frame, which made 0.2% marginal and flaky. 0.05% is
+        // still >1000 pixels at 1080p; the check's purpose is only "does
+        // 3D geometry reach the screen at all", not how much of it.
+        if warm_frac < 0.0005 {
             eprintln!(
                 "VERIFY FAIL: only {:.3}% of the frame is crate-coloured — \
                  3D geometry is not reaching the screen",
@@ -1515,15 +1634,18 @@ impl Game {
             .iter()
             // The bar is "not going anywhere", not "asleep".
             //
-            // A stacked crate never fully sleeps: the solver pushes it out
-            // of the crate below every tick and gravity pulls it back,
-            // leaving a standing residual around 0.11 m/s that neither
-            // side wins. That is inherent to correcting penetration by
-            // position alone — removing it needs split impulses or a
-            // velocity bias, which is a different solver rather than a
-            // different constant. What *is* checkable is that the stack
-            // does not move, and the height assertion below does that to
-            // the millimetre.
+            // With warm starting a placed stack sleeps: normal impulses now
+            // carry across ticks, so the support load is already present at
+            // iteration 0 and the corrector has nothing left to fight.
+            // Measured by rerunning `--verify` with VERIFY_AT_FRAME pushed
+            // to 9000 (3000 frames past the normal check): spots stayed
+            // [2, 2, 1, 0], all 5 placed crates were asleep, and worst
+            // overlap held at 0.0154 m — no post-placement creep. Before
+            // warm starting this filter had to accept a standing ~0.11 m/s
+            // residual because the stack never settled; that residual is
+            // gone, but the filter is left permissive since "not moving" is
+            // still the real bar, and the height assertion below checks the
+            // position to the millimetre regardless.
             .filter(|b| b.rigid.sleeping || b.velocity.linear.length() < 0.2)
             .count();
         if settled != crates.len() {
@@ -1569,53 +1691,72 @@ impl Game {
             std::process::exit(1);
         }
 
-        // The stack, which is the whole point of the agent.
+        // The stacks, which are the whole point of the agent.
         //
-        // Counted from the crates rather than from the task's tally: a
-        // tally cannot tell a tower that stands from one that was built
-        // and then fell over, and it is the standing one that matters.
-        // **Currently one, not `TARGET_LAYERS`.**
+        // Counted from the crates rather than from a tally: a tally
+        // cannot tell a tower that stands from one that was built and
+        // then fell over, and it is the standing one that matters.
         //
-        // The forklift places its first crate correctly and then stops
-        // instead of starting the next cycle — the task reaches `Idle`
-        // and does not pick up again. That is a known, open gap, and the
-        // check is pinned to what the machine actually does rather than
-        // deleted, so the day the cycle restarts this fails and says so.
-        const LAYERS_EXPECTED: u32 = 1;
-        let layers = self.task.layers_standing(self.nav_plane(), &self.crate_infos());
-        if layers < LAYERS_EXPECTED {
+        // This was pinned to one spot for a long time, because the
+        // machine placed its first crate and stopped. It now runs the
+        // whole sequence — line up square, drive the tines in, lift,
+        // haul, stop short, raise, line up over the pile, set down, back
+        // out — forever, filling each storage spot in turn.
+        let plane = self.nav_plane();
+        let infos = self.crate_infos();
+        let t = self.task.tuning;
+        let standing: Vec<u32> = (0..STORAGE_SPOTS.len() as u32)
+            .map(|i| self.board.standing(ai3d::SpotId(i), plane, &infos, t))
+            .collect();
+        // Sequential fill: spot 0 to capacity, then spot 1, ...
+        let expected_total =
+            (CRATE_SPAWN_TILES.len() as u32).min(STORAGE_SPOTS.len() as u32 * SPOT_CAPACITY);
+        let mut left = expected_total;
+        let expected: Vec<u32> = standing
+            .iter()
+            .map(|_| {
+                let n = left.min(SPOT_CAPACITY);
+                left -= n;
+                n
+            })
+            .collect();
+        if standing != expected {
             eprintln!(
-                "VERIFY FAIL: the agent built {layers} of the {LAYERS_EXPECTED} \
-                 layers it currently manages (of {TARGET_LAYERS} asked for) \
-                 after {VERIFY_AT_FRAME} frames — task state is {:?}",
+                "VERIFY FAIL: spots hold {standing:?}, expected {expected:?} — task state {:?}",
                 self.task.state,
             );
             std::process::exit(1);
         }
 
-        // And the tower must be at its nominal height, not squashed into
-        // itself. Each contact in a stack sinks under the load above it,
-        // and a solver that cannot push it back out leaves a three-high
-        // pile measurably shorter than three crates.
-        let mut heights: Vec<f64> = crates.iter().map(|b| b.transform.pos.z).collect();
-        heights.sort_by(f64::total_cmp);
-        let top = heights.last().copied().unwrap_or(0.0);
-        // Against the layers actually built, not the ones asked for —
-        // see `LAYERS_EXPECTED` above.
-        let nominal = (LAYERS_EXPECTED as f64 - 0.5) * (CRATE_HALF as f64 * 2.0);
-        if top < nominal - 0.15 {
-            eprintln!(
-                "VERIFY FAIL: the top crate is at z={top:.3} against a nominal \
-                 {nominal:.3} — the stack is compressed into itself",
-            );
-            std::process::exit(1);
+        // And each occupied spot must be at its nominal height, not
+        // squashed into itself. Each contact in a stack sinks under the
+        // load above it, and a solver that cannot push it back out
+        // leaves a pile measurably shorter than its crates.
+        for (i, &n) in standing.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let Some(top_crate) = self.board.top_placed(ai3d::SpotId(i as u32), plane, &infos, t)
+            else {
+                eprintln!("VERIFY FAIL: spot {i} reports {n} standing but has no top crate");
+                std::process::exit(1);
+            };
+            let nominal = (n as f64 - 0.5) * (CRATE_HALF as f64 * 2.0);
+            if top_crate.pos.z < nominal - 0.15 {
+                eprintln!(
+                    "VERIFY FAIL: spot {i} top crate at z={:.3} against nominal \
+                     {nominal:.3} — the stack is compressed into itself",
+                    top_crate.pos.z,
+                );
+                std::process::exit(1);
+            }
         }
 
         println!(
             "[verify] agent walked {walked:.2} m, tilt {tilt:.2} deg, state {:?}",
             self.agent.state,
         );
-        println!("[verify] stack: {layers} layers, top crate at z={top:.3}");
+        println!("[verify] spots: {standing:?}");
         println!("[verify] worst per-tick crate movement = {:.4} m", self.worst_jump);
         println!(
             "[verify] OK — scene rendered, geometry visible, \
@@ -1633,6 +1774,10 @@ impl Game {
             .filter(|b| b.rigid.kind.is_dynamic() && !b.rigid.sleeping)
             .count();
         let total = self.bodies.len() - 1; // the floor is not a crate
+        let plane = self.nav_plane();
+        let infos = self.crate_infos();
+        let stored = self.board.total_standing(plane, &infos, self.task.tuning);
+        let capacity = STORAGE_SPOTS.len() as u32 * SPOT_CAPACITY;
 
         let batch = &mut r.batch;
         batch.set_surface(Surface::new(Material::Solid));
@@ -1657,8 +1802,8 @@ impl Game {
         );
 
         let status = match self.selected {
-            Some(i) => format!("crates {total}   awake {awake}   selected #{i}"),
-            None => format!("crates {total}   awake {awake}   nothing selected"),
+            Some(i) => format!("crates {total}   awake {awake}   stored {stored}/{capacity}   selected #{i}"),
+            None => format!("crates {total}   awake {awake}   stored {stored}/{capacity}   nothing selected"),
         };
         void_engine::text::draw_text(
             batch,
@@ -1678,12 +1823,13 @@ impl Game {
 
 /// Frames to run before the self-check fires, when `--verify` is passed.
 ///
-/// Long enough for the opening stack to fall and settle *and fall
+/// Long enough for all five crates to be placed — five placements at
+/// roughly 900 ticks each — plus settle time for the last one *and fall
 /// asleep*, so the check sees a scene physics has actually finished with
 /// rather than one still in motion. Settling takes a little under four
 /// seconds from the drop, plus the half second of continuous stillness
 /// [`void_engine::physics3d::TIME_TO_SLEEP`] requires.
-const VERIFY_AT_FRAME: u32 = 1500;
+const VERIFY_AT_FRAME: u32 = 6000;
 
 fn main() {
     // `--verify` runs headed for a couple of seconds, captures a frame,

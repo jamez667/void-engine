@@ -37,6 +37,17 @@ pub mod app;
 pub mod app_headless;
 #[cfg(feature = "audio")]
 pub mod audio;
+/// Steering around obstacles: which way an agent should actually go,
+/// given where it wants to go and what is in the way.
+///
+/// Dimension-free and mover-agnostic, because the engine's two movers
+/// work in opposite ways — [`walk`] moves a position, [`ai3d`] applies a
+/// force — and neither can use the other's code. What they share is the
+/// decision, so the decision is what lives here.
+///
+/// The planning half of the same job is [`pathfind`]. Most agents want
+/// both; the module docs say why.
+pub mod avoid;
 pub mod collision;
 pub mod components;
 pub mod ecs;

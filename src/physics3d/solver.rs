@@ -28,6 +28,13 @@
 //! small allowance, so resting bodies keep a hair of penetration rather
 //! than jittering between touching and not.
 
+// A `BTreeMap`, not a `HashMap`: `ContactCache` is walked in the STORE
+// pass in the same order every tick, with no hasher to seed or a build to
+// make non-deterministic across platforms. The pair count per tick is
+// small, so the lookup cost difference is not worth trading away that
+// determinism for.
+use std::collections::BTreeMap;
+
 use glam::{DVec3, Quat};
 
 use super::body::RigidBody;
@@ -84,6 +91,18 @@ pub const PENETRATION_SLOP: f64 = 0.005;
 /// smaller but never zero, and the object buzzes on the floor forever.
 pub const RESTITUTION_THRESHOLD: f64 = 1.0;
 
+/// How far a contact point may drift, in A's local frame, between ticks
+/// and still be treated as "the same point" for warm starting, in metres.
+///
+/// The manifold is not stable frame to frame: a box resting flush on a
+/// face flickers between a 4-point and 5-point manifold as the SAT axis
+/// wobbles by about a degree, and the crossing point can land a
+/// millimetre from a corner. Matching by nearest point within this
+/// distance (see [`ContactCache`]) rides through that flicker; matching
+/// by exact index or position would drop the impulse every time the
+/// manifold's point count changes, which is most ticks under load.
+pub const WARM_MATCH_DIST: f64 = 0.02;
+
 /// One point of contact between two bodies.
 ///
 /// Produced by the caller from whatever narrowphase it ran — see
@@ -111,6 +130,12 @@ pub struct Contact {
 /// over-correction made early can be taken back later. Storing only the
 /// last increment instead makes every over-correction permanent, which is
 /// what leaves a resting stack with a residual it can never shed.
+///
+/// `normal` is the one field that outlives this tick: `solve_warm` seeds
+/// it from [`ContactCache`] before iterating, and stores it back after.
+/// `tangent`, `target`, and `primed` start fresh every tick — friction is
+/// not warm-started (see [`ContactCache`] for why), and the bounce target
+/// depends on this tick's own approach velocity.
 #[derive(Copy, Clone, Debug, Default)]
 struct Accumulated {
     /// Total normal impulse, clamped at or above zero: a contact pushes
@@ -133,6 +158,71 @@ struct Accumulated {
     target: f64,
     /// Whether `target` has been captured yet.
     primed: bool,
+}
+
+/// One remembered contact point's normal impulse, kept between ticks.
+///
+/// `local` is the point's position in **A's body frame**: `rot_a⁻¹ *
+/// (point - pos_a)`. Storing it relative to A rather than in world space
+/// is what lets a moving or spinning A keep matching its own points tick
+/// to tick — only B's motion *relative to* A should ever displace a
+/// match, and the local frame is exactly the view in which that is true.
+#[derive(Copy, Clone, Debug)]
+struct WarmPoint {
+    local: DVec3,
+    normal: DVec3,
+    normal_impulse: f64,
+}
+
+/// Normal impulses remembered from the previous [`solve_warm`], keyed by
+/// contact pair.
+///
+/// # Why keyed by ordered pair, not by point
+///
+/// A pair's manifold is rebuilt from scratch by the narrowphase every
+/// tick — there is no stable point identity to key on directly. The pair
+/// `(a, b)` is stable (both callers build it the same way every tick from
+/// the same body indices), so lookups go pair-first, then match the
+/// nearest point within that pair's list by [`WARM_MATCH_DIST`].
+///
+/// # Why local frame
+///
+/// See [`WarmPoint::local`].
+///
+/// # Why not friction
+///
+/// The normal impulse at a resting contact is close to constant tick to
+/// tick — it is supporting a fixed weight — so warm-starting it removes
+/// almost all the solver's work before iteration even begins. Friction
+/// has no such steady state: its direction depends on the current
+/// tangential slide, which changes with whatever else is happening to
+/// the body, so last tick's tangent impulse is not a useful guess for
+/// this tick's and is left to build up fresh every time, same as before
+/// this change.
+#[derive(Clone, Debug, Default)]
+pub struct ContactCache {
+    pairs: BTreeMap<(usize, usize), Vec<WarmPoint>>,
+}
+
+impl ContactCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop every remembered impulse. Useful when the caller's body
+    /// indices are about to be invalidated (a respawn, a scene reset).
+    pub fn clear(&mut self) {
+        self.pairs.clear();
+    }
+
+    /// Total number of remembered contact points, across all pairs.
+    pub fn len(&self) -> usize {
+        self.pairs.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.values().all(Vec::is_empty)
+    }
 }
 
 /// Everything the solver needs about one body, borrowed for a step.
@@ -164,7 +254,7 @@ fn effective_mass(
     rel: DVec3,
     dir: DVec3,
 ) -> f64 {
-    if !body.kind.is_dynamic() {
+    if !body.is_movable() {
         return 0.0;
     }
     let inv_i = body.world_inv_inertia(rot);
@@ -173,14 +263,64 @@ fn effective_mass(
     body.inv_mass as f64 + angular
 }
 
-/// Resolve `contacts` over `bodies`, in place.
+/// A contact point's position in A's body frame, for matching against
+/// [`ContactCache`].
+fn local_point(pos_a: DVec3, rot_a: Quat, point: DVec3) -> DVec3 {
+    rot_a.as_dquat().inverse() * (point - pos_a)
+}
+
+/// Resolve `contacts` over `bodies`, in place, carrying normal impulses
+/// across ticks via `cache`.
 ///
 /// Bodies are addressed by the indices in each [`Contact`]; the caller
-/// owns the array and the mapping back to entities. Contacts touching a
-/// sleeping body wake it first — a body hit while asleep that stays
-/// asleep is the classic "projectile passes through the crate" bug.
-pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
+/// owns the array and the mapping back to entities. A sleeping body is
+/// woken first by a contact with something awake and actually moving —
+/// see the wake pass below; a contact with a static or another sleeping
+/// body does *not* wake it.
+///
+/// # Why warm starting
+///
+/// Without it, `solve` (the cold wrapper below) rebuilds every contact's
+/// impulse from zero each tick. Four iterations is not enough to fully
+/// support a loaded stack from a standing start, so a resting contact was
+/// left with a few millimetres of excess penetration every tick, which
+/// `correct_penetration` then pushed out — and because that correction
+/// acts per point rather than per pair, four independently-corrected
+/// points on a nominally flat face don't move by quite the same amount,
+/// which tilts the face itself by about a degree. Once the normal has
+/// even a slight tilt, "pushing along the normal" acquires a sideways
+/// component, and the body's *position* drifts sideways while its
+/// *velocity* stays near zero — invisible to a friction model that only
+/// looks at velocity, and slow enough to sit under the sleep threshold.
+/// Measured on `examples/stackbench`, a 2-crate stack over 30 s: 191 mm
+/// of drift, 16.5 mm of resting penetration, 0/2 asleep.
+///
+/// Warm starting closes the gap the leak depends on: `cache` supplies
+/// last tick's normal impulse for a matched contact *before* iteration
+/// begins (the WARM pass, below), so a steady load is already supported
+/// at iteration 0. Penetration settles to the slop, the excess the
+/// corrector reacts to goes to zero, the corrector goes idle, and nothing
+/// is left to leak sideways.
+///
+/// # Pass order
+/// 1. Wake pass.
+/// 2. INIT — prime every contact's bounce target from this tick's
+///    (pre-warm-start) velocity. Must run before any impulse, including
+///    the warm-started one; see [`prime`].
+/// 3. WARM — apply each matched contact's remembered normal impulse.
+/// 4. Iterate — the ordinary sequential-impulse passes.
+/// 5. `correct_penetration` — unchanged; now also skips sleeping bodies
+///    (see its doc).
+/// 6. STORE — save this tick's normal impulses into `cache` for next
+///    tick.
+pub fn solve_warm(
+    bodies: &mut [BodyRef<'_>],
+    contacts: &[Contact],
+    dt: f64,
+    cache: &mut ContactCache,
+) {
     if contacts.is_empty() {
+        cache.clear();
         return;
     }
 
@@ -217,6 +357,60 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
 
     // One accumulator per contact point, living for the whole solve.
     let mut acc = vec![Accumulated::default(); contacts.len()];
+
+    // Take the previous tick's cache; this tick's STORE pass rebuilds it
+    // from scratch, so a pair absent this tick simply does not reappear.
+    let mut old = std::mem::take(&mut cache.pairs);
+
+    // INIT: capture every contact's bounce target before any impulse is
+    // applied — including the warm-started one below. See `prime`.
+    for (i, c) in contacts.iter().enumerate() {
+        prime(bodies, c, &mut acc[i]);
+    }
+
+    // WARM: seed each contact's accumulator from the nearest matching
+    // point in last tick's cache, and apply that impulse immediately so
+    // the very first iteration sees a body that is already supported.
+    for (i, c) in contacts.iter().enumerate() {
+        let (ia, ib) = (c.a, c.b);
+        if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
+            continue;
+        }
+
+        let Some(list) = old.get_mut(&(ia, ib)) else { continue };
+        if list.is_empty() {
+            continue;
+        }
+
+        let (pos_a, rot_a) = (bodies[ia].transform.pos, bodies[ia].transform.rot);
+        let local = local_point(pos_a, rot_a, c.point);
+
+        let mut best: Option<(usize, f64)> = None;
+        for (idx, e) in list.iter().enumerate() {
+            let dist = (e.local - local).length();
+            let is_match = dist <= WARM_MATCH_DIST && e.normal.dot(c.normal) > 0.9;
+            if is_match && best.is_none_or(|(_, best_dist)| dist < best_dist) {
+                best = Some((idx, dist));
+            }
+        }
+
+        let Some((idx, _)) = best else { continue };
+        // Consume the match: two new contact points must never both draw
+        // on one remembered impulse.
+        let e = list.swap_remove(idx);
+        acc[i].normal = e.normal_impulse;
+
+        // Must be set before this apply, so a sleeping pair's impulse
+        // (which `apply` below will refuse to turn into velocity) is
+        // still recorded in `acc` and survives into the STORE pass.
+        let (pos_b, rot_b) = (bodies[ib].transform.pos, bodies[ib].transform.rot);
+        let ra = c.point - pos_a;
+        let rb = c.point - pos_b;
+        let impulse = c.normal * e.normal_impulse;
+        apply(bodies, ia, rot_a, ra, impulse);
+        apply(bodies, ib, rot_b, rb, -impulse);
+    }
+
     for _ in 0..SOLVER_ITERATIONS {
         for (i, c) in contacts.iter().enumerate() {
             solve_one(bodies, c, &mut acc[i]);
@@ -239,7 +433,70 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
         correct_penetration(bodies, c);
     }
 
+    // STORE: remember this tick's normal impulses for next tick's WARM
+    // pass. `cache.pairs` was emptied above by `mem::take`, so this
+    // rebuilds it from nothing rather than appending.
+    for (i, c) in contacts.iter().enumerate() {
+        let (ia, ib) = (c.a, c.b);
+        if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
+            continue;
+        }
+        if acc[i].normal <= 0.0 {
+            continue;
+        }
+        let (pos_a, rot_a) = (bodies[ia].transform.pos, bodies[ia].transform.rot);
+        let local = local_point(pos_a, rot_a, c.point);
+        cache.pairs.entry((ia, ib)).or_default().push(WarmPoint {
+            local,
+            normal: c.normal,
+            normal_impulse: acc[i].normal,
+        });
+    }
+
+    // Every caller runs a fixed 1/60 s tick, so a remembered impulse is
+    // applied as-is next tick with no rescaling. A variable dt would need
+    // `j *= dt_new / dt_old` — an impulse is a force integrated over time,
+    // and reusing one across a *different* dt without that correction
+    // over- or under-shoots the target velocity change.
     let _ = dt;
+}
+
+/// The cold path: resolve `contacts` with no memory of previous ticks.
+///
+/// Identical behaviour to every version of `solve` before warm starting
+/// existed — every existing caller and test that does not pass a
+/// [`ContactCache`] of its own sees no change.
+pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
+    solve_warm(bodies, contacts, dt, &mut ContactCache::default());
+}
+
+/// Capture the bounce target for one contact before any impulse touches it.
+///
+/// This must run for every contact *before* any contact's impulse is
+/// applied — including a warm-started one. `target` is derived from the
+/// approach velocity `vn`, and a warm-start impulse changes `vn` by
+/// design: that is the whole point of applying it early. Prime after
+/// warm-starting and the bounce target it captures is the bounce the
+/// warm start just created, not the approach that preceded it — measured
+/// as the elastic-bounce test collapsing from +5 m/s to ~0.
+fn prime(bodies: &[BodyRef<'_>], c: &Contact, acc: &mut Accumulated) {
+    let (ia, ib) = (c.a, c.b);
+    if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
+        return;
+    }
+
+    let (a_pos, a_vel) = (bodies[ia].transform.pos, bodies[ia].velocity.clone());
+    let (b_pos, b_vel) = (bodies[ib].transform.pos, bodies[ib].velocity.clone());
+
+    let ra = c.point - a_pos;
+    let rb = c.point - b_pos;
+    let vn = (point_velocity(&a_vel, ra) - point_velocity(&b_vel, rb)).dot(c.normal);
+
+    let restitution = RigidBody::combined_restitution(bodies[ia].body, bodies[ib].body) as f64;
+
+    let bounce = if -vn > RESTITUTION_THRESHOLD { restitution } else { 0.0 };
+    acc.target = -vn * bounce;
+    acc.primed = true;
 }
 
 /// Apply the normal and friction impulses for one contact.
@@ -313,9 +570,10 @@ fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact, acc: &mut Accumulated) {
         return;
     }
 
-    // Below the threshold, treat the contact as resting: applying
-    // restitution to a slow approach is what keeps a settling body
-    // buzzing forever.
+    // Normally a no-op: every contact is primed by the INIT pass in
+    // `solve`/`solve_warm` before this ever runs. Kept as a fallback so a
+    // contact that somehow skipped INIT still gets a target rather than
+    // solving toward a stale zero.
     if !acc.primed {
         let bounce = if -vn > RESTITUTION_THRESHOLD { restitution } else { 0.0 };
         acc.target = -vn * bounce;
@@ -396,7 +654,7 @@ fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact, acc: &mut Accumulated) {
 /// Apply an impulse to one body, if it is allowed to move.
 fn apply(bodies: &mut [BodyRef<'_>], i: usize, rot: Quat, rel: DVec3, impulse: DVec3) {
     let r = &mut bodies[i];
-    if !r.body.kind.is_dynamic() {
+    if !r.body.is_movable() {
         return;
     }
     r.velocity.linear += impulse * r.body.inv_mass as f64;
@@ -410,6 +668,11 @@ fn apply(bodies: &mut [BodyRef<'_>], i: usize, rot: Quat, rel: DVec3, impulse: D
 /// Splitting this from the impulse solve is what keeps a resting stack
 /// still: correcting overlap with velocity injects energy the solver then
 /// has to remove again, which reads as a stack that breathes.
+///
+/// Sleeping bodies are not moved. Gating on `is_dynamic()` alone let a
+/// sleeping body be pushed by this corrector every tick with no velocity
+/// to show for it — a second, quieter leak alongside the one this whole
+/// change exists to fix.
 fn correct_penetration(bodies: &mut [BodyRef<'_>], c: &Contact) {
     let (ia, ib) = (c.a, c.b);
     if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
@@ -422,8 +685,8 @@ fn correct_penetration(bodies: &mut [BodyRef<'_>], c: &Contact) {
         return;
     }
 
-    let inv_a = if bodies[ia].body.kind.is_dynamic() { bodies[ia].body.inv_mass as f64 } else { 0.0 };
-    let inv_b = if bodies[ib].body.kind.is_dynamic() { bodies[ib].body.inv_mass as f64 } else { 0.0 };
+    let inv_a = if bodies[ia].body.is_movable() { bodies[ia].body.inv_mass as f64 } else { 0.0 };
+    let inv_b = if bodies[ib].body.is_movable() { bodies[ib].body.inv_mass as f64 } else { 0.0 };
     let total = inv_a + inv_b;
     if total <= 0.0 {
         return;
@@ -473,6 +736,17 @@ mod tests {
                 .map(|((body, transform), velocity)| BodyRef { body, transform, velocity })
                 .collect();
             super::solve(&mut refs, contacts, 1.0 / 60.0);
+        }
+
+        fn solve_warm(&mut self, contacts: &[Contact], cache: &mut ContactCache) {
+            let mut refs: Vec<BodyRef<'_>> = self
+                .bodies
+                .iter_mut()
+                .zip(self.transforms.iter_mut())
+                .zip(self.velocities.iter_mut())
+                .map(|((body, transform), velocity)| BodyRef { body, transform, velocity })
+                .collect();
+            super::solve_warm(&mut refs, contacts, 1.0 / 60.0, cache);
         }
     }
 
@@ -975,6 +1249,244 @@ mod tests {
         );
     }
 
+    /// A bogus warm-start entry must not change a bounce.
+    ///
+    /// `prime` captures the bounce target from this tick's *approach*
+    /// velocity, before any impulse — including a warm-started one — is
+    /// applied. A stale normal impulse sitting in the cache from a
+    /// previous, unrelated tick must not leak into that target: whatever
+    /// `J` the cache offers, priming first means the bounce comes out the
+    /// same as the cold path.
+    ///
+    /// This is also the sabotage check for pass order: temporarily moving
+    /// INIT after WARM (so the bounce target is read from the
+    /// already-warm-started, already-separating velocity) gave `vz` = 2.0
+    /// instead of ~5 for J=3, and exactly 0.0 instead of ~5 for J=10;
+    /// restored, both match cold to well under 1e-6.
+    #[test]
+    fn a_warm_start_does_not_change_a_bounce() {
+        let mut cold = Scene::new();
+        let ball = cold.push(
+            RigidBody::sphere(1.0, 0.5).with_material(Material3D { restitution: 1.0, friction: 0.0 }),
+            DVec3::new(0.0, 0.0, 0.5),
+            DVec3::new(0.0, 0.0, -5.0),
+        );
+        let floor = cold.push(RigidBody::static_body(), DVec3::ZERO, DVec3::ZERO);
+        cold.solve(&[contact(ball, floor, DVec3::new(0.0, 0.0, 1.0), 0.0, DVec3::ZERO)]);
+        let vz_cold = cold.velocities[ball].linear.z;
 
+        for j in [3.0, 10.0] {
+            let mut s = Scene::new();
+            let ball = s.push(
+                RigidBody::sphere(1.0, 0.5)
+                    .with_material(Material3D { restitution: 1.0, friction: 0.0 }),
+                DVec3::new(0.0, 0.0, 0.5),
+                DVec3::new(0.0, 0.0, -5.0),
+            );
+            let floor = s.push(RigidBody::static_body(), DVec3::ZERO, DVec3::ZERO);
 
+            let mut cache = ContactCache::new();
+            cache.pairs.insert(
+                (ball, floor),
+                vec![WarmPoint {
+                    local: DVec3::new(0.0, 0.0, -0.5),
+                    normal: DVec3::new(0.0, 0.0, 1.0),
+                    normal_impulse: j,
+                }],
+            );
+
+            s.solve_warm(
+                &[contact(ball, floor, DVec3::new(0.0, 0.0, 1.0), 0.0, DVec3::ZERO)],
+                &mut cache,
+            );
+            let vz_warm = s.velocities[ball].linear.z;
+            assert!(
+                (vz_warm - vz_cold).abs() < 1e-6,
+                "J={j}: warm-started bounce {vz_warm} differs from cold {vz_cold}",
+            );
+        }
+    }
+
+    /// A sleeping body on a static floor must not be moved by
+    /// `solve_warm`, and its cached impulse must still be there afterward
+    /// — the whole point of warm starting a sleeper is that it costs
+    /// nothing and loses nothing.
+    ///
+    /// Sabotage check: temporarily reverting `apply`'s gate from
+    /// `is_movable()` back to `is_dynamic()` let the warm-started impulse
+    /// turn into real velocity on the sleeping body — tens of m/s instead
+    /// of exactly zero; restored, velocity and position are untouched.
+    #[test]
+    fn a_sleeping_pair_is_not_touched() {
+        let mut s = Scene::new();
+        let box_ = s.push(
+            RigidBody::box3d(1.0, [0.5, 0.5, 0.5]),
+            DVec3::new(0.0, 0.0, 0.5),
+            DVec3::ZERO,
+        );
+        s.bodies[box_].sleeping = true;
+        let floor = s.push(RigidBody::static_body(), DVec3::new(0.0, 0.0, -0.5), DVec3::ZERO);
+
+        let point = DVec3::new(0.0, 0.0, 0.0);
+        let mut cache = ContactCache::new();
+        cache.pairs.insert(
+            (box_, floor),
+            vec![WarmPoint {
+                local: point - DVec3::new(0.0, 0.0, 0.5),
+                normal: DVec3::Z,
+                normal_impulse: 100.0,
+            }],
+        );
+
+        let pos_before = s.transforms[box_].pos;
+        s.solve_warm(&[contact(box_, floor, DVec3::Z, 0.05, point)], &mut cache);
+
+        assert_eq!(
+            s.velocities[box_].linear,
+            Velocity3D::default().linear,
+            "a sleeping body must not gain velocity from a warm-started impulse",
+        );
+        assert_eq!(s.transforms[box_].pos, pos_before, "a sleeping body must not move");
+        assert!(s.bodies[box_].sleeping, "a static floor must not wake it");
+        assert_eq!(cache.len(), 1, "the cached impulse must be retained");
+        assert_eq!(cache.pairs[&(box_, floor)][0].normal_impulse, 100.0);
+    }
+
+    /// A two-crate stack, warm-started, must hold penetration down at the
+    /// same equilibrium a *single* body resting alone settles at; the
+    /// same scene through the cold solver settles measurably deeper under
+    /// the doubled load. This is the drift bug from the module doc,
+    /// reduced to its essential loop.
+    ///
+    /// # Why the bar is not `PENETRATION_SLOP` itself
+    ///
+    /// `correct_penetration` recovers only `BAUMGARTE` (0.3) of the excess
+    /// each tick, and gravity resinks the contact by `g*dt²` every tick
+    /// regardless of how well the normal impulse is warm-started — warm
+    /// starting fixes the *velocity* side of a contact, not this
+    /// position-correction rate. The two reach a steady state on their
+    /// own: `pen_eq = PENETRATION_SLOP + g*dt² / BAUMGARTE ≈ 0.005 +
+    /// 0.00272/0.3 ≈ 0.0141` — the same number a single crate resting
+    /// alone settles at even through the *cold* path (see
+    /// [`a_box_resting_on_a_floor_does_not_sink_through_it`]). What warm
+    /// starting buys under a stacked load is holding *at* that one-body
+    /// equilibrium instead of sinking further, because the lower contact
+    /// no longer has to rebuild support for two bodies' weight from zero
+    /// every tick. Measured: warm 0.01408 m, cold 0.03375 m — cold sinks
+    /// more than double the single-body equilibrium under the same load.
+    ///
+    /// Angular velocity is zeroed every tick by hand: this test measures
+    /// normal support under load, not the emergent tilt that the module
+    /// doc describes as the *mechanism* of the drift (a real scene is not
+    /// zeroed like this — `examples/stackbench` measures the tilted
+    /// case).
+    ///
+    /// Sabotage check: temporarily setting `WARM_MATCH_DIST` to 0.0 made
+    /// every WARM lookup fail to match (contact points move a fraction of
+    /// a millimetre tick to tick from floating-point noise even at exact
+    /// rest), which fell back to the cold behaviour — warm rose to match
+    /// cold at 0.03375 m — and failed the `cold - warm > 0.01` assertion;
+    /// restored, warm clears it.
+    #[test]
+    fn warm_start_holds_a_resting_stack_at_the_slop() {
+        fn run(warm: bool) -> f64 {
+            let mut s = Scene::new();
+            let floor = s.push(RigidBody::static_body(), DVec3::new(0.0, 0.0, -0.5), DVec3::ZERO);
+            let eps = 0.01;
+            let lower = s.push(
+                RigidBody::box3d(1.0, [0.5, 0.5, 0.5])
+                    .with_material(Material3D { restitution: 0.0, friction: 0.8 }),
+                DVec3::new(0.0, 0.0, 0.5 + eps),
+                DVec3::ZERO,
+            );
+            let upper = s.push(
+                RigidBody::box3d(1.0, [0.5, 0.5, 0.5])
+                    .with_material(Material3D { restitution: 0.0, friction: 0.8 }),
+                DVec3::new(0.0, 0.0, 1.5 + eps),
+                DVec3::ZERO,
+            );
+
+            let dt = 1.0 / 60.0;
+            let mut cache = ContactCache::new();
+            let mut worst_last_60 = 0.0f64;
+            let corners = [(-0.5, -0.5), (-0.5, 0.5), (0.5, -0.5), (0.5, 0.5)];
+
+            for tick in 0..600 {
+                for &b in &[lower, upper] {
+                    s.velocities[b].linear += DVec3::new(0.0, 0.0, -9.81) * dt;
+                    s.transforms[b].pos += s.velocities[b].linear * dt;
+                    // This test measures normal support, not tilt.
+                    s.velocities[b].angular = DVec3::ZERO;
+                }
+
+                let mut contacts = Vec::new();
+                let mut worst_tick = 0.0f64;
+
+                let lower_z = s.transforms[lower].pos.z;
+                let pen_lf = 0.5 - lower_z;
+                if pen_lf > 0.0 {
+                    worst_tick = worst_tick.max(pen_lf);
+                    for &(x, y) in &corners {
+                        contacts.push(contact(
+                            lower,
+                            floor,
+                            DVec3::Z,
+                            pen_lf,
+                            DVec3::new(x, y, lower_z - 0.5),
+                        ));
+                    }
+                }
+
+                let upper_z = s.transforms[upper].pos.z;
+                let pen_ul = (lower_z + 0.5) - (upper_z - 0.5);
+                if pen_ul > 0.0 {
+                    worst_tick = worst_tick.max(pen_ul);
+                    for &(x, y) in &corners {
+                        contacts.push(contact(
+                            upper,
+                            lower,
+                            DVec3::Z,
+                            pen_ul,
+                            DVec3::new(x, y, upper_z - 0.5),
+                        ));
+                    }
+                }
+
+                if !contacts.is_empty() {
+                    if warm {
+                        s.solve_warm(&contacts, &mut cache);
+                    } else {
+                        s.solve(&contacts);
+                    }
+                }
+
+                if tick >= 540 {
+                    worst_last_60 = worst_last_60.max(worst_tick);
+                }
+            }
+            worst_last_60
+        }
+
+        let warm = run(true);
+        let cold = run(false);
+        eprintln!("[warm_start_holds_a_resting_stack_at_the_slop] warm={warm:.5} cold={cold:.5}");
+
+        // The single-body equilibrium under this BAUMGARTE/gravity pair:
+        // see the doc comment above for the derivation (~0.0141 m).
+        let sink_per_tick = crate::physics3d::GRAVITY.z.abs() / 3600.0;
+        let single_body_equilibrium = PENETRATION_SLOP + sink_per_tick / BAUMGARTE;
+        assert!(
+            warm <= single_body_equilibrium + 0.002,
+            "warm-started penetration {warm:.5} exceeds the single-body \
+             equilibrium ({single_body_equilibrium:.5}) by more than 2 mm — \
+             the stacked load is not being warm-started",
+        );
+        assert!(
+            cold - warm > 0.01,
+            "cold ({cold:.5}) should settle measurably deeper than warm \
+             ({warm:.5}); the whole point of warm-starting a stack is that \
+             the lower contact doesn't have to rebuild support for the \
+             load above it from zero every tick",
+        );
+    }
 }

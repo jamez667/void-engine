@@ -37,6 +37,7 @@
 //! mitigation and why smoothing is not built here.
 
 pub mod agent;
+pub mod jobs;
 pub mod nav;
 pub mod steer;
 pub mod task;
@@ -50,11 +51,14 @@ use crate::pathfind::TileSource;
 use crate::physics3d::body::{self, RigidBody};
 
 pub use agent::{Agent3D, AgentState, PROGRESS_EPSILON, STALL_TIMEOUT};
+pub use jobs::{Job, JobBoard, Spot, SpotId};
 pub use nav::{plan_path, NavPath, NavPlane};
-pub use steer::{desired_speed, steering_force, WalkTuning3D};
+pub use steer::{
+    desired_speed, steering_force, steering_force_avoiding, WalkTuning3D,
+};
 pub use task::{
     drive_stacker, fork_height_for_layer, CarryPose, CrateId, CrateInfo, Forks, StackAction,
-    StackState, StackTask, StackTuning, FORK_THICKNESS,
+    StackState, StackTask, StackTuning, FORK_REACH, FORK_THICKNESS,
 };
 
 /// Advance one agent by one tick, applying its walk force to `body`.
@@ -148,13 +152,27 @@ pub fn drive_agent(
     let is_final = path.on_final_leg();
     let distance = plane.flatten(target - pos).length();
 
-    let force = steering_force(
+    // Avoidance is inside the steering, not wrapped around it.
+    //
+    // This is the reactive half of routing; the planning half is
+    // `NavPlane::blocked_cells_from`, which a caller spends on the same
+    // obstacle list when it plans. A plan cannot react to something that
+    // moved after it was made, and a steer walks into dead ends a plan
+    // would have avoided — so an agent wants both.
+    //
+    // The bend has to reach the *desired velocity* rather than this
+    // force, because the force is a velocity error and rotating an error
+    // steers nothing once the agent is up to speed.
+    // `steering_force_avoiding` documents the measurement.
+    let force = steering_force_avoiding(
         pos,
         velocity.linear,
         target,
         mass_of(body),
         is_final,
         agent.tuning,
+        &agent.obstacles,
+        agent.avoid,
     );
 
     if force == DVec3::ZERO {
@@ -257,6 +275,7 @@ fn mass_of(body: &RigidBody) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::avoid::{AvoidTuning, Obstacle};
     use crate::physics3d::{self, BodyRef};
 
     /// A floor plane and an open grid, matching `crates3d`'s scale.
@@ -816,7 +835,183 @@ mod tests {
         );
     }
 
+    /// An agent with nothing around it steers exactly as it did before
+    /// avoidance existed.
+    ///
+    /// The compatibility guarantee behind the empty default: a caller
+    /// that never fills `obstacles` must not have its walk changed by a
+    /// single bit. Without this, tuning avoidance could silently move
+    /// every existing agent.
+    #[test]
+    fn an_empty_obstacle_list_changes_nothing() {
+        let start = DVec3::new(-6.0, 0.0, AGENT_HH);
+        let goal = DVec3::new(6.0, 0.0, AGENT_HH);
 
+        let mut plain = World::new(start);
+        let mut a1 = Agent3D::new(WalkTuning3D::default());
+        a1.set_goal(goal);
+        assert!(replan(&mut a1, plane(), &OpenFloor, start, &HashSet::new()));
 
+        let mut avoiding = World::new(start);
+        let mut a2 = Agent3D::new(WalkTuning3D::default());
+        a2.set_goal(goal);
+        assert!(replan(&mut a2, plane(), &OpenFloor, start, &HashSet::new()));
+        // Explicitly empty, which is also the default.
+        a2.obstacles.clear();
 
+        for _ in 0..120 {
+            let f1 = plain.tick(&mut a1, 1.0 / 60.0);
+            let f2 = avoiding.tick(&mut a2, 1.0 / 60.0);
+            assert_eq!(f1, f2, "an empty obstacle list perturbed the steering force");
+        }
+        assert_eq!(plain.pos(), avoiding.pos());
+    }
+
+    /// An agent walking at a crate goes **round** it.
+    ///
+    /// The wiring test: it fails if `drive_agent` stops consulting
+    /// [`crate::avoid::steer_around`], which the unit tests in that module
+    /// cannot catch because they never touch an agent.
+    #[test]
+    fn an_agent_steers_around_a_crate_in_its_path() {
+        let start = DVec3::new(-6.0, 0.0, AGENT_HH);
+        let goal = DVec3::new(6.0, 0.0, AGENT_HH);
+        // Squarely on the straight line between the two.
+        let crate_at = DVec3::new(0.0, 0.0, AGENT_HH);
+
+        let mut w = World::new(start);
+        let mut a = Agent3D::new(WalkTuning3D::default());
+        a.set_goal(goal);
+        assert!(replan(&mut a, plane(), &OpenFloor, start, &HashSet::new()));
+        // Sized for this walker: 3 m/s, half-width 0.5 m, getting
+        // round crates of radius 0.6 m.
+        a.avoid = AvoidTuning::for_speed(AGENT_HW, 0.6, 0.8);
+
+        let mut worst_lateral: f64 = 0.0;
+        for _ in 0..600 {
+            // Refilled每 tick, the way a real caller would from a
+            // broadphase query.
+            a.obstacles.clear();
+            a.obstacles.push(Obstacle::new(crate_at, 0.6));
+            w.tick(&mut a, 1.0 / 60.0);
+            worst_lateral = worst_lateral.max(w.pos().y.abs());
+        }
+
+        assert!(
+            worst_lateral > 0.2,
+            "the agent never left the straight line (max |y| = {worst_lateral:.3}), \
+             so it walked through the crate rather than round it",
+        );
+    }
+
+    /// And it still arrives.
+    ///
+    /// The other half of the previous test, and the one that catches
+    /// avoidance that is merely *strong*: an agent that refuses to
+    /// approach anything is not avoiding obstacles, it is refusing to
+    /// work. `AvoidTuning::strength` below 1.0 is what guarantees the
+    /// goal eventually wins.
+    #[test]
+    fn steering_around_a_crate_still_reaches_the_goal() {
+        let start = DVec3::new(-6.0, 0.0, AGENT_HH);
+        let goal = DVec3::new(6.0, 0.0, AGENT_HH);
+        let crate_at = DVec3::new(0.0, 0.0, AGENT_HH);
+
+        let mut w = World::new(start);
+        let mut a = Agent3D::new(WalkTuning3D::default());
+        a.set_goal(goal);
+        assert!(replan(&mut a, plane(), &OpenFloor, start, &HashSet::new()));
+        // Sized for this walker: 3 m/s, half-width 0.5 m, getting
+        // round crates of radius 0.6 m.
+        a.avoid = AvoidTuning::for_speed(AGENT_HW, 0.6, 0.8);
+
+        for _ in 0..1200 {
+            a.obstacles.clear();
+            a.obstacles.push(Obstacle::new(crate_at, 0.6));
+            w.tick(&mut a, 1.0 / 60.0);
+            if a.state == AgentState::Arrived {
+                break;
+            }
+        }
+
+        assert_eq!(
+            a.state,
+            AgentState::Arrived,
+            "the agent gave up short of its goal at {:?} — avoidance that \
+             never lets an agent arrive is worse than none",
+            w.pos(),
+        );
+    }
+
+    /// Avoidance rotates the force, never grows it.
+    ///
+    /// `WalkTuning3D::for_body` bounds the walk force below by the
+    /// friction it must beat and above by the torque that would tip the
+    /// agent onto its face. A bend that scaled the vector would walk out
+    /// of that bound, and the agent would face-plant near every crate —
+    /// a failure that looks like a physics bug, not a steering one.
+    #[test]
+    fn avoidance_does_not_inflate_the_walk_force() {
+        let start = DVec3::new(-6.0, 0.0, AGENT_HH);
+        let goal = DVec3::new(6.0, 0.0, AGENT_HH);
+        let crate_at = DVec3::new(0.0, 0.0, AGENT_HH);
+
+        let tuning = WalkTuning3D::for_body(
+            AGENT_MASS as f64,
+            [AGENT_HW, AGENT_HW, AGENT_HH],
+            FLOOR_FRICTION,
+        );
+
+        let mut w = World::new(start);
+        let mut a = Agent3D::new(tuning);
+        a.avoid = AvoidTuning::for_speed(AGENT_HW, 0.6, 0.8);
+        a.set_goal(goal);
+        assert!(replan(&mut a, plane(), &OpenFloor, start, &HashSet::new()));
+
+        for _ in 0..600 {
+            a.obstacles.clear();
+            a.obstacles.push(Obstacle::new(crate_at, 0.6));
+            let force = w.tick(&mut a, 1.0 / 60.0);
+
+            assert!(
+                force.length() <= tuning.max_force + 1e-9,
+                "bending produced {:.1} N against the body's {:.1} N limit — \
+                 a force past that limit tips the agent onto its face",
+                force.length(),
+                tuning.max_force,
+            );
+        }
+    }
+
+    /// Avoidance never pushes the agent vertically.
+    ///
+    /// A walk force with a `z` is a walk force that makes the agent fly or
+    /// dig. `avoid` is fully 3D, so this is the property that pins the
+    /// planar reduction — without it an obstacle whose centre sits above
+    /// the agent's bends the setpoint toward the sky.
+    #[test]
+    fn avoidance_never_produces_a_vertical_force() {
+        let start = DVec3::new(-6.0, 0.0, AGENT_HH);
+        let goal = DVec3::new(6.0, 0.0, AGENT_HH);
+        // Deliberately well above the agent's centre: the case that
+        // produces a vertical bend if the problem is not flattened.
+        let crate_at = DVec3::new(0.0, 0.0, AGENT_HH + 2.0);
+
+        let mut w = World::new(start);
+        let mut a = Agent3D::new(WalkTuning3D::default());
+        a.avoid = AvoidTuning::for_speed(AGENT_HW, 0.6, 0.8);
+        a.set_goal(goal);
+        assert!(replan(&mut a, plane(), &OpenFloor, start, &HashSet::new()));
+
+        for _ in 0..600 {
+            a.obstacles.clear();
+            a.obstacles.push(Obstacle::new(crate_at, 0.6));
+            let force = w.tick(&mut a, 1.0 / 60.0);
+            assert_eq!(
+                force.z, 0.0,
+                "the walk force acquired a vertical component of {}",
+                force.z,
+            );
+        }
+    }
 }

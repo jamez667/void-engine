@@ -175,6 +175,40 @@ impl Mesh3D {
         self.push_quad(p[1], p[2], p[6], p[5], color); // +X
     }
 
+    /// A UV sphere centred on `center`, flat-shaded like everything else.
+    ///
+    /// Sixteen slices by eight stacks: round enough at the distances this
+    /// engine's cameras sit at, and small enough that a handful of them
+    /// on one body is not the mesh's whole vertex budget.
+    ///
+    /// Every latitude band is emitted as quads, poles included. At the
+    /// poles one edge of each quad has zero length, so its second
+    /// triangle is degenerate — and [`Mesh3D::push_triangle`] drops
+    /// degenerates rather than admitting a NaN normal. That is what lets
+    /// this loop stay uniform instead of special-casing the caps.
+    pub fn push_sphere(&mut self, center: Vec3, radius: f32, color: [f32; 4]) {
+        const SLICES: usize = 16;
+        const STACKS: usize = 8;
+        use std::f32::consts::PI;
+
+        let at = |i: usize, j: usize| {
+            let phi = PI * i as f32 / STACKS as f32;
+            let theta = 2.0 * PI * j as f32 / SLICES as f32;
+            center
+                + radius
+                    * Vec3::new(phi.sin() * theta.cos(), phi.sin() * theta.sin(), phi.cos())
+        };
+
+        for i in 0..STACKS {
+            for j in 0..SLICES {
+                // Wound so the face normal points outward: down the
+                // stack first, then round the slice, which is
+                // counter-clockwise seen from outside the sphere.
+                self.push_quad(at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1), color);
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();

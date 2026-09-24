@@ -22,8 +22,11 @@
 //! [`crate::physics3d::step`] runs the first two and the last; the middle
 //! is the caller's, because which pairs are worth testing and which shapes
 //! they are is a game's business.
-//! [`crate::physics3d::solver::solve`] takes the contact list that comes
-//! out.
+//! [`crate::physics3d::solver::solve_warm`] takes the contact list that
+//! comes out, plus a [`ContactCache`] the caller holds across ticks so
+//! contact impulses carry over instead of rebuilding from zero each step;
+//! [`crate::physics3d::solver::solve`] is the cold equivalent for a caller
+//! that does not want that.
 //!
 //! # What it is not
 //!
@@ -36,7 +39,7 @@ pub mod body;
 pub mod solver;
 
 pub use body::{apply_impulse, apply_impulse_at, BodyKind, Material3D, RigidBody};
-pub use solver::{BodyRef, Contact};
+pub use solver::{BodyRef, Contact, ContactCache};
 
 use glam::DVec3;
 

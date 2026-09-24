@@ -2,6 +2,8 @@
 
 use glam::DVec3;
 
+use crate::avoid::{AvoidTuning, Obstacle};
+
 use super::nav::NavPath;
 use super::steer::WalkTuning3D;
 
@@ -47,6 +49,21 @@ pub struct Agent3D {
     pub state: AgentState,
     /// Seconds since the agent last made progress toward its waypoint.
     pub stall_time: f32,
+    /// What the agent can see right now, for [`crate::avoid::steer_around`].
+    ///
+    /// The caller refills this each tick from whatever it uses for
+    /// proximity — a broadphase sphere query, a tile lookup, its own list.
+    /// Empty means "nothing nearby", which is also the state an agent
+    /// starts in, so an existing caller that never fills it gets exactly
+    /// the behaviour it had before.
+    ///
+    /// Held on the agent rather than passed to
+    /// [`super::drive_agent`] because it is per-agent state that changes
+    /// every tick, and because it keeps `drive_agent`'s signature — which
+    /// three call sites already use — unchanged.
+    pub obstacles: Vec<Obstacle>,
+    /// How hard to steer around what is in [`Self::obstacles`].
+    pub avoid: AvoidTuning,
     /// Distance to the current waypoint last tick, for the stall check.
     last_distance: f64,
 }
@@ -59,6 +76,8 @@ impl Agent3D {
             tuning,
             state: AgentState::Idle,
             stall_time: 0.0,
+            obstacles: Vec::new(),
+            avoid: AvoidTuning::default(),
             last_distance: f64::INFINITY,
         }
     }
