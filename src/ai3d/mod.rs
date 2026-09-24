@@ -53,7 +53,8 @@ pub use agent::{Agent3D, AgentState, PROGRESS_EPSILON, STALL_TIMEOUT};
 pub use nav::{plan_path, NavPath, NavPlane};
 pub use steer::{desired_speed, steering_force, WalkTuning3D};
 pub use task::{
-    drive_stacker, CarryPose, CrateId, CrateInfo, StackAction, StackState, StackTask, StackTuning,
+    drive_stacker, fork_height_for_layer, CarryPose, CrateId, CrateInfo, Forks, StackAction,
+    StackState, StackTask, StackTuning, FORK_THICKNESS,
 };
 
 /// Advance one agent by one tick, applying its walk force to `body`.

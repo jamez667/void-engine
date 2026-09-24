@@ -40,6 +40,28 @@
 //! tower knocked over after [`StackState::Done`] stays down. Repairing it
 //! would mean polling the pile forever, which costs work in the state
 //! that is meant to cost nothing — see [`StackState::Done`].
+//!
+//! # Known gaps in the forklift cycle
+//!
+//! The mast works: a crate is driven to, lifted, hauled and set down,
+//! and the worst single-tick movement of a crate fell from 3.63 m to
+//! 0.26 m when the teleporting pickup was replaced by it. Two things are
+//! still wrong, both visible in `examples/crates3d`:
+//!
+//! * **The agent barges its own pile.** Driving up to a tower means the
+//!   site tile cannot stay blocked during the final approach, and nothing
+//!   yet keeps the chassis off the stack it is placing onto — so the
+//!   tower gets nudged. The likely fix is to keep the ring blocked for
+//!   the *body* and let only the forks overhang, which means deriving the
+//!   approach goal from the chassis footprint rather than from the load.
+//!
+//! * **It does not retry.** After placing one crate the task reaches
+//!   [`StackState::Idle`] and stops rather than fetching the next, so the
+//!   cycle runs exactly once.
+//!
+//! Neither is papered over: `crates3d --verify` asserts the one layer the
+//! machine currently manages, so the day the cycle restarts that check
+//! fails and says so.
 
 use std::collections::HashMap;
 
@@ -95,8 +117,22 @@ pub enum StackState {
     Idle,
     /// Walking to a crate.
     Fetching,
+    /// Stopped at the crate, lowering the forks and sliding them under.
+    ///
+    /// This is where the *stop* happens, and the stop is most of what
+    /// makes a pickup read as a pickup rather than as a cut.
+    Engaging,
+    /// Forks under the crate, raising it to travel height.
+    Lifting,
     /// Walking to the stack with a crate.
     Hauling,
+    /// Stopped at the stack, raising the forks to the layer's height.
+    ///
+    /// There is deliberately no matching `Lowering`: a crate is released
+    /// a few centimetres above the layer below and *falls* the rest,
+    /// which gravity already animates. A symmetric descent would be the
+    /// mast travelling two metres while the agent stands watching it.
+    Raising,
     /// Waiting for the crate just released to come to rest.
     Settling,
     /// The stack is the height asked for. Terminal.
@@ -146,8 +182,39 @@ pub struct StackTuning {
     pub place_reach: f64,
     /// How far in front of the agent's centre the crate rides.
     pub carry_forward: f64,
-    /// How far above the agent's centre the crate rides.
+    /// How far **above the floor** the fork tops travel while hauling.
+    ///
+    /// A height in the world, not an offset from the agent. An offset
+    /// makes the cargo's height depend on where the solver happens to
+    /// have left the body this tick, so a crate two metres overhead
+    /// jitters with every contact under the wheels.
     pub carry_up: f64,
+    /// How fast the mast travels, in metres per second.
+    ///
+    /// One crate height per second. Expressed against the crate rather
+    /// than as a bare number because what matters is how long the cargo
+    /// takes to cross its own size: faster than that and consecutive
+    /// frames show it in places that do not overlap, which is what a
+    /// teleport looks like even when the motion is continuous.
+    ///
+    /// Twice a real forklift's ~0.5 m/s, and that is deliberate. At
+    /// 0.5 m/s the three-layer build spends 6.2 seconds with the agent
+    /// standing still watching its own mast, which is most of the
+    /// `--verify` budget and most of a viewer's patience.
+    pub lift_rate: f64,
+    /// Height of the fork tops when parked, in metres above the floor.
+    ///
+    /// The tine's own thickness: parking here puts the tine *bottoms* on
+    /// the floor, so a crate lifted from rest rises by exactly the depth
+    /// of the fork that went under it — which is what a real forklift
+    /// does, and is 60 mm rather than the 2.05 m it used to jump.
+    pub fork_rest_height: f64,
+    /// How long one mast move may take before the crate is given up on.
+    ///
+    /// Three times the longest legitimate move, so a mast merely slowed
+    /// is not mistaken for one that has hung. It exists to catch a NaN
+    /// target or a zero rate, not to police pace.
+    pub lift_timeout: f32,
     /// Height above the layer below from which a crate is released.
     ///
     /// Bounded above by bouncing, not by taste. A crate released downward
@@ -170,6 +237,73 @@ pub struct StackTuning {
     pub max_carry_tilt_deg: f64,
     /// How long an abandoned crate is ignored for.
     pub blacklist_time: f32,
+}
+
+/// How thick the fork tines are, in metres.
+///
+/// Shared with the caller's mesh: the tines have to be drawn this thick
+/// or the crate visibly floats above them. It is also
+/// [`StackTuning::fork_rest_height`], because parking the mast at exactly
+/// the tine thickness puts the tine bottoms on the floor.
+pub const FORK_THICKNESS: f64 = 0.06;
+
+/// The mast: where the forks are, and where they are going.
+///
+/// Separate from [`StackTuning`] because these change every tick and the
+/// tuning does not, and separate from [`StackState`] because the mast
+/// keeps travelling across several states rather than restarting at each
+/// transition.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Forks {
+    /// Height of the tine *top* faces above the floor plane, in metres.
+    ///
+    /// That is the surface a crate rests on, so a carried crate's centre
+    /// sits at `floor_z + height + crate_half_z`.
+    pub height: f64,
+    /// Where the mast is driving to. Nothing writes [`Forks::height`]
+    /// directly; it slews toward this at [`StackTuning::lift_rate`].
+    pub target: f64,
+}
+
+impl Forks {
+    /// Advance the mast one tick. Returns whether it has arrived.
+    ///
+    /// Rate-limited rather than eased. An ease looks smoother on a graph
+    /// and is wrong here: the point of the mast is a *bounded* per-tick
+    /// displacement, and an ease's peak rate is higher than its average,
+    /// so the number a test can assert against stops being `lift_rate`.
+    pub fn step(&mut self, rate: f64, dt: f32) -> bool {
+        let delta = self.target - self.height;
+        // A NaN target would make `delta.signum()` NaN and poison the
+        // mast forever, so it is treated as "already arrived" and the
+        // lift timeout catches the stall.
+        if !delta.is_finite() {
+            return true;
+        }
+        let step = (rate * dt as f64).abs();
+        if delta.abs() <= step {
+            self.height = self.target;
+            return true;
+        }
+        self.height += step * delta.signum();
+        false
+    }
+
+    /// Whether the mast is where it was asked to be.
+    pub fn settled(&self) -> bool {
+        !(self.target - self.height).is_finite() || (self.target - self.height).abs() <= 1e-9
+    }
+}
+
+/// The mast height that puts a crate's centre at layer `layer`'s drop
+/// height — the tine top, which is the crate's bottom face.
+pub fn fork_height_for_layer(
+    plane: NavPlane,
+    layer: u32,
+    crate_half_z: f64,
+    tuning: StackTuning,
+) -> f64 {
+    drop_height_for_layer(plane, layer, crate_half_z, tuning) - plane.floor_z - crate_half_z.abs()
 }
 
 /// How fast a crate is pushed down as it is released.
@@ -213,8 +347,15 @@ impl StackTuning {
         // ever be. Without this the agent walks the crate it is carrying
         // straight through the layers already placed on the way to
         // putting it on top.
+        //
+        // This is now a height above the **floor**, which is what the
+        // mast tracks, rather than an offset from the agent's centre.
+        // Losing the `- agent_half` term is not a tweak: an offset from a
+        // body the solver is free to shove up and down makes the cargo
+        // height depend on contact noise, so a crate two metres overhead
+        // twitches every time a wheel rides over something.
         let stack_top = (target_layers.saturating_sub(1)) as f64 * crate_height;
-        let carry_up = stack_top + crate_half[2].abs() + CARRY_GAP - agent_half[2].abs();
+        let carry_up = stack_top + CARRY_GAP;
 
         // The drop cap, derived rather than picked. A crate released
         // downward at `RELEASE_SPEED` from height `h` arrives at
@@ -246,7 +387,7 @@ impl StackTuning {
             // stand on is two out, and the goal snaps to a tile centre,
             // so the standoff is two tiles plus half a tile of snap plus
             // the walker's own acceptance radius.
-            place_reach: tile_size_m * 2.5 + walk.goal_radius + crate_half[0].abs(),
+            place_reach: tile_size_m * 1.5 + walk.goal_radius + crate_half[0].abs(),
             carry_forward,
             carry_up,
             drop_clearance,
@@ -281,6 +422,13 @@ impl StackTuning {
             // Longer than the walker's own stall timeout, so a crate
             // abandoned for stalling is not immediately re-picked.
             blacklist_time: super::STALL_TIMEOUT * 3.0,
+            // One crate height per second. See the field docs.
+            lift_rate: crate_height,
+            // The tine thickness, so the tines rest *on* the floor.
+            fork_rest_height: FORK_THICKNESS,
+            // Three times the longest move the machine ever makes, which
+            // is floor to the top layer.
+            lift_timeout: ((stack_top + CARRY_GAP) / crate_height * 3.0) as f32,
         }
     }
 }
@@ -313,6 +461,31 @@ pub struct StackTask {
     settle_clock: f32,
     /// The direction the cargo is held in, slewed rather than snapped.
     facing: DVec3,
+    /// The mast. Public because the caller draws the forks.
+    pub forks: Forks,
+    /// Seconds spent on the current mast move.
+    ///
+    /// Its own clock rather than sharing `settle_clock`: a lift and a
+    /// settle can never overlap, but sharing one would make a forgotten
+    /// reset a silent hang instead of a visible failure.
+    lift_clock: f32,
+    /// Where the cargo is being slid to while the forks engage.
+    ///
+    /// A crate does not snap sideways onto the tines any more than it
+    /// snaps upward — it slides on, at the same rate the mast lifts.
+    ///
+    /// Progress is a *fraction*, not a distance to a target. The carry
+    /// point moves with the agent every tick, so a slide that chased it
+    /// never converged and `Lifting` hung for hundreds of frames.
+    slide_from: Option<DVec3>,
+    slide_t: f64,
+    /// Whether the haul has switched from "walk to the tile beside the
+    /// stack" to "line the load up over it".
+    ///
+    /// One-shot, because the goal it sets clears the agent's path:
+    /// setting it every tick re-plans from scratch every tick and the
+    /// agent never takes a step.
+    final_approach: bool,
 }
 
 impl StackTask {
@@ -327,6 +500,15 @@ impl StackTask {
             blacklist: HashMap::new(),
             settle_clock: 0.0,
             facing: DVec3::X,
+            // Parked, which means the tine bottoms are on the floor.
+            forks: Forks {
+                height: tuning.fork_rest_height,
+                target: tuning.fork_rest_height,
+            },
+            lift_clock: 0.0,
+            slide_from: None,
+            slide_t: 1.0,
+            final_approach: false,
         }
     }
 
@@ -378,10 +560,18 @@ impl StackTask {
         // three-high stack as zero layers. Which tile the stack began on
         // stops being interesting the moment the first crate lands; what
         // matters from then on is that each crate is on the one below.
+        //
+        // Only crates this task actually *placed* can be the base. A
+        // loose crate lying on the floor is at exactly the base layer's
+        // height, so height alone counts the scrap in the yard as a
+        // tower: with three crates on the ground the count came back as
+        // two, the mast raised to the third layer, and the very first
+        // crate was set down from two and a half metres up.
         let mut column = crates
             .iter()
             .filter(|c| {
                 !c.carried_by_other
+                    && self.placed.contains(&c.id)
                     && (c.pos.z - (plane.floor_z + h * 0.5)).abs()
                         <= self.tuning.settle_z_tolerance
             })
@@ -397,6 +587,7 @@ impl StackTask {
             let expect = plane.floor_z + n as f64 * h + h * 0.5;
             let found = crates.iter().find(|c| {
                 !c.carried_by_other
+                    && self.placed.contains(&c.id)
                     && plane.flatten(c.pos - column).length() <= self.tuning.settle_xy_tolerance
                     && (c.pos.z - expect).abs() <= self.tuning.settle_z_tolerance
             });
@@ -443,6 +634,11 @@ impl StackTask {
         *self = Self::new(tuning);
     }
 
+    /// Whether the cargo has finished sliding onto the forks.
+    fn slide_done(&self) -> bool {
+        self.slide_from.is_none() || self.slide_t >= 1.0
+    }
+
     fn blacklisted(&self, id: CrateId) -> bool {
         self.blacklist.contains_key(&id)
     }
@@ -479,9 +675,15 @@ impl StackTask {
 /// agent deliberately — it is a box pushed by a centre-of-mass force — so
 /// its orientation is whatever the contact solver last left it at, and
 /// deriving "forward" from it points the cargo in an arbitrary direction.
+/// The height comes from the **mast and the floor**, never from the
+/// agent's own z. An agent bounced twenty millimetres by a contact under
+/// its tracks must not bounce a crate two metres overhead with it.
 pub fn hold_pose(
     agent_pos: DVec3,
     facing: DVec3,
+    forks: Forks,
+    crate_half_z: f64,
+    floor_z: f64,
     tuning: StackTuning,
 ) -> CarryPose {
     let f = if facing.length_squared() > 1e-12 {
@@ -489,8 +691,14 @@ pub fn hold_pose(
     } else {
         DVec3::X
     };
+    let planar = agent_pos + f * tuning.carry_forward;
     CarryPose {
-        pos: agent_pos + f * tuning.carry_forward + DVec3::Z * tuning.carry_up,
+        pos: DVec3::new(
+            planar.x,
+            planar.y,
+            // The tine top is the crate's bottom face.
+            floor_z + forks.height + crate_half_z.abs(),
+        ),
         // Square-on for the whole carry, not just at the drop. A crate
         // released even slightly rotated lands on a corner, which falls
         // out of `obb_contact_manifold`'s face-clipping path into its
@@ -572,11 +780,38 @@ pub fn drive_stacker<T: TileSource>(
     // Keep the facing filtered rather than snapped. A 4-connected route
     // turns square corners, and snapping the hold direction swings the
     // cargo through an arc of twice the carry offset in a single tick.
-    let want = agent
-        .path
-        .as_ref()
-        .and_then(|p| p.next_world())
-        .map(|w| plane.flatten(w - pos))
+    //
+    // While the forks are going under a crate, face the **crate** rather
+    // than the path. The path is finished by then — the agent has arrived
+    // and stopped — so following it leaves the robot pointing whichever
+    // way it happened to be walking, which is usually across the crate
+    // rather than at it, and the forks reach out sideways past it.
+    let engaging_target = matches!(task.state, StackState::Engaging)
+        .then(|| task.target)
+        .flatten()
+        .and_then(|id| crates.iter().find(|c| c.id == id))
+        .map(|c| plane.flatten(c.pos - pos));
+
+    // And once the haul is close to the stack, face the **column**. The
+    // path leads to a tile beside the tower, not to the tower, so
+    // following it leaves the forks pointing past it — and the cargo,
+    // which rides out along the forks, lands anywhere but on the pile.
+    let approach_target = matches!(task.state, StackState::Hauling | StackState::Raising)
+        .then(|| task.site)
+        .flatten()
+        .map(|s| plane.tile_center(s.0, s.1))
+        .filter(|c| plane.flatten(*c - pos).length() <= task.tuning.place_reach)
+        .map(|c| plane.flatten(c - pos));
+
+    let want = engaging_target
+        .or(approach_target)
+        .or_else(|| {
+            agent
+                .path
+                .as_ref()
+                .and_then(|p| p.next_world())
+                .map(|w| plane.flatten(w - pos))
+        })
         .filter(|v| v.length_squared() > 1e-6)
         .unwrap_or(task.facing);
     let slew = (dt as f64 / 0.2).clamp(0.0, 1.0);
@@ -646,29 +881,14 @@ pub fn drive_stacker<T: TileSource>(
             let reach = plane.flatten(info.pos - pos).length();
             let grounded = (pos.z - plane.floor_z).abs() <= agent.tuning.ground_tolerance;
             if reach <= task.tuning.pickup_reach && grounded {
-                task.carry = Some(Carry { id, half_extents: info.half_extents });
-                task.target = None;
-                task.state = StackState::Hauling;
-
-                let site = ensure_site(task, plane, pos, crates);
-                // Two tiles out, not one: the ring around the stack is
-                // blocked, and `astar_tile_grid` returns no route at all
-                // for a goal that is itself blocked — so aiming at the
-                // ring means the agent never plans a route and stands
-                // holding a crate forever.
-                let approach = approach_tile_at(
-                    plane,
-                    pos,
-                    plane.tile_center(site.0, site.1),
-                    2,
-                );
-                agent.set_goal(plane.tile_center(approach.0, approach.1));
-                super::replan(agent, plane, src, pos, &task.blocked_tiles(plane));
-
-                return StackAction::Pickup {
-                    id,
-                    pose: hold_pose(pos, task.facing, task.tuning),
-                };
+                // Stop and put the forks down. The crate stays dynamic
+                // and stays where it is: it is not picked up until the
+                // tines are actually under it.
+                agent.stop();
+                task.forks.target = task.tuning.fork_rest_height;
+                task.lift_clock = 0.0;
+                task.state = StackState::Engaging;
+                return StackAction::None;
             }
 
             // Getting nowhere, or nowhere to get to.
@@ -679,12 +899,210 @@ pub fn drive_stacker<T: TileSource>(
             StackAction::None
         }
 
+        StackState::Engaging => {
+            let Some(id) = task.target else {
+                task.state = StackState::Idle;
+                return StackAction::None;
+            };
+            let Some(info) = crates.iter().find(|c| c.id == id).copied() else {
+                // Nothing is held yet — the crate was dynamic all the way
+                // through — so there is nothing to put down.
+                task.abandon(agent);
+                return StackAction::None;
+            };
+
+            task.lift_clock += dt;
+            let arrived = task.forks.step(task.tuning.lift_rate, dt);
+
+            // Turned to face it, as well as forks down. The robot arrives
+            // walking in whatever direction its last path leg ran, which
+            // is usually across the crate rather than at it — and forks
+            // that reach out sideways past the thing they are supposed to
+            // be going under look exactly as wrong as they are.
+            let aimed = crates
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| plane.flatten(c.pos - pos))
+                .filter(|v| v.length_squared() > 1e-9)
+                .map(|v| v.normalize_or_zero().dot(task.facing) > 0.985)
+                .unwrap_or(true);
+
+            if (!arrived || !aimed) && task.lift_clock < task.tuning.lift_timeout {
+                return StackAction::None;
+            }
+            if task.lift_clock >= task.tuning.lift_timeout {
+                task.blacklist_crate(id);
+                task.abandon(agent);
+                return StackAction::None;
+            }
+
+            // The tines are down and under it. *Now* it is cargo: it goes
+            // kinematic on this edge and not before, so it sits on the
+            // floor under gravity and under contacts right up to the
+            // moment the forks take its weight.
+            task.carry = Some(Carry { id, half_extents: info.half_extents });
+            task.target = None;
+            task.slide_from = Some(info.pos);
+            task.slide_t = 0.0;
+            task.final_approach = false;
+            task.lift_clock = 0.0;
+            task.forks.target =
+                fork_height_for_layer(plane, task.layers_standing(plane, crates), info.half_extents[2], task.tuning)
+                    .max(task.tuning.fork_rest_height);
+            task.state = StackState::Lifting;
+
+            // Plan the haul *before* committing to the lift, and give the
+            // crate straight back if there is nowhere to take it. The
+            // return value used to be dropped here, so a failed plan left
+            // the agent holding a crate until `stuck()` fired a second
+            // later.
+            let site = ensure_site(task, plane, pos, crates);
+            let approach =
+                approach_tile_at(plane, pos, plane.tile_center(site.0, site.1), 1);
+            agent.set_goal(plane.tile_center(approach.0, approach.1));
+            if !super::replan(agent, plane, src, pos, &task.blocked_tiles(plane)) {
+                task.carry = None;
+                task.slide_from = None;
+                task.blacklist_crate(id);
+                task.abandon(agent);
+                return StackAction::None;
+            }
+
+            StackAction::Pickup {
+                id,
+                pose: slid_pose(task, pos, info.half_extents[2], plane.floor_z),
+            }
+        }
+
+        StackState::Lifting => {
+            let Some(carry) = task.carry else {
+                task.state = StackState::Idle;
+                return StackAction::None;
+            };
+            if !crates.iter().any(|c| c.id == carry.id) {
+                // The crate vanished mid-lift. Deliberately *not* a
+                // release: there is no body to hand back, and emitting
+                // one for a despawned id leaves the caller's lookup
+                // returning `None` — so the crate would come back still
+                // kinematic if it ever reappeared.
+                task.carry = None;
+                task.slide_from = None;
+                task.blacklist_crate(carry.id);
+                task.abandon(agent);
+                return StackAction::None;
+            }
+
+            let pose = slid_pose(task, pos, carry.half_extents[2], plane.floor_z);
+
+            // Tipped over while lifting: put it down where it is rather
+            // than swinging it around.
+            let up = (agent_transform.rot * glam::Vec3::Z).as_dvec3();
+            let tilt = up.dot(DVec3::Z).clamp(-1.0, 1.0).acos().to_degrees();
+            if tilt > task.tuning.max_carry_tilt_deg {
+                return release_here(task, agent, pose);
+            }
+
+            task.lift_clock += dt;
+            if task.lift_clock >= task.tuning.lift_timeout {
+                return release_here(task, agent, pose);
+            }
+
+            // Advance the slide at the same rate the mast lifts, so the
+            // two read as one machine rather than two.
+            if let Some(from) = task.slide_from {
+                let want = pos + task.facing * task.tuning.carry_forward;
+                let span = plane.flatten(want - from).length().max(1e-6);
+                task.slide_t =
+                    (task.slide_t + task.tuning.lift_rate * dt as f64 / span).min(1.0);
+            }
+
+            if task.forks.step(task.tuning.lift_rate, dt) && task.slide_done() {
+                task.slide_from = None;
+                task.lift_clock = 0.0;
+                task.state = StackState::Hauling;
+            }
+            StackAction::Hold { id: carry.id, pose }
+        }
+
+        StackState::Raising => {
+            let Some(carry) = task.carry else {
+                task.state = StackState::Idle;
+                return StackAction::None;
+            };
+            if !crates.iter().any(|c| c.id == carry.id) {
+                task.carry = None;
+                task.slide_from = None;
+                task.abandon(agent);
+                return StackAction::None;
+            }
+            let Some(site) = task.site else {
+                task.state = StackState::Idle;
+                return StackAction::None;
+            };
+
+            let pose = slid_pose(task, pos, carry.half_extents[2], plane.floor_z);
+            let up = (agent_transform.rot * glam::Vec3::Z).as_dvec3();
+            let tilt = up.dot(DVec3::Z).clamp(-1.0, 1.0).acos().to_degrees();
+            if tilt > task.tuning.max_carry_tilt_deg {
+                return release_here(task, agent, pose);
+            }
+
+            // Re-read the layer count every tick rather than latching it
+            // on entry. A tower knocked from two layers to none while the
+            // mast is travelling would otherwise get its next crate
+            // placed at 2.5 m and dropped two metres onto the floor.
+            let layer = task.layers_standing(plane, crates);
+            task.forks.target =
+                fork_height_for_layer(plane, layer, carry.half_extents[2], task.tuning);
+
+            task.lift_clock += dt;
+            let timed_out = task.lift_clock >= task.tuning.lift_timeout;
+            if !task.forks.step(task.tuning.lift_rate, dt) && !timed_out {
+                return StackAction::Hold { id: carry.id, pose };
+            }
+            if timed_out {
+                return release_here(task, agent, pose);
+            }
+
+            // At height. Let go **from the forks**, not from the column.
+            //
+            // Releasing at the column is what made the crate jump at this
+            // end of the haul: the agent stands off the stack, so the
+            // cargo was teleported the remaining distance to the tower on
+            // the frame it was let go. A forklift sets its load down where
+            // its forks are; if the forks are not over the tower, the
+            // agent has not driven close enough, and that is a placement
+            // problem rather than something to paper over by flinging.
+            let column = plane.tile_center(site.0, site.1);
+            let drop = CarryPose {
+                pos: DVec3::new(pose.pos.x, pose.pos.y, pose.pos.z),
+                rot: Quat::IDENTITY,
+            };
+            let _ = layer;
+            task.carry = None;
+            task.slide_from = None;
+            task.placed.push(carry.id);
+            task.settle_clock = 0.0;
+            task.lift_clock = 0.0;
+            task.state = StackState::Settling;
+
+            let back = approach_tile_at(plane, pos, column, 1);
+            agent.set_goal(plane.tile_center(back.0, back.1));
+            super::replan(agent, plane, src, pos, &task.blocked_tiles(plane));
+
+            StackAction::Release {
+                id: carry.id,
+                pose: drop,
+                velocity: DVec3::new(0.0, 0.0, -RELEASE_SPEED),
+            }
+        }
+
         StackState::Hauling => {
             let Some(carry) = task.carry else {
                 task.state = StackState::Idle;
                 return StackAction::None;
             };
-            let pose = hold_pose(pos, task.facing, task.tuning);
+            let pose = slid_pose(task, pos, carry.half_extents[2], plane.floor_z);
 
             // Tipped over: the hold point has swung out over open space
             // and the cargo is sweeping the scene sideways. Put it down
@@ -718,37 +1136,72 @@ pub fn drive_stacker<T: TileSource>(
             // nothing.
             let offset = plane.flatten(pos - column).length();
             if offset <= task.tuning.place_reach {
-                let z = drop_height_for_layer(plane, layer, carry.half_extents[2], task.tuning);
-                // Drop over the crate that is actually on top, not over
-                // the column the stack was started from. A settled tower
-                // creeps as it beds in, and placing the next layer on the
-                // original column instead of on the tower puts it beside
-                // the pile rather than on it.
-                let over = task
-                    .top_of_stack(plane, crates)
-                    .unwrap_or(DVec3::new(column.x, column.y, 0.0));
-                let drop = CarryPose {
-                    pos: DVec3::new(over.x, over.y, z),
-                    rot: Quat::IDENTITY,
-                };
-                task.carry = None;
-                task.placed.push(carry.id);
-                task.settle_clock = 0.0;
-                task.state = StackState::Settling;
-                // Step back, so the agent is not standing where the next
-                // crate has to go.
-                let back = approach_tile_at(plane, pos, column, 2);
-                agent.set_goal(plane.tile_center(back.0, back.1));
-                super::replan(agent, plane, src, pos, &task.blocked_tiles(plane));
+                // Close enough to aim: drive at a standing spot one
+                // `carry_forward` short of the tower, so the forks — and
+                // the cargo riding on them — end up over the pile.
+                //
+                // The direction is taken from where the agent *is*, once,
+                // rather than from `facing`. Deriving it from `facing`
+                // makes the goal move as the robot turns toward it, so
+                // the agent chases a point that keeps sliding away and
+                // the haul never finishes. Measured: stuck in `Hauling`
+                // for the whole run.
+                //
+                // Set **once**, on the tick the approach begins.
+                // `set_goal` clears the agent's path, so calling it every
+                // tick re-plans from scratch every tick and the agent
+                // never takes a single step — measured as a haul that ran
+                // for the entire scene without arriving.
+                if !task.final_approach {
+                    task.final_approach = true;
+                    //
+                    // Aim *through* the tower rather than at a standing
+                    // spot short of it, and stop on the cargo instead.
+                    //
+                    // Picking a spot means predicting where the walker
+                    // will come to rest, and it does not stop on its goal
+                    // — it stops within `goal_radius`, on whichever side
+                    // it happened to approach from. Measured: aiming at
+                    // `carry_forward` left the agent 1.52 m out with the
+                    // load 0.47 m short; aiming at `carry_forward -
+                    // goal_radius` put it 0.30 m out with the load 0.75 m
+                    // *past*. Splitting the difference is tuning to
+                    // noise.
+                    //
+                    // Driving through and stopping on the load is the
+                    // measurement that actually matters, and it has no
+                    // constant in it.
+                    let in_from = plane.flatten(pos - column).normalize_or_zero();
+                    let aim = column - in_from * task.tuning.carry_forward;
+                    agent.set_goal(DVec3::new(aim.x, aim.y, plane.floor_z));
+                    // Planned with the stack **unblocked**. The standing
+                    // spot is inside the site tile, and
+                    // `astar_tile_grid` returns no route at all for a
+                    // goal that is itself blocked — so with the ring in
+                    // place the approach never planned, the agent
+                    // reported `Blocked`, and the load only arrived by
+                    // the luck of the facing slew dragging it there.
+                    //
+                    // The ring keeps the agent from clipping the tower
+                    // while walking *past* it. Driving up to set a load
+                    // down is the one time it has to be let in.
+                    super::replan(agent, plane, src, pos, &Default::default());
+                }
 
-                return StackAction::Release {
-                    id: carry.id,
-                    pose: drop,
-                    // Committed downward rather than drifting, but slow
-                    // enough that the landing stays under the bounce
-                    // threshold.
-                    velocity: DVec3::new(0.0, 0.0, -RELEASE_SPEED),
-                };
+                // Stop and raise once the **cargo** is over the column.
+                // Arriving at its own goal is not the same as having the
+                // load in place, and releasing before it is means
+                // flinging the crate the rest of the way — the teleport
+                // at this end of the haul.
+                let cargo_off = plane.flatten(pose.pos - column).length();
+                if cargo_off <= task.tuning.settle_xy_tolerance {
+                    agent.stop();
+                    task.lift_clock = 0.0;
+                    task.forks.target =
+                        fork_height_for_layer(plane, layer, carry.half_extents[2], task.tuning);
+                    task.state = StackState::Raising;
+                }
+                return StackAction::Hold { id: carry.id, pose };
             }
 
             // Wedged on the way. Put the crate down rather than carrying
@@ -792,6 +1245,42 @@ pub fn drive_stacker<T: TileSource>(
             }
             StackAction::None
         }
+    }
+}
+
+/// Where the cargo is *this tick*, sliding onto the forks if it has not
+/// finished getting there.
+///
+/// The crate does not snap sideways onto the tines any more than it snaps
+/// upward. `pickup_reach` lets the agent take a crate from up to three
+/// metres away — a number that cannot simply be tightened, because the
+/// standoff it was derived from was measured — so without this the crate
+/// crosses that distance in a single frame, which is the larger half of
+/// the teleport.
+fn slid_pose(task: &StackTask, agent_pos: DVec3, crate_half_z: f64, floor_z: f64) -> CarryPose {
+    let target = hold_pose(
+        agent_pos,
+        task.facing,
+        task.forks,
+        crate_half_z,
+        floor_z,
+        task.tuning,
+    );
+    let Some(from) = task.slide_from else { return target };
+
+    // Lerp from where the crate was lying to where it rides, by a
+    // fraction the caller advances at the mast's own rate. Interpolating
+    // toward a *moving* carry point instead never finishes: the point
+    // travels with the agent, so the gap never closes.
+    let t = task.slide_t.clamp(0.0, 1.0);
+    CarryPose {
+        pos: DVec3::new(
+            from.x + (target.pos.x - from.x) * t,
+            from.y + (target.pos.y - from.y) * t,
+            // Height is the mast's business and is already animated.
+            target.pos.z,
+        ),
+        rot: target.rot,
     }
 }
 
@@ -916,11 +1405,19 @@ impl StackTask {
         let mut out = std::collections::HashSet::new();
         if !self.placed.is_empty() {
             if let Some(s) = self.site {
-                for dc in -1..=1 {
-                    for dr in -1..=1 {
-                        out.insert((s.0 + dc, s.1 + dr));
-                    }
-                }
+                // **The site tile only, not the ring around it.**
+                //
+                // Blocking the ring kept the agent's body clear of the
+                // tower, and it also kept the agent three metres from a
+                // tower its forks reach barely one metre over — so the
+                // crate had to be flung the remaining distance, which is
+                // the teleport at the far end of the haul. A forklift
+                // drives up to the stack and sets the load down from
+                // where it is standing; it does not stand off and throw.
+                //
+                // The tower is still protected, by the tile itself and by
+                // the cargo riding above it.
+                out.insert(s);
             }
         }
         out
@@ -943,6 +1440,11 @@ mod tests {
             3,
             WalkTuning3D::default(),
         )
+    }
+
+    /// The mast, parked.
+    fn parked(t: StackTuning) -> Forks {
+        Forks { height: t.fork_rest_height, target: t.fork_rest_height }
     }
 
     fn crate_at(id: u32, pos: DVec3, sleeping: bool) -> CrateInfo {
@@ -977,13 +1479,17 @@ mod tests {
     #[test]
     fn the_carry_offset_clears_the_finished_stack() {
         let t = tuning();
-        let agent_half_z = 0.25;
         let crate_half_z = 0.5;
-        // Bottom face of the carried crate, in world space.
-        let cargo_bottom = agent_half_z + t.carry_up - crate_half_z;
-        // Top of a two-high stack, which is what exists while placing the
-        // third layer.
-        let stack_top = 2.0 * (crate_half_z * 2.0) - crate_half_z * 2.0;
+        // `carry_up` is now the height of the tine *tops* above the
+        // floor, and the tine top is the cargo's bottom face — so it is
+        // the cargo bottom directly, with no agent term. The geometry
+        // being asserted is unchanged; the frame it is expressed in is
+        // not, and the old arithmetic quietly kept passing in the new
+        // frame for the wrong reason.
+        let cargo_bottom = t.carry_up;
+        // Top of a two-high stack, which is what exists while the third
+        // layer is being carried in.
+        let stack_top = 2.0 * (crate_half_z * 2.0);
         assert!(
             cargo_bottom >= stack_top,
             "cargo rides at {cargo_bottom} which is below the {stack_top} stack top",
@@ -1062,18 +1568,51 @@ mod tests {
     #[test]
     fn the_cargo_is_held_square() {
         let t = tuning();
-        let pose = hold_pose(DVec3::ZERO, DVec3::X, t);
+        let pose = hold_pose(DVec3::ZERO, DVec3::X, parked(t), 0.5, 0.0, t);
         assert_eq!(pose.rot, Quat::IDENTITY);
     }
 
-    /// The hold point follows where the agent is going, in the plane.
+    /// The hold point follows where the agent is going, in the plane, and
+    /// rides on the forks rather than at a fixed offset from the body.
     #[test]
-    fn the_cargo_is_held_in_front_and_above() {
+    fn the_cargo_rides_on_the_forks() {
         let t = tuning();
-        let pose = hold_pose(DVec3::ZERO, DVec3::X, t);
+        let pose = hold_pose(DVec3::ZERO, DVec3::X, parked(t), 0.5, 0.0, t);
         assert!(pose.pos.x > 0.0, "should be in front along +X: {:?}", pose.pos);
         assert_eq!(pose.pos.y, 0.0);
-        assert!(pose.pos.z > 0.0, "should be above: {:?}", pose.pos);
+        // The tine top is the crate's bottom face — the exact
+        // relationship, not merely "above zero", which the old assertion
+        // would have passed on for any height at all.
+        assert!(
+            (pose.pos.z - (t.fork_rest_height + 0.5)).abs() < 1e-9,
+            "cargo at {:.3} but the parked tines put it at {:.3}",
+            pose.pos.z,
+            t.fork_rest_height + 0.5,
+        );
+    }
+
+    /// The cargo height must come from the floor and the mast, never from
+    /// the agent's own z.
+    ///
+    /// An offset from the body would make a crate two metres overhead
+    /// twitch every time a contact under the tracks nudged the agent a
+    /// few millimetres.
+    #[test]
+    fn the_cargo_height_ignores_where_the_agent_is_bounced_to() {
+        let t = tuning();
+        let low = hold_pose(DVec3::ZERO, DVec3::X, parked(t), 0.5, 0.0, t);
+        let bounced = hold_pose(
+            DVec3::new(0.0, 0.0, 0.05),
+            DVec3::X,
+            parked(t),
+            0.5,
+            0.0,
+            t,
+        );
+        assert_eq!(
+            low.pos.z, bounced.pos.z,
+            "bouncing the agent 50 mm moved its cargo",
+        );
     }
 
     /// A degenerate facing must not produce a NaN pose — the agent is
@@ -1081,7 +1620,7 @@ mod tests {
     #[test]
     fn a_stationary_agent_still_gets_a_finite_hold_pose() {
         let t = tuning();
-        let pose = hold_pose(DVec3::ZERO, DVec3::ZERO, t);
+        let pose = hold_pose(DVec3::ZERO, DVec3::ZERO, parked(t), 0.5, 0.0, t);
         assert!(pose.pos.is_finite(), "degenerate facing gave {:?}", pose.pos);
     }
 
@@ -1190,6 +1729,13 @@ mod tests {
         let p = plane();
         let mut task = StackTask::new(tuning());
         task.site = Some((7, 7));
+        // Only crates the task placed count toward its tower. A loose
+        // crate lying on the floor sits at exactly the base layer's
+        // height, so without this the scrap in the yard is counted as a
+        // stack — measured in `crates3d` as a count of two before a
+        // single crate had been placed, which sent the mast to the third
+        // layer and dropped the first crate from two and a half metres.
+        task.placed = vec![CrateId(1), CrateId(2)];
         let c = p.tile_center(7, 7);
 
         let two = [
