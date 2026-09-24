@@ -171,6 +171,16 @@ struct Game {
     /// Frame at which to run the self-check, if `--verify` was passed.
     verify_at: Option<u32>,
     frame: u32,
+
+    /// Where every crate was last tick, and the furthest any of them has
+    /// moved in a single tick since the scene started.
+    ///
+    /// A crate should never move further in one tick than the agent can
+    /// carry it. Anything beyond that is a teleport — which is what a
+    /// pickup used to be: 2.05 m vertically in a single frame, twenty
+    /// three times the honest bound.
+    prev_pos: Vec<DVec3>,
+    worst_jump: f64,
 }
 
 impl Game {
@@ -202,6 +212,8 @@ impl Game {
             agent_mesh: None,
             verify_at: None,
             frame: 0,
+            prev_pos: Vec::new(),
+            worst_jump: 0.0,
         };
         g.reset();
         g
@@ -1042,6 +1054,28 @@ impl App for Game {
             physics3d::update_sleep_all(&mut refs, dt);
         }
 
+        // How far did anything move this tick?
+        //
+        // Measured at the very end, so it sees the net effect of the
+        // agent, the integrator and the solver together. A carried crate
+        // moves at the agent's speed plus whatever the forks are doing;
+        // anything much past that is a teleport, and `--verify` says so.
+        if self.prev_pos.len() == self.bodies.len() {
+            for (i, b) in self.bodies.iter().enumerate() {
+                if b.rigid.kind == BodyKind::Static || i == self.agent_body {
+                    continue;
+                }
+                // The fell-off-the-world reset below is a deliberate
+                // teleport, so ignore anything that far out.
+                let d = (b.transform.pos - self.prev_pos[i]).length();
+                if d < 5.0 {
+                    self.worst_jump = self.worst_jump.max(d);
+                }
+            }
+        }
+        self.prev_pos.clear();
+        self.prev_pos.extend(self.bodies.iter().map(|b| b.transform.pos));
+
         // Anything that falls off the world is gone; without this a
         // stray crate integrates forever.
         for b in &mut self.bodies {
@@ -1467,6 +1501,7 @@ impl Game {
             self.agent.state,
         );
         println!("[verify] stack: {layers} layers, top crate at z={top:.3}");
+        println!("[verify] worst per-tick crate movement = {:.4} m", self.worst_jump);
         println!(
             "[verify] OK — scene rendered, geometry visible, \
              physics settled (resting z={lowest:.3}, worst overlap={worst:.4})"
