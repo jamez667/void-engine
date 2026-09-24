@@ -48,6 +48,30 @@
 //! solver starts every contact impulse from zero every tick, so a resting
 //! stack must rediscover its own support force from scratch, and with no
 //! memory of the previous tick it overshoots and rings.
+//!
+//! # What accumulating impulses changed
+//!
+//! The solver now accumulates each contact point's impulse across the
+//! iterations of a tick and clamps the *total* rather than the increment,
+//! so a point that over-corrects can be partly undone by the next
+//! iteration instead of being skipped by a separating early-out.
+//!
+//! That did not move the numbers above at four iterations. What it did
+//! was make the solver **convergent**, which shows up as soon as the
+//! iteration count is raised — something that did nothing whatsoever
+//! before:
+//!
+//! ```text
+//! n=3 sink      4 iters   64 iters
+//!   before       2.00       2.00
+//!   after        2.00       0.03
+//! ```
+//!
+//! So what is left is a convergence *rate* problem rather than a
+//! stability one, and 64 iterations a tick is not a shippable answer.
+//! Warm starting across ticks is: a resting stack would begin each tick
+//! already holding last tick's support impulses, so four iterations only
+//! has to absorb the change rather than rediscover the whole answer.
 use glam::{DVec3, Quat};
 use void_engine::collision::narrow3d;
 use void_engine::components::{Transform3D, Velocity3D};

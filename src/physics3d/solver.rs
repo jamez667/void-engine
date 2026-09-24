@@ -104,6 +104,37 @@ pub struct Contact {
     pub point: DVec3,
 }
 
+/// What one contact point has applied so far this tick.
+///
+/// Sequential impulses converge by *accumulating*: each iteration adds an
+/// increment and the clamp is applied to the running total, so an
+/// over-correction made early can be taken back later. Storing only the
+/// last increment instead makes every over-correction permanent, which is
+/// what leaves a resting stack with a residual it can never shed.
+#[derive(Copy, Clone, Debug, Default)]
+struct Accumulated {
+    /// Total normal impulse, clamped at or above zero: a contact pushes
+    /// and never pulls.
+    normal: f64,
+    /// Total friction impulse along the tangent, clamped to Coulomb's
+    /// limit against `normal`.
+    tangent: f64,
+    /// The separating speed this contact is solving *toward*, captured on
+    /// the first iteration and held for the rest of the tick.
+    ///
+    /// Zero for a resting contact; `restitution * approach_speed` for a
+    /// bouncy one. It must be captured once rather than recomputed,
+    /// because after the first iteration the contact is already
+    /// separating — a recomputed target would chase its own output, the
+    /// second iteration seeing the bounce it just created as an approach
+    /// to cancel, and the accumulator taking the whole bounce back again.
+    /// Measured before this: a perfectly elastic 5 m/s impact came out at
+    /// exactly zero.
+    target: f64,
+    /// Whether `target` has been captured yet.
+    primed: bool,
+}
+
 /// Everything the solver needs about one body, borrowed for a step.
 pub struct BodyRef<'a> {
     pub body: &'a mut RigidBody,
@@ -184,19 +215,26 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
         }
     }
 
+    // One accumulator per contact point, living for the whole solve.
+    let mut acc = vec![Accumulated::default(); contacts.len()];
     for _ in 0..SOLVER_ITERATIONS {
-        for c in contacts {
-            solve_one(bodies, c);
+        for (i, c) in contacts.iter().enumerate() {
+            solve_one(bodies, c, &mut acc[i]);
         }
     }
 
     // Positional correction after the impulses, so it works on the
-    // post-impulse state rather than fighting it — and **iterated**, for
-    // the same reason the impulses are.
+    // post-impulse state rather than fighting it.
     //
-    // The strength of that one pass is what decides whether a stack
-    // settles or squashes; see [`BAUMGARTE`], which also records why
-    // running this once per solver iteration is worse rather than better.
+    // This is per contact *point*, which looks like a bug and is not.
+    // Correcting once per pair instead — the arithmetically tidy thing,
+    // since all a pair's points share one normal — was tried and made the
+    // real scene worse: `examples/crates3d` went from a settled stack to
+    // a crate moving at 3.5 m/s, while `examples/stackbench` did not
+    // improve at all. A resting box's four points each carry their own
+    // depth, and correcting only the deepest leaves the others embedded,
+    // so the box tips. Per point over-corrects a flat rest but keeps the
+    // face level, and level turns out to matter more.
     for c in contacts {
         correct_penetration(bodies, c);
     }
@@ -205,7 +243,7 @@ pub fn solve(bodies: &mut [BodyRef<'_>], contacts: &[Contact], dt: f64) {
 }
 
 /// Apply the normal and friction impulses for one contact.
-fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact) {
+fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact, acc: &mut Accumulated) {
     let (ia, ib) = (c.a, c.b);
     if ia == ib || ia >= bodies.len() || ib >= bodies.len() {
         return;
@@ -238,11 +276,24 @@ fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact) {
     let rv = va - vb;
     let vn = rv.dot(c.normal);
 
-    // Already separating: nothing to do. Resolving here would *pull* the
-    // bodies together.
-    if vn > 0.0 {
-        return;
-    }
+    // **No early-out for a separating contact here.**
+    //
+    // Skipping when `vn > 0` is right for a solver that applies one
+    // impulse and forgets it, and wrong for one that accumulates. Four
+    // points share a resting face: the first removes the whole approach
+    // velocity, which over-corrects for the pair, so the second sees the
+    // pair *separating* and skips — and the rotation the first induced
+    // makes the third see approach again. The points fight each other
+    // instead of converging, and the pair is left with a steady residual
+    // it never sheds. Measured on a three-high stack: every crate sank at
+    // a constant 0.074 m/s forever, 2.2 m over thirty seconds, which is
+    // the whole collapse.
+    //
+    // Accumulating instead lets a point that over-corrected be partly
+    // *undone* by the next iteration, because the clamp below is on the
+    // running total rather than on each increment. A total that would go
+    // negative is what "this contact is separating" really means, and the
+    // clamp expresses it exactly.
 
     let (restitution, friction) = {
         let a = &bodies[ia].body;
@@ -265,10 +316,26 @@ fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact) {
     // Below the threshold, treat the contact as resting: applying
     // restitution to a slow approach is what keeps a settling body
     // buzzing forever.
-    let bounce = if -vn > RESTITUTION_THRESHOLD { restitution } else { 0.0 };
+    if !acc.primed {
+        let bounce = if -vn > RESTITUTION_THRESHOLD { restitution } else { 0.0 };
+        acc.target = -vn * bounce;
+        acc.primed = true;
+    }
 
-    let jn = -(1.0 + bounce) * vn / inv_mass_n;
-    let normal_impulse = c.normal * jn;
+    // The increment this iteration wants, then the clamp on the *total*.
+    //
+    // `acc.normal` is what this contact point has already applied across
+    // earlier iterations of this tick. Clamping the sum at zero means a
+    // contact can push but never pull, while still allowing an increment
+    // to be negative — which is how an over-correction from an earlier
+    // iteration gets taken back. Clamping the increment instead would
+    // make every over-correction permanent, which is the bug.
+    let delta = (acc.target - vn) / inv_mass_n;
+    let total = (acc.normal + delta).max(0.0);
+    let jn_applied = total - acc.normal;
+    acc.normal = total;
+
+    let normal_impulse = c.normal * jn_applied;
     apply(bodies, ia, a_rot, ra, normal_impulse);
     apply(bodies, ib, b_rot, rb, -normal_impulse);
 
@@ -309,11 +376,19 @@ fn solve_one(bodies: &mut [BodyRef<'_>], c: &Contact) {
     // reverses a slide either way — but without the limit it cancels the
     // whole slide however glancing the touch, and a puck skimming a
     // surface stops dead instead of sliding on.
-    let jt_unclamped = -rv2.dot(tangent) / inv_mass_t;
-    let max_friction = friction * jn.abs();
-    let jt = jt_unclamped.clamp(-max_friction, max_friction);
+    // The budget comes from the **accumulated** normal impulse, not from
+    // this iteration's increment. The increment shrinks toward zero as
+    // the contact converges — that is what convergence means — so a
+    // budget derived from it would starve friction on exactly the resting
+    // contacts that need it most, and a settled stack would slowly slide
+    // apart.
+    let delta_t = -rv2.dot(tangent) / inv_mass_t;
+    let max_friction = friction * acc.normal;
+    let total_t = (acc.tangent + delta_t).clamp(-max_friction, max_friction);
+    let jt_applied = total_t - acc.tangent;
+    acc.tangent = total_t;
 
-    let friction_impulse = tangent * jt;
+    let friction_impulse = tangent * jt_applied;
     apply(bodies, ia, a_rot, ra, friction_impulse);
     apply(bodies, ib, b_rot, rb, -friction_impulse);
 }
@@ -899,6 +974,7 @@ mod tests {
              same tick — a stack will squash into itself",
         );
     }
+
 
 
 }
